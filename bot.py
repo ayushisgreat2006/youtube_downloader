@@ -133,10 +133,10 @@ def sanitize_filename(name: str) -> str:
 async def download_and_send(update: Update, context: ContextTypes.DEFAULT_TYPE, url: str, quality: str):
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
 
-    # --- yt-dlp opts ---
+    # yt-dlp setup
     if quality == "mp3":
         ydl_opts = {
-            "outtmpl": str(DOWNLOAD_DIR / "@spotifyxmusixbot - %(title)s.%(ext)s"),
+            "outtmpl": str(DOWNLOAD_DIR / "%(title)s.%(ext)s"),
             "format": "bestaudio/best",
             "quiet": True,
             "no_warnings": True,
@@ -149,7 +149,7 @@ async def download_and_send(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     else:
         h = int(quality)
         ydl_opts = {
-            "outtmpl": str(DOWNLOAD_DIR / "@spotifyxmusixbot - %(title)s.%(ext)s"),
+            "outtmpl": str(DOWNLOAD_DIR / "%(title)s.%(ext)s"),
             "format": f"bestvideo[height<={h}]+bestaudio/best/best[height<={h}]",
             "merge_output_format": "mp4",
             "quiet": True,
@@ -157,52 +157,53 @@ async def download_and_send(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         }
 
     try:
+        # download
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
             title = sanitize_filename(info.get("title") or "output")
 
         ext = ".mp3" if quality == "mp3" else ".mp4"
-        pattern = f"@spotifyxmusixbot - {title}*{ext}"
-        matches = list(DOWNLOAD_DIR.glob(pattern)) or list(DOWNLOAD_DIR.glob(f"*{ext}"))
-        if not matches:
+        files = list(DOWNLOAD_DIR.glob(f"*{ext}"))
+        if not files:
             raise FileNotFoundError("Downloaded file not found")
-        final_path = sorted(matches, key=lambda p: p.stat().st_mtime, reverse=True)[0]
+        final_path = sorted(files, key=lambda p: p.stat().st_mtime, reverse=True)[0]
 
-        # verify non-empty
         if final_path.stat().st_size < 1000:
             raise RuntimeError(f"{final_path.name} seems empty")
 
         caption = f"Here ya go 😎\\nSource: {url}"
-        await context.bot.send_chat_action(
-            chat_id=update.effective_chat.id,
-            action=ChatAction.UPLOAD_AUDIO if quality == 'mp3' else ChatAction.UPLOAD_VIDEO
-        )
 
-    if quality == "mp3":
-    try:
-        safe_name = sanitize_filename(f"{title}.mp3")
-        safe_path = DOWNLOAD_DIR / safe_name
+        # upload section
+        if quality == "mp3":
+            safe_name = f"{title}.mp3"
+            safe_path = DOWNLOAD_DIR / safe_name
+            if final_path != safe_path:
+                final_path.rename(safe_path)
+                final_path = safe_path
 
-        # If yt-dlp saved with a different name, rename it to safe_path
-        if final_path != safe_path:
-            final_path.rename(safe_path)
-            final_path = safe_path
+            await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.UPLOAD_AUDIO)
+            try:
+                with open(final_path, "rb") as f:
+                    await update.message.reply_audio(
+                        audio=InputFile(f, filename=safe_name),
+                        caption=caption,
+                        title=title,
+                        performer="YouTube 🎧"
+                    )
+            except Exception as e:
+                # fallback as document if Telegram refuses audio
+                await update.message.reply_text(f"⚠️ Audio upload failed ({e}), sending as file instead…")
+                with open(final_path, "rb") as f:
+                    await update.message.reply_document(InputFile(f, filename=safe_name), caption=caption)
 
-        # Now send it as proper audio (Telegram needs .mp3 extension)
-        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.UPLOAD_AUDIO)
-        with open(final_path, "rb") as f:
-            await update.message.reply_audio(
-                audio=InputFile(f, filename=safe_name),
-                caption=caption,
-                title=title,
-                performer="YouTube 🎧"
-            )
+        else:
+            await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.UPLOAD_VIDEO)
+            with open(final_path, "rb") as f:
+                await update.message.reply_video(video=f, caption=caption)
 
     except Exception as e:
-        # fallback: if Telegram still rejects it, send as file instead of audio
-        await update.message.reply_text(f"⚠️ Audio upload failed ({e}), sending as file instead…")
-        with open(final_path, "rb") as f:
-            await update.message.reply_document(InputFile(f, filename=safe_name), caption=caption)
+        await update.message.reply_text(f"⚠️ Error: {e}")
+
 
 
 # =========================
