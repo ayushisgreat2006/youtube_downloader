@@ -135,7 +135,7 @@ def sanitize_filename(name: str) -> str:
 async def download_and_send(update: Update, context: ContextTypes.DEFAULT_TYPE, url: str, quality: str):
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
 
-    # yt-dlp options
+    # yt-dlp setup
     if quality == "mp3":
         ydl_opts = {
             "outtmpl": str(DOWNLOAD_DIR / "%(title)s.%(ext)s"),
@@ -159,7 +159,7 @@ async def download_and_send(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         }
 
     try:
-        # Download
+        # download
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
             title = sanitize_filename(info.get("title") or "output")
@@ -170,33 +170,26 @@ async def download_and_send(update: Update, context: ContextTypes.DEFAULT_TYPE, 
             raise FileNotFoundError("Downloaded file not found")
         final_path = sorted(files, key=lambda p: p.stat().st_mtime, reverse=True)[0]
 
-        size = final_path.stat().st_size
-        if size < 1024:
+        if final_path.stat().st_size < 1024:
             raise RuntimeError("File is empty or incomplete")
 
         caption = f"Here ya go 😎\nSource: {url}"
 
         if quality == "mp3":
-            # ensure clean name + .mp3 extension
+            # clean filename for Telegram
             safe_name = f"{title}.mp3"
             safe_path = DOWNLOAD_DIR / safe_name
             if final_path != safe_path:
                 try:
                     final_path.rename(safe_path)
-                    final_path = safe_path
                 except Exception:
-                    # fallback: copy
-                    data = final_path.read_bytes()
-                    safe_path.write_bytes(data)
-                    final_path = safe_path
+                    safe_path.write_bytes(final_path.read_bytes())
+                final_path = safe_path
 
-            # If > audio limit, send as document (Telegram sendAudio limit ~50MB)
-            if size > AUDIO_SIZE_LIMIT:
+            # send as audio if <= ~49MB, else as document
+            size = final_path.stat().st_size
+            if size <= 49 * 1024 * 1024:
                 await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.UPLOAD_DOCUMENT)
-                with open(final_path, "rb") as f:
-                    await update.message.reply_document(InputFile(f, filename=safe_name), caption=caption)
-            else:
-                await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.UPLOAD_AUDIO)
                 try:
                     with open(final_path, "rb") as f:
                         await update.message.reply_audio(
@@ -205,29 +198,28 @@ async def download_and_send(update: Update, context: ContextTypes.DEFAULT_TYPE, 
                             title=title,
                             performer="YouTube 🎧",
                         )
-                except Exception as e:
-                    # fallback: document upload if Telegram rejects as audio
+                except Exception:
                     with open(final_path, "rb") as f:
                         await update.message.reply_document(InputFile(f, filename=safe_name), caption=f"(Fallback)\n{caption}")
+            else:
+                await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.UPLOAD_DOCUMENT)
+                with open(final_path, "rb") as f:
+                    await update.message.reply_document(InputFile(f, filename=safe_name), caption=caption)
+
         else:
-            # video path
-            if size > DOC_SIZE_LIMIT:
-                await update.message.reply_text("Video >2GB. Try lower quality.")
-                return
             await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.UPLOAD_VIDEO)
             with open(final_path, "rb") as f:
                 await update.message.reply_video(video=f, caption=caption)
 
-        # optional cleanup (avoid storage bloat)
-        try:
-            for p in DOWNLOAD_DIR.glob("*"):
-                if p.is_file() and p != final_path:
-                    p.unlink(missing_ok=True)
-        except Exception:
-            pass
+        # cleanup others
+        for p in DOWNLOAD_DIR.glob("*"):
+            if p.is_file() and p != final_path:
+                try: p.unlink()
+                except: pass
 
     except Exception as e:
         await update.message.reply_text(f"⚠️ Error: {e}")
+
 
 # =========================
 # Handlers
