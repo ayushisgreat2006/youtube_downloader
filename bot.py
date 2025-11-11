@@ -133,8 +133,7 @@ def sanitize_filename(name: str) -> str:
 async def download_and_send(update: Update, context: ContextTypes.DEFAULT_TYPE, url: str, quality: str):
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
 
-
-    # Build format
+    # --- Build options (no cookies anywhere) ---
     if quality == "mp3":
         ydl_opts = {
             "outtmpl": str(DOWNLOAD_DIR / "@spotifyxmusixbot - %(title)s.%(ext)s"),
@@ -159,52 +158,32 @@ async def download_and_send(update: Update, context: ContextTypes.DEFAULT_TYPE, 
             "no_warnings": True,
         }
 
-    
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
-            # Find actual output path
-            if quality == "mp3":
-                out_ext = ".mp3"
-            else:
-                out_ext = ".mp4"
-            base = ydl.prepare_filename(info)
-            # base might include format tags; locate a file that exists with ext
             title = info.get("title") or "output"
-            final_guess = DOWNLOAD_DIR / f"@spotifyxmusixbot - {sanitize_filename(title)}{out_ext}"
-            if final_guess.exists():
-                final_path = final_guess
-            else:
-                # fallback: scan directory for newest file
+            ext = ".mp3" if quality == "mp3" else ".mp4"
+            final_path = DOWNLOAD_DIR / f"@spotifyxmusixbot - {sanitize_filename(title)}{ext}"
+            if not final_path.exists():
+                # fallback: most recent file
                 files = sorted(DOWNLOAD_DIR.glob("*"), key=lambda p: p.stat().st_mtime, reverse=True)
-                final_path = files[0] if files else Path(base)
+                if files:
+                    final_path = files[0]
 
-        # Telegram limits ~2GB for bot uploads
-        size_mb = final_path.stat().st_size / (1024*1024)
-        if size_mb > 1990 and quality != "mp3":
-            await update.message.reply_text("File >2GB. Compressing to fit…")
-            compressed = final_path.with_name(final_path.stem + "_720p.mp4")
-            cmd = [
-                "ffmpeg", "-y", "-i", str(final_path),
-                "-vf", "scale=-2:720",
-                "-c:v", "libx264", "-b:v", "2000k", "-preset", "veryfast", "-movflags", "+faststart",
-                "-c:a", "aac", "-b:a", "128k",
-                str(compressed)
-            ]
-            subprocess.run(cmd, check=True)
-            final_path = compressed
-
-        await context.bot.send_chat_action(chat_id=update.effective_chat.id,
-                                           action=ChatAction.UPLOAD_VIDEO if quality != "mp3" else ChatAction.UPLOAD_AUDIO)
-
-        cap = f"Here ya go 😎\nSource: {url}"
+        # --- upload to Telegram ---
+        await context.bot.send_chat_action(
+            chat_id=update.effective_chat.id,
+            action=ChatAction.UPLOAD_AUDIO if quality == "mp3" else ChatAction.UPLOAD_VIDEO,
+        )
+        cap = f"Here ya go 😎\\nSource: {url}"
         if quality == "mp3":
-            await update.message.reply_audio(audio=InputFile(final_path), caption=cap)
+            await update.message.reply_audio(audio=open(final_path, "rb"), caption=cap)
         else:
-            await update.message.reply_video(video=InputFile(final_path), caption=cap)
+            await update.message.reply_video(video=open(final_path, "rb"), caption=cap)
 
     except Exception as e:
         await update.message.reply_text(f"⚠️ Error: {e}")
+
 
 
 # =========================
