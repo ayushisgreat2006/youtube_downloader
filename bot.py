@@ -133,7 +133,7 @@ def sanitize_filename(name: str) -> str:
 async def download_and_send(update: Update, context: ContextTypes.DEFAULT_TYPE, url: str, quality: str):
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
 
-    # --- Build options (no cookies anywhere) ---
+    # --- Build yt-dlp options ---
     if quality == "mp3":
         ydl_opts = {
             "outtmpl": str(DOWNLOAD_DIR / "@spotifyxmusixbot - %(title)s.%(ext)s"),
@@ -141,11 +141,13 @@ async def download_and_send(update: Update, context: ContextTypes.DEFAULT_TYPE, 
             "noplaylist": True,
             "quiet": True,
             "no_warnings": True,
-            "postprocessors": [{
-                "key": "FFmpegExtractAudio",
-                "preferredcodec": "mp3",
-                "preferredquality": "192",
-            }],
+            "postprocessors": [
+                {
+                    "key": "FFmpegExtractAudio",
+                    "preferredcodec": "mp3",
+                    "preferredquality": "192",
+                }
+            ],
         }
     else:
         h = int(quality)
@@ -162,24 +164,35 @@ async def download_and_send(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
             title = info.get("title") or "output"
-            ext = ".mp3" if quality == "mp3" else ".mp4"
-            final_path = DOWNLOAD_DIR / f"@spotifyxmusixbot - {sanitize_filename(title)}{ext}"
-            if not final_path.exists():
-                # fallback: most recent file
-                files = sorted(DOWNLOAD_DIR.glob("*"), key=lambda p: p.stat().st_mtime, reverse=True)
-                if files:
-                    final_path = files[0]
+            base = sanitize_filename(title)
 
-        # --- upload to Telegram ---
+        # === find the real file that yt-dlp created ===
+        if quality == "mp3":
+            # find any mp3 created in the downloads dir
+            files = list(DOWNLOAD_DIR.glob(f"@spotifyxmusixbot - {base}*.mp3"))
+            if not files:
+                files = list(DOWNLOAD_DIR.glob("*.mp3"))
+        else:
+            files = list(DOWNLOAD_DIR.glob(f"@spotifyxmusixbot - {base}*.mp4"))
+            if not files:
+                files = list(DOWNLOAD_DIR.glob("*.mp4"))
+
+        if not files:
+            raise FileNotFoundError("downloaded file not found")
+
+        # pick the newest
+        final_path = sorted(files, key=lambda p: p.stat().st_mtime, reverse=True)[0]
+
+        # === send to Telegram ===
         await context.bot.send_chat_action(
             chat_id=update.effective_chat.id,
             action=ChatAction.UPLOAD_AUDIO if quality == "mp3" else ChatAction.UPLOAD_VIDEO,
         )
-        cap = f"Here ya go 😎\\nSource: {url}"
+        caption = f"Here ya go 😎 Updates :- @tonystark_jr \\nSource: {url}"
         if quality == "mp3":
-            await update.message.reply_audio(audio=open(final_path, "rb"), caption=cap)
+            await update.message.reply_audio(audio=open(final_path, "rb"), caption=caption, title=base)
         else:
-            await update.message.reply_video(video=open(final_path, "rb"), caption=cap)
+            await update.message.reply_video(video=open(final_path, "rb"), caption=caption)
 
     except Exception as e:
         await update.message.reply_text(f"⚠️ Error: {e}")
@@ -193,8 +206,9 @@ async def download_and_send(update: Update, context: ContextTypes.DEFAULT_TYPE, 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ensure_user(update)
     msg = [
-        "yo, I’m alive ⚡",
+        "Yo, I’m alive ⚡",
         "send a YouTube link and pick a quality, or /help",
+        "Created by :- @mahadev_ki_iccha ",
     ]
     if UPDATES_CHANNEL:
         msg.append(f"updates: {UPDATES_CHANNEL}")
