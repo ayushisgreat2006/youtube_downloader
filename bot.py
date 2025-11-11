@@ -178,22 +178,31 @@ async def download_and_send(update: Update, context: ContextTypes.DEFAULT_TYPE, 
             action=ChatAction.UPLOAD_AUDIO if quality == 'mp3' else ChatAction.UPLOAD_VIDEO
         )
 
-        if quality == "mp3":
-            try:
-                with open(final_path, "rb") as f:
-                    await update.message.reply_audio(audio=f, caption=caption, title=title)
-            except Exception as e:
-                # fallback: send as file if Telegram rejects it as 'audio'
-                with open(final_path, "rb") as f:
-                    await update.message.reply_document(document=f, caption=f"(Fallback upload)\\n{caption}")
-        else:
-            with open(final_path, "rb") as f:
-                await update.message.reply_video(video=f, caption=caption)
+    if quality == "mp3":
+    try:
+        safe_name = sanitize_filename(f"{title}.mp3")
+        safe_path = DOWNLOAD_DIR / safe_name
+
+        # If yt-dlp saved with a different name, rename it to safe_path
+        if final_path != safe_path:
+            final_path.rename(safe_path)
+            final_path = safe_path
+
+        # Now send it as proper audio (Telegram needs .mp3 extension)
+        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.UPLOAD_AUDIO)
+        with open(final_path, "rb") as f:
+            await update.message.reply_audio(
+                audio=InputFile(f, filename=safe_name),
+                caption=caption,
+                title=title,
+                performer="YouTube 🎧"
+            )
 
     except Exception as e:
-        await update.message.reply_text(f"⚠️ Error: {e}")
-
-
+        # fallback: if Telegram still rejects it, send as file instead of audio
+        await update.message.reply_text(f"⚠️ Audio upload failed ({e}), sending as file instead…")
+        with open(final_path, "rb") as f:
+            await update.message.reply_document(InputFile(f, filename=safe_name), caption=caption)
 
 
 # =========================
