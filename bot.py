@@ -133,21 +133,18 @@ def sanitize_filename(name: str) -> str:
 async def download_and_send(update: Update, context: ContextTypes.DEFAULT_TYPE, url: str, quality: str):
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
 
-    # --- Build yt-dlp options ---
+    # --- yt-dlp opts ---
     if quality == "mp3":
         ydl_opts = {
             "outtmpl": str(DOWNLOAD_DIR / "@spotifyxmusixbot - %(title)s.%(ext)s"),
             "format": "bestaudio/best",
-            "noplaylist": True,
             "quiet": True,
             "no_warnings": True,
-            "postprocessors": [
-                {
-                    "key": "FFmpegExtractAudio",
-                    "preferredcodec": "mp3",
-                    "preferredquality": "192",
-                }
-            ],
+            "postprocessors": [{
+                "key": "FFmpegExtractAudio",
+                "preferredcodec": "mp3",
+                "preferredquality": "192",
+            }],
         }
     else:
         h = int(quality)
@@ -155,7 +152,6 @@ async def download_and_send(update: Update, context: ContextTypes.DEFAULT_TYPE, 
             "outtmpl": str(DOWNLOAD_DIR / "@spotifyxmusixbot - %(title)s.%(ext)s"),
             "format": f"bestvideo[height<={h}]+bestaudio/best/best[height<={h}]",
             "merge_output_format": "mp4",
-            "noplaylist": True,
             "quiet": True,
             "no_warnings": True,
         }
@@ -163,39 +159,40 @@ async def download_and_send(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
-            title = info.get("title") or "output"
-            base = sanitize_filename(title)
+            title = sanitize_filename(info.get("title") or "output")
 
-        # === find the real file that yt-dlp created ===
-        if quality == "mp3":
-            # find any mp3 created in the downloads dir
-            files = list(DOWNLOAD_DIR.glob(f"@spotifyxmusixbot - {base}*.mp3"))
-            if not files:
-                files = list(DOWNLOAD_DIR.glob("*.mp3"))
-        else:
-            files = list(DOWNLOAD_DIR.glob(f"@spotifyxmusixbot - {base}*.mp4"))
-            if not files:
-                files = list(DOWNLOAD_DIR.glob("*.mp4"))
+        ext = ".mp3" if quality == "mp3" else ".mp4"
+        pattern = f"@spotifyxmusixbot - {title}*{ext}"
+        matches = list(DOWNLOAD_DIR.glob(pattern)) or list(DOWNLOAD_DIR.glob(f"*{ext}"))
+        if not matches:
+            raise FileNotFoundError("Downloaded file not found")
+        final_path = sorted(matches, key=lambda p: p.stat().st_mtime, reverse=True)[0]
 
-        if not files:
-            raise FileNotFoundError("downloaded file not found")
+        # verify non-empty
+        if final_path.stat().st_size < 1000:
+            raise RuntimeError(f"{final_path.name} seems empty")
 
-        # pick the newest
-        final_path = sorted(files, key=lambda p: p.stat().st_mtime, reverse=True)[0]
-
-        # === send to Telegram ===
+        caption = f"Here ya go 😎\\nSource: {url}"
         await context.bot.send_chat_action(
             chat_id=update.effective_chat.id,
-            action=ChatAction.UPLOAD_AUDIO if quality == "mp3" else ChatAction.UPLOAD_VIDEO,
+            action=ChatAction.UPLOAD_AUDIO if quality == 'mp3' else ChatAction.UPLOAD_VIDEO
         )
-        caption = f"Here ya go 😎 Updates :- @tonystark_jr \\nSource: {url}"
+
         if quality == "mp3":
-            await update.message.reply_audio(audio=open(final_path, "rb"), caption=caption, title=base)
+            try:
+                with open(final_path, "rb") as f:
+                    await update.message.reply_audio(audio=f, caption=caption, title=title)
+            except Exception as e:
+                # fallback: send as file if Telegram rejects it as 'audio'
+                with open(final_path, "rb") as f:
+                    await update.message.reply_document(document=f, caption=f"(Fallback upload)\\n{caption}")
         else:
-            await update.message.reply_video(video=open(final_path, "rb"), caption=caption)
+            with open(final_path, "rb") as f:
+                await update.message.reply_video(video=f, caption=caption)
 
     except Exception as e:
         await update.message.reply_text(f"⚠️ Error: {e}")
+
 
 
 
