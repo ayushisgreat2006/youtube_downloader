@@ -173,7 +173,7 @@ async def download_and_send(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         if final_path.stat().st_size < 1024:
             raise RuntimeError("File is empty or incomplete")
 
-        caption = f"Here ya go 😎\nSource: {url}"
+        caption = f"Here ya go 😎 Created by @mahadev_ki_iccha \nSource: {url}"
 
         if quality == "mp3":
             # clean filename for Telegram
@@ -196,7 +196,7 @@ async def download_and_send(update: Update, context: ContextTypes.DEFAULT_TYPE, 
                             audio=InputFile(f, filename=safe_name),
                             caption=caption,
                             title=title,
-                            performer="YouTube 🎧",
+                            performer="@spotifyxmusixbot 🎧",
                         )
                 except Exception:
                     with open(final_path, "rb") as f:
@@ -229,7 +229,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ensure_user(update)
     msg = [
         "Yo, I’m alive ⚡",
-        "send a YouTube link and pick a quality, or /help",
+        "send a YouTube link and pick a quality,",
+        "Send me:- Name of the track",
+        "- Performer"'
+        "- Words from a song",
+        "- Link from Youtube",
         "Created by :- @mahadev_ki_iccha ",
     ]
     if UPDATES_CHANNEL:
