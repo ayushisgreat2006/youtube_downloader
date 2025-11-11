@@ -4,7 +4,7 @@ import json
 import asyncio
 import logging
 from pathlib import Path
-from typing import Dict, Set, List, Optional, Tuple
+from typing import Dict, Set, Optional, Tuple
 
 from telegram import (
     Update,
@@ -27,23 +27,26 @@ import subprocess
 # =========================
 # ENV / CONFIG
 # =========================
-BOT_TOKEN = os.getenv("BOT_TOKEN")  # <- set on Railway/Koyeb env vars
-OWNER_ID = int(os.getenv("OWNER_ID", "7941244038"))  # your TG ID
-UPDATES_CHANNEL = os.getenv("UPDATES_CHANNEL", "@tonystark_jr")  # optional, shown in /start
+BOT_TOKEN = os.getenv("BOT_TOKEN")  # set in Railway Variables
+OWNER_ID = int(os.getenv("OWNER_ID", "7941244038"))
+UPDATES_CHANNEL = os.getenv("UPDATES_CHANNEL", "@tonystark_jr")
 
-# File persistence (ephemeral on redeploys)
+# Paths
 DATA_DIR = Path("data"); DATA_DIR.mkdir(exist_ok=True)
 USERS_FILE = DATA_DIR / "users.json"
 ADMINS_FILE = DATA_DIR / "admins.json"
 DOWNLOAD_DIR = Path("downloads"); DOWNLOAD_DIR.mkdir(exist_ok=True)
 
+# Limits (Telegram)
+AUDIO_SIZE_LIMIT = 49 * 1024 * 1024   # ~49MB for sendAudio (bots)
+DOC_SIZE_LIMIT = 2 * 1024 * 1024 * 1024  # 2GB hard bot limit
+
 # Logging
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
 log = logging.getLogger("ytbot")
 
-# In-memory map: short id -> URL (for callbacks)
+# Memory store for callbacks
 PENDING: Dict[str, str] = {}
-
 YOUTUBE_REGEX = re.compile(r"(https?://)?(www\.)?(youtube\.com|youtu\.be)/[\w\-?&=/%]+", re.I)
 
 # =========================
@@ -63,7 +66,7 @@ def save_json(path: Path, data) -> None:
 
 
 def ensure_user(update: Update) -> None:
-    users = load_json(USERS_FILE, {})  # {str(uid): {"name": "..."}}
+    users = load_json(USERS_FILE, {})
     u = update.effective_user
     if not u:
         return
@@ -108,7 +111,6 @@ def human_list_users(users_map: Dict[str, Dict[str, str]], limit: int = 60) -> T
 
 
 def quality_keyboard(url: str) -> InlineKeyboardMarkup:
-    # create a short token
     token = str(abs(hash((url, os.urandom(4)))))[:10]
     PENDING[token] = url
     btns = [
@@ -127,13 +129,13 @@ def sanitize_filename(name: str) -> str:
     return name
 
 # =========================
-# yt-dlp core
+# yt-dlp core (NO cookies; public vids only)
 # =========================
 
 async def download_and_send(update: Update, context: ContextTypes.DEFAULT_TYPE, url: str, quality: str):
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
 
-    # --- yt-dlp opts ---
+    # yt-dlp options
     if quality == "mp3":
         ydl_opts = {
             "outtmpl": str(DOWNLOAD_DIR / "%(title)s.%(ext)s"),
@@ -157,7 +159,7 @@ async def download_and_send(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         }
 
     try:
-        # --- download with yt-dlp ---
+        # Download
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
             title = sanitize_filename(info.get("title") or "output")
@@ -166,50 +168,66 @@ async def download_and_send(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         files = list(DOWNLOAD_DIR.glob(f"*{ext}"))
         if not files:
             raise FileNotFoundError("Downloaded file not found")
-
         final_path = sorted(files, key=lambda p: p.stat().st_mtime, reverse=True)[0]
 
-        # check file size
-        if final_path.stat().st_size < 500:
+        size = final_path.stat().st_size
+        if size < 1024:
             raise RuntimeError("File is empty or incomplete")
 
-        caption = f"Here ya go 😎\\nSource: {url}"
+        caption = f"Here ya go 😎\nSource: {url}"
 
-        # --- Upload MP3 ---
         if quality == "mp3":
+            # ensure clean name + .mp3 extension
             safe_name = f"{title}.mp3"
             safe_path = DOWNLOAD_DIR / safe_name
             if final_path != safe_path:
-                final_path.rename(safe_path)
-                final_path = safe_path
+                try:
+                    final_path.rename(safe_path)
+                    final_path = safe_path
+                except Exception:
+                    # fallback: copy
+                    data = final_path.read_bytes()
+                    safe_path.write_bytes(data)
+                    final_path = safe_path
 
-            await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.UPLOAD_AUDIO)
-
-            try:
-                with open(final_path, "rb") as f:
-                    await update.message.reply_audio(
-                        audio=InputFile(f, filename=safe_name),
-                        caption=caption,
-                        title=title,
-                        performer="YouTube 🎧"
-                    )
-            except Exception as e:
-                # fallback: send as document if Telegram rejects as audio
-                await update.message.reply_text(f"⚠️ Audio upload failed ({e}), sending as file instead…")
+            # If > audio limit, send as document (Telegram sendAudio limit ~50MB)
+            if size > AUDIO_SIZE_LIMIT:
+                await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.UPLOAD_DOCUMENT)
                 with open(final_path, "rb") as f:
                     await update.message.reply_document(InputFile(f, filename=safe_name), caption=caption)
-
-        # --- Upload Video ---
+            else:
+                await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.UPLOAD_AUDIO)
+                try:
+                    with open(final_path, "rb") as f:
+                        await update.message.reply_audio(
+                            audio=InputFile(f, filename=safe_name),
+                            caption=caption,
+                            title=title,
+                            performer="YouTube 🎧",
+                        )
+                except Exception as e:
+                    # fallback: document upload if Telegram rejects as audio
+                    with open(final_path, "rb") as f:
+                        await update.message.reply_document(InputFile(f, filename=safe_name), caption=f"(Fallback)\n{caption}")
         else:
+            # video path
+            if size > DOC_SIZE_LIMIT:
+                await update.message.reply_text("Video >2GB. Try lower quality.")
+                return
             await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.UPLOAD_VIDEO)
             with open(final_path, "rb") as f:
                 await update.message.reply_video(video=f, caption=caption)
 
+        # optional cleanup (avoid storage bloat)
+        try:
+            for p in DOWNLOAD_DIR.glob("*"):
+                if p.is_file() and p != final_path:
+                    p.unlink(missing_ok=True)
+        except Exception:
+            pass
+
     except Exception as e:
         await update.message.reply_text(f"⚠️ Error: {e}")
-
-
-
 
 # =========================
 # Handlers
@@ -247,11 +265,8 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_text_or_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ensure_user(update)
     text = (update.message.text or "").strip()
-
-    # Only react to YouTube links. Otherwise ignore (to avoid triggering on all msgs)
     if not YOUTUBE_REGEX.search(text):
         return
-
     url = YOUTUBE_REGEX.search(text).group(0)
     await update.message.reply_text("Choose quality:", reply_markup=quality_keyboard(url))
 
@@ -290,7 +305,6 @@ async def search_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "extract_flat": "in_playlist",
         "noplaylist": True,
     }
-    
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -304,7 +318,6 @@ async def search_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("No results.")
         return
 
-    # Show top 5 as buttons -> pressing leads to quality menu
     buttons = []
     for e in entries[:5]:
         title = sanitize_filename(e.get("title") or "video")
@@ -358,7 +371,6 @@ async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     users = load_json(USERS_FILE, {})
     targets = [int(uid) for uid in users.keys()]
 
-    # Case 1: reply to media (photo/video/document/audio) -> broadcast that
     if update.message.reply_to_message:
         src = update.message.reply_to_message
         sent = 0
@@ -382,7 +394,6 @@ async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Broadcasted to {sent}/{len(targets)} users.")
         return
 
-    # Case 2: text argument
     text = " ".join(context.args) if context.args else None
     if not text:
         await update.message.reply_text("Reply to a media OR use: /broadcast <text>")
@@ -448,7 +459,6 @@ def main():
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    # Commands
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("search", search_cmd))
@@ -457,11 +467,9 @@ def main():
     app.add_handler(CommandHandler("addadmin", addadmin_cmd))
     app.add_handler(CommandHandler("rmadmin", rmadmin_cmd))
 
-    # Callback buttons
     app.add_handler(CallbackQueryHandler(on_quality_pressed, pattern=r"^q\|"))
     app.add_handler(CallbackQueryHandler(on_search_pick, pattern=r"^s\|"))
 
-    # Only respond to messages that are YouTube links (no generic text)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_or_link))
 
     log.info("Bot running…")
