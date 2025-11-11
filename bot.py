@@ -133,7 +133,7 @@ def sanitize_filename(name: str) -> str:
 async def download_and_send(update: Update, context: ContextTypes.DEFAULT_TYPE, url: str, quality: str):
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
 
-    # yt-dlp setup
+    # --- yt-dlp opts ---
     if quality == "mp3":
         ydl_opts = {
             "outtmpl": str(DOWNLOAD_DIR / "%(title)s.%(ext)s"),
@@ -157,7 +157,7 @@ async def download_and_send(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         }
 
     try:
-        # download
+        # --- download with yt-dlp ---
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
             title = sanitize_filename(info.get("title") or "output")
@@ -166,14 +166,16 @@ async def download_and_send(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         files = list(DOWNLOAD_DIR.glob(f"*{ext}"))
         if not files:
             raise FileNotFoundError("Downloaded file not found")
+
         final_path = sorted(files, key=lambda p: p.stat().st_mtime, reverse=True)[0]
 
-        if final_path.stat().st_size < 1000:
-            raise RuntimeError(f"{final_path.name} seems empty")
+        # check file size
+        if final_path.stat().st_size < 500:
+            raise RuntimeError("File is empty or incomplete")
 
         caption = f"Here ya go 😎\\nSource: {url}"
 
-        # upload section
+        # --- Upload MP3 ---
         if quality == "mp3":
             safe_name = f"{title}.mp3"
             safe_path = DOWNLOAD_DIR / safe_name
@@ -182,6 +184,7 @@ async def download_and_send(update: Update, context: ContextTypes.DEFAULT_TYPE, 
                 final_path = safe_path
 
             await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.UPLOAD_AUDIO)
+
             try:
                 with open(final_path, "rb") as f:
                     await update.message.reply_audio(
@@ -191,11 +194,12 @@ async def download_and_send(update: Update, context: ContextTypes.DEFAULT_TYPE, 
                         performer="YouTube 🎧"
                     )
             except Exception as e:
-                # fallback as document if Telegram refuses audio
+                # fallback: send as document if Telegram rejects as audio
                 await update.message.reply_text(f"⚠️ Audio upload failed ({e}), sending as file instead…")
                 with open(final_path, "rb") as f:
                     await update.message.reply_document(InputFile(f, filename=safe_name), caption=caption)
 
+        # --- Upload Video ---
         else:
             await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.UPLOAD_VIDEO)
             with open(final_path, "rb") as f:
@@ -203,6 +207,7 @@ async def download_and_send(update: Update, context: ContextTypes.DEFAULT_TYPE, 
 
     except Exception as e:
         await update.message.reply_text(f"⚠️ Error: {e}")
+
 
 
 
