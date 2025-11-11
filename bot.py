@@ -230,8 +230,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = [
         "Yo, I’m alive ⚡",
         "send a YouTube link and pick a quality,",
-        "Send me:- Name of the track",
-        "- Performer"'
+        "Send me:- /search (Name of the track)",
+        "- Performer",
         "- Words from a song",
         "- Link from Youtube",
         "Created by :- @mahadev_ki_iccha ",
