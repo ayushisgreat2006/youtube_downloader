@@ -142,7 +142,13 @@ def sanitize_filename(name: str) -> str:
 async def download_and_send(update: Update, context: ContextTypes.DEFAULT_TYPE, url: str, quality: str):
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
 
-    cookiefile = write_cookies_if_any()
+    def write_cookies_if_any() -> Optional[str]:
+    if COOKIES_TXT_ENV:
+        tmp = Path("/tmp/cookies.txt")
+        tmp.write_text(COOKIES_TXT_ENV, encoding="utf-8")
+        return str(tmp)   # <- make sure it’s str not Path
+    return None
+
 
     # Build format
     if quality == "mp3":
@@ -170,7 +176,7 @@ async def download_and_send(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         }
 
     if cookiefile:
-        ydl_opts["cookiefile"] = cookiefile
+        ydl_opts["cookiefile"] = str(cookiefile) if not hasattr(cookiefile, "read") else cookiefile
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
