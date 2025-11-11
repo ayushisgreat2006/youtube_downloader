@@ -30,7 +30,6 @@ import subprocess
 BOT_TOKEN = os.getenv("BOT_TOKEN")  # <- set on Railway/Koyeb env vars
 OWNER_ID = int(os.getenv("OWNER_ID", "7941244038"))  # your TG ID
 UPDATES_CHANNEL = os.getenv("UPDATES_CHANNEL", "@tonystark_jr")  # optional, shown in /start
-COOKIES_TXT_ENV = os.getenv("COOKIES_TXT")  # optional: paste cookies file content as env var
 
 # File persistence (ephemeral on redeploys)
 DATA_DIR = Path("data"); DATA_DIR.mkdir(exist_ok=True)
@@ -94,7 +93,6 @@ def set_admins(admin_ids: Set[int]):
 
 def is_admin(user_id: int) -> bool:
     return user_id in get_admins()
-    cookiefile = write_cookies_if_any()
 
 
 def human_list_users(users_map: Dict[str, Dict[str, str]], limit: int = 60) -> Tuple[str, Optional[str]]:
@@ -135,7 +133,6 @@ def sanitize_filename(name: str) -> str:
 async def download_and_send(update: Update, context: ContextTypes.DEFAULT_TYPE, url: str, quality: str):
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
 
-    cookiefile = write_cookies_if_any()
 
     # Build format
     if quality == "mp3":
@@ -162,9 +159,7 @@ async def download_and_send(update: Update, context: ContextTypes.DEFAULT_TYPE, 
             "no_warnings": True,
         }
 
-    if cookiefile:
-        ydl_opts["cookiefile"] = cookiefile
-
+    
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
@@ -290,8 +285,7 @@ async def search_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "extract_flat": "in_playlist",
         "noplaylist": True,
     }
-    if write_cookies_if_any():
-        ydl_opts["cookiefile"] = "/tmp/cookies.txt"
+    
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
