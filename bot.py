@@ -94,14 +94,7 @@ def set_admins(admin_ids: Set[int]):
 
 def is_admin(user_id: int) -> bool:
     return user_id in get_admins()
-
-
-def write_cookies_if_any() -> Optional[str]:
-    if COOKIES_TXT_ENV:
-        tmp = Path("/tmp/cookies.txt")
-        tmp.write_text(COOKIES_TXT_ENV, encoding="utf-8")
-        return str(tmp)
-    return None
+    cookiefile = write_cookies_if_any()
 
 
 def human_list_users(users_map: Dict[str, Dict[str, str]], limit: int = 60) -> Tuple[str, Optional[str]]:
@@ -142,13 +135,7 @@ def sanitize_filename(name: str) -> str:
 async def download_and_send(update: Update, context: ContextTypes.DEFAULT_TYPE, url: str, quality: str):
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
 
-    def write_cookies_if_any() -> Optional[str]:
-    if COOKIES_TXT_ENV:
-        tmp = Path("/tmp/cookies.txt")
-        tmp.write_text(COOKIES_TXT_ENV, encoding="utf-8")
-        return str(tmp)   # <- make sure it’s str not Path
-    return None
-
+    cookiefile = write_cookies_if_any()
 
     # Build format
     if quality == "mp3":
@@ -176,7 +163,7 @@ async def download_and_send(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         }
 
     if cookiefile:
-        ydl_opts["cookiefile"] = str(cookiefile) if not hasattr(cookiefile, "read") else cookiefile
+        ydl_opts["cookiefile"] = cookiefile
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
