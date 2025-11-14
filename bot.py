@@ -135,13 +135,14 @@ def sanitize_filename(name: str) -> str:
 async def download_and_send(update: Update, context: ContextTypes.DEFAULT_TYPE, url: str, quality: str):
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
 
-    # yt-dlp setup
+    # --- yt-dlp options (cookie-less & clean) ---
     if quality == "mp3":
         ydl_opts = {
             "outtmpl": str(DOWNLOAD_DIR / "%(title)s.%(ext)s"),
             "format": "bestaudio/best",
             "quiet": True,
             "no_warnings": True,
+            "extract_flat": False,
             "postprocessors": [{
                 "key": "FFmpegExtractAudio",
                 "preferredcodec": "mp3",
@@ -156,10 +157,10 @@ async def download_and_send(update: Update, context: ContextTypes.DEFAULT_TYPE, 
             "merge_output_format": "mp4",
             "quiet": True,
             "no_warnings": True,
+            "extract_flat": False,
         }
 
     try:
-        # download
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
             title = sanitize_filename(info.get("title") or "output")
@@ -168,54 +169,38 @@ async def download_and_send(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         files = list(DOWNLOAD_DIR.glob(f"*{ext}"))
         if not files:
             raise FileNotFoundError("Downloaded file not found")
+
         final_path = sorted(files, key=lambda p: p.stat().st_mtime, reverse=True)[0]
 
-        if final_path.stat().st_size < 1024:
+        # verify file
+        if final_path.stat().st_size < 500:
             raise RuntimeError("File is empty or incomplete")
 
-        caption = f"Here ya go 😎 Created by @mahadev_ki_iccha \nSource: {url}"
+        caption = f"Here ya go 😎\n Downloaded with :- @spotifyxmusixbot"
 
+        # send audio
         if quality == "mp3":
-            # clean filename for Telegram
             safe_name = f"{title}.mp3"
             safe_path = DOWNLOAD_DIR / safe_name
             if final_path != safe_path:
-                try:
-                    final_path.rename(safe_path)
-                except Exception:
-                    safe_path.write_bytes(final_path.read_bytes())
+                final_path.rename(safe_path)
                 final_path = safe_path
 
-            # send as audio if <= ~49MB, else as document
-            size = final_path.stat().st_size
-            if size <= 49 * 1024 * 1024:
-                await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.UPLOAD_DOCUMENT)
-                try:
-                    with open(final_path, "rb") as f:
-                        await update.message.reply_audio(
-                            audio=InputFile(f, filename=safe_name),
-                            caption=caption,
-                            title=title,
-                            performer="@spotifyxmusixbot 🎧",
-                        )
-                except Exception:
-                    with open(final_path, "rb") as f:
-                        await update.message.reply_document(InputFile(f, filename=safe_name), caption=f"(Fallback)\n{caption}")
-            else:
-                await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.UPLOAD_DOCUMENT)
-                with open(final_path, "rb") as f:
-                    await update.message.reply_document(InputFile(f, filename=safe_name), caption=caption)
+            await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.UPLOAD_AUDIO)
 
+            with open(final_path, "rb") as f:
+                await update.message.reply_audio(
+                    audio=InputFile(f, filename=safe_name),
+                    caption=caption,
+                    title=title,
+                    performer="@spotifyxmusixbot 🎧"
+                )
+
+        # send video
         else:
             await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.UPLOAD_VIDEO)
             with open(final_path, "rb") as f:
                 await update.message.reply_video(video=f, caption=caption)
-
-        # cleanup others
-        for p in DOWNLOAD_DIR.glob("*"):
-            if p.is_file() and p != final_path:
-                try: p.unlink()
-                except: pass
 
     except Exception as e:
         await update.message.reply_text(f"⚠️ Error: {e}")
