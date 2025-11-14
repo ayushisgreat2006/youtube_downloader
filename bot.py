@@ -204,6 +204,12 @@ async def download_and_send(update: Update, context: ContextTypes.DEFAULT_TYPE, 
 
     except Exception as e:
         await update.message.reply_text(f"⚠️ Error: {e}")
+        # --- Apply cookies from Railway env if available ---
+    cookies_env = os.getenv("COOKIES_TXT")
+    if cookies_env:
+        cookiefile = "/tmp/cookies.txt"
+        Path(cookiefile).write_text(cookies_env, encoding="utf-8")
+        ydl_opts["cookiefile"] = cookiefile
 
 
 # =========================
