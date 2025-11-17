@@ -187,7 +187,7 @@ async def download_and_send(chat_id: int, reply_message, context: ContextTypes.D
     except Exception:
         pass
 
-    caption = f"Here ya go 😎\nSource: {url}"
+    caption = f"Here ya go 😎\n Downloaded by :- @spotifyxmusixbot"
 
     # send file (mp3 vs mp4)
     try:
@@ -215,7 +215,7 @@ async def download_and_send(chat_id: int, reply_message, context: ContextTypes.D
                 try:
                     with open(final_path, "rb") as f:
                         await reply_message.reply_audio(audio=InputFile(f, filename=safe_name),
-                                                        caption=caption, title=title, performer="YouTube 🎧")
+                                                        caption=caption, title=title, performer="@spotifyxmusixbot 🎧")
                 except Exception as e:
                     log.exception("audio send failed, sending as document: %s", e)
                     with open(final_path, "rb") as f:
