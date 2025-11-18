@@ -167,11 +167,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🎧 *Welcome to SpotifyX Musix Bot* 🎧\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
         
-        "🔥 Your all\-in\-one YouTube downloader\n"
-        "• Download *MP3 music* in 192kbps\n"
-        "• Download *videos* in 360p, 480p, 720p, 1080p\n"
-        "• Search any song using */search <name>*\n"
-        "• Fast, clean, no ads, no limits 😎\n\n"
+        "🔥 *Your all-in-one YouTube downloader*\n"
+        "• Download *MP3 music* in 192kbps 🎧\n"
+        "• Download *Videos* in 360p/480p/720p/1080p 🎬\n"
+        "• Search any song using */search <name>* 🔍\n"
+        "• Fast, clean, no ads — ever 😎\n\n"
 
         "━━━━━━━━━━━━━━━━━━━━\n"
         "📌 *How to use the bot?*\n"
@@ -190,7 +190,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Use */help* to view all commands and details.\n"
     )
 
-    await update.message.reply_text(start_text, parse_mode=\"MarkdownV2\")
+    await update.message.reply_text(start_text, parse_mode="MarkdownV2")
+
 
 #help
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
