@@ -13,7 +13,7 @@ from telegram import (
     InlineKeyboardButton,
     InputFile,
 )
-from telegram.constants import ChatAction
+from telegram.constants import ChatAction, ParseMode
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -49,7 +49,6 @@ log = logging.getLogger("ytbot")
 # =========================
 
 try:
-    # Connect to MongoDB with proper settings for Atlas
     mongo = MongoClient(
         MONGO_URI,
         tls=True,
@@ -58,7 +57,6 @@ try:
         retryWrites=True,
         w='majority'
     )
-    # Test connection
     mongo.admin.command('ping')
     db = mongo[MONGO_DB]
     users_col = db[MONGO_USERS]
@@ -75,7 +73,6 @@ except Exception as e:
 # =========================
 
 def ensure_user(update: Update):
-    """Track users only if database is available"""
     if not MONGO_AVAILABLE or not update.effective_user:
         return
     try:
@@ -89,7 +86,6 @@ def ensure_user(update: Update):
         log.error(f"User tracking failed: {e}")
 
 def is_admin(user_id: int) -> bool:
-    """Check admin status without database dependency"""
     return int(user_id) == OWNER_ID
 
 def sanitize_filename(name: str) -> str:
@@ -117,7 +113,6 @@ def quality_keyboard(url: str) -> InlineKeyboardMarkup:
 # =========================
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    """Log errors and prevent crashes"""
     log.error("Exception while handling an update:", exc_info=context.error)
 
 # =========================
@@ -171,7 +166,7 @@ async def download_and_send(chat_id, reply_msg, context, url, quality):
         return
 
     final_path = files[0]
-    caption = f"Downloaded by :- @spotifyxmusixbot"
+    caption = f"Downloaded by @spotifyxmusixbot"
 
     try:
         if quality == "mp3":
@@ -192,74 +187,74 @@ async def download_and_send(chat_id, reply_msg, context, url, quality):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ensure_user(update)
 
-    # FIXED: Properly escaped MarkdownV2 formatting
+    # FIXED: Use HTML instead of MarkdownV2
     start_text = (
-        "🎧 *Welcome to SpotifyX Musix Bot* 🎧\n"
-        "\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\n\\n"
+        "<b>🎧 Welcome to SpotifyX Musix Bot 🎧</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
         
-        "🔥 *Your all\\-in\\-one YouTube downloader*\\n"
-        "• Download *MP3 music* in 192kbps 🎧\\n"
-        "• Download *Videos* in 360p/480p/720p/1080p 🎬\\n"
-        "• Search any song using */search <name>* 🔍\\n"
-        "• Fast, clean, no ads — ever 😎\\n\\n"
+        "<b>🔥 Your all-in-one YouTube downloader</b>\n"
+        "• Download <b>MP3 music</b> in 192kbps 🎧\n"
+        "• Download <b>Videos</b> in 360p/480p/720p/1080p 🎬\n"
+        "• Search any song using <code>/search &lt;name&gt;</code> 🔍\n"
+        "• Fast, clean, no ads — ever 😎\n\n"
 
-        "\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\n"
-        "📌 *How to use the bot\\?*\\n"
-        "1\\. Send any *YouTube link* → choose quality\\n"
-        "2\\. Or use */search* to find songs\\n"
-        "3\\. Audio & video sent instantly ⚡\\n\\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "<b>📌 How to use the bot?</b>\n"
+        "1. Send any <b>YouTube link</b> → choose quality\n"
+        "2. Or use <code>/search</code> to find songs\n"
+        "3. Audio & video sent instantly ⚡\n\n"
 
-        "\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\n"
-        "📢 *Important Links*\\n"
-        f"• Updates: {UPDATES_CHANNEL}\\n"
-        "• Report Issue: @mahadev_ki_iccha\\n"
-        "• Paid Bots / Promo: @mahadev_ki_iccha\\n\\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "<b>📢 Important Links</b>\n"
+        f"• Updates: {UPDATES_CHANNEL}\n"
+        "• Report Issue: @mahadev_ki_iccha\n"
+        "• Paid Bots / Promo: @mahadev_ki_iccha\n\n"
 
-        "\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\n"
-        "❓ *Need full guide\\?*\\n"
-        "Use */help* to view all commands and details\\.\\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "<b>❓ Need full guide?</b>\n"
+        "Use <code>/help</code> to view all commands and details.\n"
     )
 
-    await update.message.reply_text(start_text, parse_mode="MarkdownV2")
+    await update.message.reply_text(start_text, parse_mode=ParseMode.HTML)
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ensure_user(update)
     
-    # FIXED: Properly escaped MarkdownV2 formatting
+    # FIXED: Use HTML instead of MarkdownV2
     help_text = (
-        "✨ *SpotifyX Musix Bot — Full Guide* ✨\\n"
-        "\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\n\\n"
+        "<b>✨ SpotifyX Musix Bot — Full Guide ✨</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
 
-        "🔥 *What this bot can do\\?*\\n"
-        "• Download *MP3 music* 🎧\\n"
-        "• Download *YouTube Videos* \\(360p/480p/720p/1080p\\) 🎬\\n"
-        "• Search any song / video via */search*\\n"
-        "• Fast, free, no ads — ever 😎\\n"
-        "• Auto quality menu on YouTube link\\n\\n"
+        "<b>🔥 What this bot can do?</b>\n"
+        "• Download <b>MP3 music</b> 🎧\n"
+        "• Download <b>YouTube Videos</b> (360p/480p/720p/1080p) 🎬\n"
+        "• Search any song / video via <code>/search</code>\n"
+        "• Fast, free, no ads — ever 😎\n"
+        "• Auto quality menu on YouTube link\n\n"
 
-        "\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\n"
-        "📌 *How to use the bot\\?*\\n"
-        "1\\. Send *any YouTube link* → choose quality\\n"
-        "2\\. Use */search <name>* → pick result → choose quality\\n"
-        "3\\. Use */start* anytime if bot feels sleepy 😴\\n"
-        "4\\. MP3 download gives best audio 192kbps\\n\\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "<b>📌 How to use the bot?</b>\n"
+        "1. Send <b>any YouTube link</b> → choose quality\n"
+        "2. Use <code>/search &lt;name&gt;</code> → pick result → choose quality\n"
+        "3. Use <code>/start</code> anytime if bot feels sleepy 😴\n"
+        "4. MP3 download gives best audio 192kbps\n\n"
 
-        "\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\n"
-        "📢 *Important Links*\\n"
-        f"• Updates Channel: {UPDATES_CHANNEL}\\n"
-        "• Report Issue: @ayushxchat_robot\\n"
-        "• Contact for Paid Bots / Cross Promo: @mahadev_ki_iccha\\n\\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "<b>📢 Important Links</b>\n"
+        f"• Updates Channel: {UPDATES_CHANNEL}\n"
+        "• Report Issue: @ayushxchat_robot\n"
+        "• Contact for Paid Bots / Cross Promo: @mahadev_ki_iccha\n\n"
 
-        "\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\n"
-        "👑 *Admin Commands*\\n"
-        "• /stats — Show user count\\n"
-        "• /broadcast <text> — send message to all users\\n\\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "<b>👑 Admin Commands</b>\n"
+        "• /stats — Show user count\n"
+        "• /broadcast &lt;text&gt; — send message to all users\n\n"
 
-        "\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\n"
-        "🤖 *Bot Created By*\\n"
-        "• *Tony Stark Jr*⚡\\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "<b>🤖 Bot Created By</b>\n"
+        "• <b>Tony Stark Jr</b>⚡\n"
     )
-    await update.message.reply_text(help_text, parse_mode="MarkdownV2")
+    await update.message.reply_text(help_text, parse_mode=ParseMode.HTML)
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ensure_user(update)
@@ -375,7 +370,7 @@ async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # =========================
 
 def main():
-    # Ensure only one instance runs
+    # Ensure clean shutdown
     import signal
     import sys
     
