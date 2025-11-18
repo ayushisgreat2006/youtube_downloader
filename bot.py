@@ -48,28 +48,47 @@ log = logging.getLogger("ytbot")
 # MongoDB Setup
 # =========================
 
-mongo = MongoClient(MONGO_URI)
-db = mongo[MONGO_DB]
-users_col = db[MONGO_USERS]
+# Add error handler for the application
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    log.error("Exception while handling an update:", exc_info=context.error)
+
+try:
+    mongo = MongoClient(
+        MONGO_URI,
+        tls=True,
+        tlsAllowInvalidCertificates=False,
+        serverSelectionTimeoutMS=5000,
+        retryWrites=True,
+        w='majority'
+    )
+    mongo.admin.command('ping')
+    db = mongo[MONGO_DB]
+    users_col = db[MONGO_USERS]
+    log.info("✅ MongoDB connected successfully")
+except Exception as e:
+    log.error(f"❌ MongoDB connection failed: {e}")
+    log.warning("Bot will run without database features")
+    mongo = db = users_col = None
 
 # =========================
 # Helpers
 # =========================
 
 def ensure_user(update: Update):
-    u = update.effective_user
-    if not u:
+    if not mongo or not update.effective_user:
         return
-    users_col.update_one(
-        {"_id": u.id},
-        {"$set": {"name": u.full_name or u.username or str(u.id)}},
-        upsert=True
-    )
+    try:
+        u = update.effective_user
+        users_col.update_one(
+            {"_id": u.id},
+            {"$set": {"name": u.full_name or u.username or str(u.id)}},
+            upsert=True
+        )
+    except Exception as e:
+        log.error(f"User tracking failed: {e}")
 
 def is_admin(user_id: int) -> bool:
-    user_id = int(user_id)
-    owner_admin_list = [OWNER_ID]
-    return user_id in owner_admin_list
+    return int(user_id) == OWNER_ID
 
 def sanitize_filename(name: str) -> str:
     name = re.sub(r'[\\/*?:"<>|]', "", name)
@@ -159,19 +178,21 @@ async def download_and_send(chat_id, reply_msg, context, url, quality):
 # =========================
 # Handlers
 # =========================
+
 # start
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ensure_user(update)
 
+    # FIXED: Escaped hyphens for MarkdownV2
     start_text = (
         "🎧 *Welcome to SpotifyX Musix Bot* 🎧\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
         
-        "🔥 *Your all-in-one YouTube downloader*\n"
+        "🔥 *Your all\\-in\\-one YouTube downloader*\n"  # Escaped hyphens
         "• Download *MP3 music* in 192kbps 🎧\n"
         "• Download *Videos* in 360p/480p/720p/1080p 🎬\n"
         "• Search any song using */search <name>* 🔍\n"
-        "• Fast, clean, no ads — ever 😎\n\n"
+        "• Fast, clean, no ads — ever 😎\n\n"  # The em dash is fine
 
         "━━━━━━━━━━━━━━━━━━━━\n"
         "📌 *How to use the bot?*\n"
@@ -192,10 +213,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(start_text, parse_mode="MarkdownV2")
 
-
-#help
+# help
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ensure_user(update)
+    
+    # FIXED: Escaped hyphens for MarkdownV2
     help_text = (
         "✨ *SpotifyX Musix Bot — Full Guide* ✨\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -230,7 +252,6 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• *Tony Stark Jr*⚡\n"
     )
     await update.message.reply_text(help_text, parse_mode="MarkdownV2")
-
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ensure_user(update)
@@ -288,7 +309,7 @@ async def search_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         title = sanitize_filename(e.get("title") or "video")
         url = e.get("url") or e.get("webpage_url")
         if not url.startswith("http"):
-            url = "https://youtube.com/watch?v=" + url
+            url = "https://youtube.com/watch?v= " + url
         token = str(abs(hash((url, os.urandom(4)))))[:10]
         PENDING[token] = url
         buttons.append([InlineKeyboardButton(title[:60], callback_data=f"s|{token}|pick")])
@@ -312,6 +333,9 @@ async def on_search_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
+    if not mongo:
+        await update.message.reply_text("Database is not available")
+        return
     total = users_col.count_documents({})
     docs = users_col.find().limit(50)
     preview = "\n".join([f"{d['name']} — {d['_id']}" for d in docs])
@@ -319,6 +343,9 @@ async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
+        return
+    if not mongo:
+        await update.message.reply_text("Database is not available")
         return
     users = users_col.find({}, {"_id": 1})
     text = " ".join(context.args)
@@ -341,6 +368,9 @@ async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
+
+    # Add error handler
+    app.add_error_handler(error_handler)
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
