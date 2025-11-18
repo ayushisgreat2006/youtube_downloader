@@ -48,11 +48,8 @@ log = logging.getLogger("ytbot")
 # MongoDB Setup
 # =========================
 
-# Add error handler for the application
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    log.error("Exception while handling an update:", exc_info=context.error)
-
 try:
+    # Connect to MongoDB with proper settings for Atlas
     mongo = MongoClient(
         MONGO_URI,
         tls=True,
@@ -61,13 +58,16 @@ try:
         retryWrites=True,
         w='majority'
     )
+    # Test connection
     mongo.admin.command('ping')
     db = mongo[MONGO_DB]
     users_col = db[MONGO_USERS]
+    MONGO_AVAILABLE = True
     log.info("✅ MongoDB connected successfully")
 except Exception as e:
     log.error(f"❌ MongoDB connection failed: {e}")
     log.warning("Bot will run without database features")
+    MONGO_AVAILABLE = False
     mongo = db = users_col = None
 
 # =========================
@@ -75,7 +75,8 @@ except Exception as e:
 # =========================
 
 def ensure_user(update: Update):
-    if not mongo or not update.effective_user:
+    """Track users only if database is available"""
+    if not MONGO_AVAILABLE or not update.effective_user:
         return
     try:
         u = update.effective_user
@@ -88,6 +89,7 @@ def ensure_user(update: Update):
         log.error(f"User tracking failed: {e}")
 
 def is_admin(user_id: int) -> bool:
+    """Check admin status without database dependency"""
     return int(user_id) == OWNER_ID
 
 def sanitize_filename(name: str) -> str:
@@ -109,6 +111,14 @@ def quality_keyboard(url: str) -> InlineKeyboardMarkup:
          InlineKeyboardButton("1080p", callback_data=f"q|{token}|1080")],
         [InlineKeyboardButton("MP3 🎧", callback_data=f"q|{token}|mp3")],
     ])
+
+# =========================
+# Error Handler
+# =========================
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    """Log errors and prevent crashes"""
+    log.error("Exception while handling an update:", exc_info=context.error)
 
 # =========================
 # yt-dlp Downloader
@@ -179,77 +189,75 @@ async def download_and_send(chat_id, reply_msg, context, url, quality):
 # Handlers
 # =========================
 
-# start
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ensure_user(update)
 
-    # FIXED: Escaped hyphens for MarkdownV2
+    # FIXED: Properly escaped MarkdownV2 formatting
     start_text = (
         "🎧 *Welcome to SpotifyX Musix Bot* 🎧\n"
-        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        "\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\n\\n"
         
-        "🔥 *Your all\\-in\\-one YouTube downloader*\n"  # Escaped hyphens
-        "• Download *MP3 music* in 192kbps 🎧\n"
-        "• Download *Videos* in 360p/480p/720p/1080p 🎬\n"
-        "• Search any song using */search <name>* 🔍\n"
-        "• Fast, clean, no ads — ever 😎\n\n"  # The em dash is fine
+        "🔥 *Your all\\-in\\-one YouTube downloader*\\n"
+        "• Download *MP3 music* in 192kbps 🎧\\n"
+        "• Download *Videos* in 360p/480p/720p/1080p 🎬\\n"
+        "• Search any song using */search <name>* 🔍\\n"
+        "• Fast, clean, no ads — ever 😎\\n\\n"
 
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        "📌 *How to use the bot?*\n"
-        "1\\. Send any *YouTube link* → choose quality\n"
-        "2\\. Or use */search* to find songs\n"
-        "3\\. Audio & video sent instantly ⚡\n\n"
+        "\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\n"
+        "📌 *How to use the bot\\?*\\n"
+        "1\\. Send any *YouTube link* → choose quality\\n"
+        "2\\. Or use */search* to find songs\\n"
+        "3\\. Audio & video sent instantly ⚡\\n\\n"
 
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        "📢 *Important Links*\n"
-        f"• Updates: {UPDATES_CHANNEL}\n"
-        "• Report Issue: @mahadev_ki_iccha\n"
-        "• Paid Bots / Promo: @mahadev_ki_iccha\n\n"
+        "\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\n"
+        "📢 *Important Links*\\n"
+        f"• Updates: {UPDATES_CHANNEL}\\n"
+        "• Report Issue: @mahadev_ki_iccha\\n"
+        "• Paid Bots / Promo: @mahadev_ki_iccha\\n\\n"
 
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        "❓ *Need full guide?*\n"
-        "Use */help* to view all commands and details.\n"
+        "\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\n"
+        "❓ *Need full guide\\?*\\n"
+        "Use */help* to view all commands and details\\.\\n"
     )
 
     await update.message.reply_text(start_text, parse_mode="MarkdownV2")
 
-# help
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ensure_user(update)
     
-    # FIXED: Escaped hyphens for MarkdownV2
+    # FIXED: Properly escaped MarkdownV2 formatting
     help_text = (
-        "✨ *SpotifyX Musix Bot — Full Guide* ✨\n"
-        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        "✨ *SpotifyX Musix Bot — Full Guide* ✨\\n"
+        "\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\n\\n"
 
-        "🔥 *What this bot can do?*\n"
-        "• Download *MP3 music* 🎧\n"
-        "• Download *YouTube Videos* (360p/480p/720p/1080p) 🎬\n"
-        "• Search any song / video via */search*\n"
-        "• Fast, free, no ads — ever 😎\n"
-        "• Auto quality menu on YouTube link\n\n"
+        "🔥 *What this bot can do\\?*\\n"
+        "• Download *MP3 music* 🎧\\n"
+        "• Download *YouTube Videos* \\(360p/480p/720p/1080p\\) 🎬\\n"
+        "• Search any song / video via */search*\\n"
+        "• Fast, free, no ads — ever 😎\\n"
+        "• Auto quality menu on YouTube link\\n\\n"
 
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        "📌 *How to use the bot?*\n"
-        "1\\. Send *any YouTube link* → choose quality\n"
-        "2\\. Use */search <name>* → pick result → choose quality\n"
-        "3\\. Use */start* anytime if bot feels sleepy 😴\n"
-        "4\\. MP3 download gives best audio 192kbps\n\n"
+        "\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\n"
+        "📌 *How to use the bot\\?*\\n"
+        "1\\. Send *any YouTube link* → choose quality\\n"
+        "2\\. Use */search <name>* → pick result → choose quality\\n"
+        "3\\. Use */start* anytime if bot feels sleepy 😴\\n"
+        "4\\. MP3 download gives best audio 192kbps\\n\\n"
 
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        "📢 *Important Links*\n"
-        f"• Updates Channel: {UPDATES_CHANNEL}\n"
-        "• Report Issue: @ayushxchat_robot\n"
-        "• Contact for Paid Bots / Cross Promo: @mahadev_ki_iccha\n\n"
+        "\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\n"
+        "📢 *Important Links*\\n"
+        f"• Updates Channel: {UPDATES_CHANNEL}\\n"
+        "• Report Issue: @ayushxchat_robot\\n"
+        "• Contact for Paid Bots / Cross Promo: @mahadev_ki_iccha\\n\\n"
 
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        "👑 *Admin Commands*\n"
-        "• /stats — Show user count\n"
-        "• /broadcast <text> — send message to all users\n\n"
+        "\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\n"
+        "👑 *Admin Commands*\\n"
+        "• /stats — Show user count\\n"
+        "• /broadcast <text> — send message to all users\\n\\n"
 
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        "🤖 *Bot Created By*\n"
-        "• *Tony Stark Jr*⚡\n"
+        "\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\n"
+        "🤖 *Bot Created By*\\n"
+        "• *Tony Stark Jr*⚡\\n"
     )
     await update.message.reply_text(help_text, parse_mode="MarkdownV2")
 
@@ -333,7 +341,7 @@ async def on_search_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
-    if not mongo:
+    if not MONGO_AVAILABLE:
         await update.message.reply_text("Database is not available")
         return
     total = users_col.count_documents({})
@@ -344,7 +352,7 @@ async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
-    if not mongo:
+    if not MONGO_AVAILABLE:
         await update.message.reply_text("Database is not available")
         return
     users = users_col.find({}, {"_id": 1})
@@ -367,6 +375,16 @@ async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # =========================
 
 def main():
+    # Ensure only one instance runs
+    import signal
+    import sys
+    
+    def shutdown_handler(signum, frame):
+        log.info("Shutting down gracefully...")
+        sys.exit(0)
+    
+    signal.signal(signal.SIGTERM, shutdown_handler)
+    
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     # Add error handler
@@ -383,6 +401,7 @@ def main():
     app.add_handler(CallbackQueryHandler(on_quality, pattern=r"^q\|"))
     app.add_handler(CallbackQueryHandler(on_search_pick, pattern=r"^s\|"))
 
+    log.info("Bot is starting...")
     app.run_polling()
 
 if __name__ == "__main__":
