@@ -1,6 +1,5 @@
 import os
 import re
-import json
 import asyncio
 import logging
 from pathlib import Path
@@ -119,76 +118,84 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 # =========================
 
 async def download_and_send(chat_id, reply_msg, context, url, quality):
-    ydl_opts = {
-        "quiet": True,
-        "no_warnings": True,
-        "outtmpl": str(DOWNLOAD_DIR / "%(title)s.%(ext)s"),
-    }
-
-    if quality == "mp3":
-        ydl_opts.update({
-            "format": "bestaudio/best",
-            "postprocessors": [{
-                "key": "FFmpegExtractAudio",
-                "preferredcodec": "mp3",
-                "preferredquality": "192",
-            }],
-        })
-    else:
-        # FIXED: Add faststart for Telegram streaming
-        ydl_opts.update({
-            "format": f"bestvideo[height<={quality}]+bestaudio/best",
-            "postprocessors": [{
-                "key": "FFmpegVideoConvertor",
-                "preferedformat": "mp4",
-            }],
-            "postprocessor_args": {
-                "MOV+FFmpegVideoConvertor+mp4": ["-movflags", "+faststart"]
-            }
-        })
-
-    if COOKIES_TXT:
-        try:
-            cookie_path = Path("/tmp/cookies.txt")
-            cookie_path.write_text(COOKIES_TXT, encoding="utf-8")
-            ydl_opts["cookiefile"] = str(cookie_path)
-        except Exception as e:
-            log.error(f"Cookie write failed: {e}")
-
     try:
+        # Prepare download options
+        ydl_opts = {
+            "quiet": True,
+            "no_warnings": True,
+            "outtmpl": str(DOWNLOAD_DIR / "%(title)s.%(ext)s"),
+        }
+
+        if quality == "mp3":
+            # Audio download settings
+            ydl_opts.update({
+                "format": "bestaudio/best",
+                "postprocessors": [{
+                    "key": "FFmpegExtractAudio",
+                    "preferredcodec": "mp3",
+                    "preferredquality": "192",
+                }],
+            })
+        else:
+            # Video download settings - optimized for Telegram streaming
+            # FIXED: Use H.264 + AAC for maximum compatibility
+            ydl_opts.update({
+                "format": f"bestvideo[height<={quality}][vcodec^=avc]+bestaudio[acodec^=mp4a]/best[height<={quality}]",
+                "postprocessors": [{
+                    "key": "FFmpegVideoConvertor",
+                    "preferedformat": "mp4",
+                }],
+                "postprocessor_args": {
+                    "MOV+FFmpegVideoConvertor+mp4": [
+                        "-movflags", "+faststart",  # Enable streaming
+                        "-preset", "medium",        # Balance quality/size
+                        "-crf", "23",              # Quality level
+                    ]
+                }
+            })
+
+        if COOKIES_TXT:
+            try:
+                cookie_path = Path("/tmp/cookies.txt")
+                cookie_path.write_text(COOKIES_TXT, encoding="utf-8")
+                ydl_opts["cookiefile"] = str(cookie_path)
+            except Exception as e:
+                log.error(f"Cookie write failed: {e}")
+
+        # Extract and download
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
             title = sanitize_filename(info.get("title", "video"))
-    except Exception as e:
-        await reply_msg.reply_text(f"⚠️ Download failed: {e}")
-        return
 
-    ext = ".mp3" if quality == "mp3" else ".mp4"
-    files = sorted(DOWNLOAD_DIR.glob(f"*{ext}"), key=lambda p: p.stat().st_mtime, reverse=True)
-    if not files:
-        await reply_msg.reply_text("⚠️ File not found after download.")
-        return
+        # Get downloaded file
+        ext = ".mp3" if quality == "mp3" else ".mp4"
+        files = sorted(DOWNLOAD_DIR.glob(f"*{ext}"), key=lambda p: p.stat().st_mtime, reverse=True)
+        if not files:
+            await reply_msg.reply_text("⚠️ File not found after download.")
+            return
 
-    final_path = files[0]
-    caption = f"Downloaded by @spotifyxmusixbot"
+        final_path = files[0]
+        caption = f"📥 {title}\n\nDownloaded by @spotifyxmusixbot"
 
-    try:
-        # FIXED: Send MP3 as document, video with streaming support
+        # FIXED: Send files properly
         if quality == "mp3":
+            # Send MP3 as document (bypasses audio size limits)
             await reply_msg.reply_document(
                 document=final_path,
                 caption=caption,
                 filename=f"{title}.mp3"
             )
         else:
+            # Send video with streaming support (plays while downloading)
             await reply_msg.reply_video(
                 video=final_path,
                 caption=caption,
                 filename=f"{title}.mp4",
-                supports_streaming=True  # Enable Telegram streaming
+                supports_streaming=True  # This enables Telegram streaming
             )
+
     except Exception as e:
-        await reply_msg.reply_text(f"⚠️ Upload failed: {e}")
+        await reply_msg.reply_text(f"⚠️ Error: {e}")
 
 # =========================
 # Handlers
@@ -197,7 +204,6 @@ async def download_and_send(chat_id, reply_msg, context, url, quality):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ensure_user(update)
 
-    # FIXED: Use HTML for reliability
     start_text = (
         "<b>🎧 Welcome to SpotifyX Musix Bot 🎧</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -301,7 +307,7 @@ async def search_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "no_warnings": True,
         "skip_download": True,
         "default_search": "ytsearch5",
-        "extract_flat": "in_playlist",
+        "extract_flat": False,  # Fixed: Need full info
     }
 
     try:
@@ -319,9 +325,8 @@ async def search_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     buttons = []
     for e in entries[:5]:
         title = sanitize_filename(e.get("title") or "video")
-        url = e.get("url") or e.get("webpage_url")
-        if not url.startswith("http"):
-            url = "https://youtube.com/watch?v= " + url
+        video_id = e.get('id')
+        url = f"https://youtube.com/watch?v={video_id}" if video_id else e.get('webpage_url')
         token = str(abs(hash((url, os.urandom(4)))))[:10]
         PENDING[token] = url
         buttons.append([InlineKeyboardButton(title[:60], callback_data=f"s|{token}|pick")])
@@ -379,7 +384,6 @@ async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # =========================
 
 def main():
-    # Graceful shutdown
     import signal
     import sys
     
