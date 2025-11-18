@@ -13,7 +13,7 @@ from telegram import (
     InlineKeyboardButton,
     InputFile,
 )
-from telegram.constants import ChatAction, ParseMode
+from telegram.constants import ParseMode
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -64,7 +64,6 @@ try:
     log.info("✅ MongoDB connected successfully")
 except Exception as e:
     log.error(f"❌ MongoDB connection failed: {e}")
-    log.warning("Bot will run without database features")
     MONGO_AVAILABLE = False
     mongo = db = users_col = None
 
@@ -120,11 +119,6 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 # =========================
 
 async def download_and_send(chat_id, reply_msg, context, url, quality):
-    try:
-        await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
-    except:
-        pass
-
     ydl_opts = {
         "quiet": True,
         "no_warnings": True,
@@ -141,7 +135,17 @@ async def download_and_send(chat_id, reply_msg, context, url, quality):
             }],
         })
     else:
-        ydl_opts["format"] = f"bestvideo[height<={quality}]+bestaudio/best"
+        # FIXED: Add faststart for Telegram streaming
+        ydl_opts.update({
+            "format": f"bestvideo[height<={quality}]+bestaudio/best",
+            "postprocessors": [{
+                "key": "FFmpegVideoConvertor",
+                "preferedformat": "mp4",
+            }],
+            "postprocessor_args": {
+                "MOV+FFmpegVideoConvertor+mp4": ["-movflags", "+faststart"]
+            }
+        })
 
     if COOKIES_TXT:
         try:
@@ -169,14 +173,20 @@ async def download_and_send(chat_id, reply_msg, context, url, quality):
     caption = f"Downloaded by @spotifyxmusixbot"
 
     try:
+        # FIXED: Send MP3 as document, video with streaming support
         if quality == "mp3":
-            await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_AUDIO)
-            with open(final_path, "rb") as f:
-                await reply_msg.reply_audio(InputFile(f, filename=final_path.name), caption=caption, title=title)
+            await reply_msg.reply_document(
+                document=final_path,
+                caption=caption,
+                filename=f"{title}.mp3"
+            )
         else:
-            await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_VIDEO)
-            with open(final_path, "rb") as f:
-                await reply_msg.reply_video(InputFile(f, filename=final_path.name), caption=caption)
+            await reply_msg.reply_video(
+                video=final_path,
+                caption=caption,
+                filename=f"{title}.mp4",
+                supports_streaming=True  # Enable Telegram streaming
+            )
     except Exception as e:
         await reply_msg.reply_text(f"⚠️ Upload failed: {e}")
 
@@ -187,7 +197,7 @@ async def download_and_send(chat_id, reply_msg, context, url, quality):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ensure_user(update)
 
-    # FIXED: Use HTML instead of MarkdownV2
+    # FIXED: Use HTML for reliability
     start_text = (
         "<b>🎧 Welcome to SpotifyX Musix Bot 🎧</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -220,7 +230,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ensure_user(update)
     
-    # FIXED: Use HTML instead of MarkdownV2
     help_text = (
         "<b>✨ SpotifyX Musix Bot — Full Guide ✨</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -370,7 +379,7 @@ async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # =========================
 
 def main():
-    # Ensure clean shutdown
+    # Graceful shutdown
     import signal
     import sys
     
@@ -381,8 +390,6 @@ def main():
     signal.signal(signal.SIGTERM, shutdown_handler)
     
     app = ApplicationBuilder().token(BOT_TOKEN).build()
-
-    # Add error handler
     app.add_error_handler(error_handler)
 
     app.add_handler(CommandHandler("start", start))
@@ -392,7 +399,6 @@ def main():
     app.add_handler(CommandHandler("broadcast", broadcast_cmd))
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-
     app.add_handler(CallbackQueryHandler(on_quality, pattern=r"^q\|"))
     app.add_handler(CallbackQueryHandler(on_search_pick, pattern=r"^s\|"))
 
