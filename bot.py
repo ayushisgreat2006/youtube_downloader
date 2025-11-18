@@ -119,7 +119,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 
 async def download_and_send(chat_id, reply_msg, context, url, quality):
     try:
-        # Prepare download options
+        # SIMPLIFIED: Standard MP4 format that Telegram plays natively
         ydl_opts = {
             "quiet": True,
             "no_warnings": True,
@@ -127,7 +127,7 @@ async def download_and_send(chat_id, reply_msg, context, url, quality):
         }
 
         if quality == "mp3":
-            # Audio download settings
+            # Audio download
             ydl_opts.update({
                 "format": "bestaudio/best",
                 "postprocessors": [{
@@ -137,19 +137,15 @@ async def download_and_send(chat_id, reply_msg, context, url, quality):
                 }],
             })
         else:
-            # Video download settings - optimized for Telegram streaming
-            # FIXED: Use H.264 + AAC for maximum compatibility
+            # SIMPLIFIED: Just get best video up to selected quality + best audio
+            # Telegram natively supports MP4 with H.264 and AAC
             ydl_opts.update({
-                "format": f"bestvideo[height<={quality}][vcodec^=avc]+bestaudio[acodec^=mp4a]/best[height<={quality}]",
-                "postprocessors": [{
-                    "key": "FFmpegVideoConvertor",
-                    "preferedformat": "mp4",
-                }],
+                "format": f"bestvideo[height<={quality}]+bestaudio/best[height<={quality}]",
+                "merge_output_format": "mp4",  # Ensure MP4 output
                 "postprocessor_args": {
                     "MOV+FFmpegVideoConvertor+mp4": [
                         "-movflags", "+faststart",  # Enable streaming
-                        "-preset", "medium",        # Balance quality/size
-                        "-crf", "23",              # Quality level
+                        "-preset", "faster",        # Faster encoding
                     ]
                 }
             })
@@ -162,12 +158,12 @@ async def download_and_send(chat_id, reply_msg, context, url, quality):
             except Exception as e:
                 log.error(f"Cookie write failed: {e}")
 
-        # Extract and download
+        # Download
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
             title = sanitize_filename(info.get("title", "video"))
 
-        # Get downloaded file
+        # Find downloaded file
         ext = ".mp3" if quality == "mp3" else ".mp4"
         files = sorted(DOWNLOAD_DIR.glob(f"*{ext}"), key=lambda p: p.stat().st_mtime, reverse=True)
         if not files:
@@ -175,27 +171,39 @@ async def download_and_send(chat_id, reply_msg, context, url, quality):
             return
 
         final_path = files[0]
-        caption = f"📥 {title}\n\nDownloaded by @spotifyxmusixbot"
+        caption = f"📥 <b>{title}</b>\n\nDownloaded by @spotifyxmusixbot"
 
-        # FIXED: Send files properly
+        # FIXED: Send as document for MP3, video with streaming for MP4
         if quality == "mp3":
-            # Send MP3 as document (bypasses audio size limits)
             await reply_msg.reply_document(
                 document=final_path,
                 caption=caption,
-                filename=f"{title}.mp3"
+                filename=f"{title}.mp3",
+                parse_mode=ParseMode.HTML
             )
         else:
-            # Send video with streaming support (plays while downloading)
             await reply_msg.reply_video(
                 video=final_path,
                 caption=caption,
                 filename=f"{title}.mp4",
-                supports_streaming=True  # This enables Telegram streaming
+                supports_streaming=True,  # This enables Telegram streaming!
+                parse_mode=ParseMode.HTML
             )
+
+        # Cleanup old files
+        cleanup_old_files()
 
     except Exception as e:
         await reply_msg.reply_text(f"⚠️ Error: {e}")
+
+def cleanup_old_files():
+    """Keep only last 10 files to save space"""
+    try:
+        all_files = sorted(DOWNLOAD_DIR.glob("*"), key=lambda p: p.stat().st_mtime, reverse=True)
+        for f in all_files[10:]:
+            f.unlink()
+    except:
+        pass
 
 # =========================
 # Handlers
@@ -307,7 +315,7 @@ async def search_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "no_warnings": True,
         "skip_download": True,
         "default_search": "ytsearch5",
-        "extract_flat": False,  # Fixed: Need full info
+        "extract_flat": False,
     }
 
     try:
