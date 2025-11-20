@@ -31,7 +31,13 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 OWNER_ID = int(os.getenv("OWNER_ID", "7941244038"))
 UPDATES_CHANNEL = os.getenv("UPDATES_CHANNEL", "")
 
-COOKIES_TXT = os.getenv("COOKIES_TXT", "cookies.txt")  # Default path
+# ==== CRITICAL FIX: Use relative path unless absolute is specified ====
+COOKIES_ENV = os.getenv("COOKIES_TXT")
+if COOKIES_ENV and COOKIES_ENV.startswith('/'):
+    COOKIES_TXT = Path(COOKIES_ENV)  # Absolute path
+else:
+    COOKIES_TXT = Path(COOKIES_ENV or "cookies.txt")  # Relative to working dir
+
 MONGO_URI = os.getenv("MONGO_URI")
 MONGO_DB = os.getenv("MONGO_DB", "youtube_bot")
 MONGO_USERS = os.getenv("MONGO_USERS", "users")
@@ -40,8 +46,8 @@ MONGO_ADMINS = os.getenv("MONGO_ADMINS", "admins")
 # Constants
 DOWNLOAD_DIR = Path("downloads")
 DOWNLOAD_DIR.mkdir(exist_ok=True)
-MAX_FREE_SIZE = 50 * 1024 * 1024  # 50MB
-PREMIUM_SIZE = 450 * 1024 * 1024  # 450MB
+MAX_FREE_SIZE = 50 * 1024 * 1024
+PREMIUM_SIZE = 450 * 1024 * 1024
 
 # Storage
 BROADCAST_STORE: Dict[int, List[dict]] = {}
@@ -72,7 +78,6 @@ try:
     MONGO_AVAILABLE = True
     log.info("✅ MongoDB connected successfully")
     
-    # Initialize owner as admin if collection is empty
     if admins_col.count_documents({}) == 0:
         admins_col.insert_one({
             "_id": OWNER_ID,
@@ -88,32 +93,65 @@ except Exception as e:
     mongo = db = users_col = admins_col = None
 
 # =========================
+# File Path Debugging
+# =========================
+
+def debug_file_paths():
+    """Debug function to check real file locations"""
+    cwd = Path.cwd()
+    cookies_path_abs = COOKIES_TXT.absolute() if isinstance(COOKIES_TXT, Path) else Path(COOKIES_TXT).absolute()
+    
+    log.info("="*60)
+    log.info("📁 FILE PATH DEBUG INFO")
+    log.info(f"Current Working Directory: {cwd}")
+    log.info(f"Cookies file path (env): {os.getenv('COOKIES_TXT')}")
+    log.info(f"Cookies file resolved: {cookies_path_abs}")
+    log.info(f"Cookies file exists: {cookies_path_abs.exists()}")
+    
+    # List all files in current directory for debugging
+    files = list(cwd.glob("*"))
+    log.info(f"Files in {cwd}: {[f.name for f in files]}")
+    
+    if not cookies_path_abs.exists():
+        log.error(f"❌ Cookies file NOT FOUND at {cookies_path_abs}")
+        # Try alternate locations
+        alt_paths = [cwd / "cookies.txt", Path("/app/cookies.txt"), Path("./cookies.txt")]
+        for alt in alt_paths:
+            if alt.exists():
+                log.info(f"✅ Found cookies at alternate location: {alt}")
+                return str(alt)
+    
+    log.info("="*60)
+    return str(cookies_path_abs) if cookies_path_abs.exists() else None
+
+# =========================
 # Cookie Validation Helper
 # =========================
 
 def validate_cookies():
-    """Validate cookies file and return status"""
-    if not COOKIES_TXT or not Path(COOKIES_TXT).exists():
-        log.warning("⚠️ No cookies file found. Public videos only.")
-        return None, "No cookies file"
+    """Validate cookies file with detailed error reporting"""
+    # First run debug
+    actual_cookie_file = debug_file_paths()
     
-    try:
-        # Check if file is readable
-        with open(COOKIES_TXT, 'r') as f:
-            content = f.read(500)  # Read first 500 chars
-        
-        # Check for Netscape format
-        if "# Netscape HTTP Cookie File" not in content:
-            log.error("❌ Cookies file is NOT in Netscape format!")
-            log.error("   Export cookies using 'cookies.txt' browser extension")
-            return None, "Invalid format"
-        
-        log.info("✅ Cookies file validated (Netscape format)")
-        return COOKIES_TXT, "OK"
-        
-    except Exception as e:
-        log.error(f"❌ Cannot read cookies file: {e}")
-        return None, str(e)
+    if actual_cookie_file:
+        try:
+            with open(actual_cookie_file, 'r') as f:
+                content = f.read(500)
+            
+            if "# Netscape HTTP Cookie File" not in content:
+                log.error("❌ Cookies file is NOT in Netscape format!")
+                return None, "Invalid format - must be Netscape HTTP Cookie File"
+            
+            log.info("✅ Cookies file validated (Netscape format)")
+            return actual_cookie_file, "OK"
+            
+        except Exception as e:
+            log.error(f"❌ Cannot read cookies file: {e}")
+            return None, f"Read error: {e}"
+    
+    log.warning("⚠️ No cookies file found. Public videos only.")
+    # Show what we're actually looking for
+    return None, f"File not found. Tried: {COOKIES_TXT.absolute() if isinstance(COOKIES_TXT, Path) else COOKIES_TXT}"
 
 # =========================
 # Helper Functions
@@ -200,15 +238,7 @@ def quality_keyboard(url: str) -> InlineKeyboardMarkup:
     ])
 
 # =========================
-# Error Handler
-# =========================
-
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    """Global error handler"""
-    log.error("Exception while handling an update:", exc_info=context.error)
-
-# =========================
-# Core Download Function (with cookie fallback)
+# Download Function (with improved error handling)
 # =========================
 
 async def download_and_send(chat_id, reply_msg, context, url, quality):
@@ -222,10 +252,12 @@ async def download_and_send(chat_id, reply_msg, context, url, quality):
             "outtmpl": str(DOWNLOAD_DIR / "%(title)s.%(ext)s"),
         }
 
-        # Add cookies if validated
+        # Only add cookies if they're valid
         if cookies_file and cookie_status == "OK":
             ydl_opts["cookiefile"] = cookies_file
             log.info("🍪 Using cookies for download")
+        else:
+            log.info("🍪 No cookies - downloading public content only")
 
         if quality == "mp3":
             ydl_opts.update({
@@ -251,26 +283,9 @@ async def download_and_send(chat_id, reply_msg, context, url, quality):
                 }
             })
 
-        # Attempt download
-        try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=True)
-                title = sanitize_filename(info.get("title", "video"))
-        except yt_dlp.utils.DownloadError as e:
-            if "cookies" in str(e).lower() or "Cookie" in str(e):
-                log.error(f"❌ Cookie error: {e}")
-                await reply_msg.reply_text(
-                    "⚠️ Cookie error! Retrying without cookies...\n"
-                    "(This may fail for private/age-restricted videos)"
-                )
-                
-                # Retry without cookies
-                ydl_opts.pop("cookiefile", None)
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    info = ydl.extract_info(url, download=True)
-                    title = sanitize_filename(info.get("title", "video"))
-            else:
-                raise e
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            title = sanitize_filename(info.get("title", "video"))
 
         ext = ".mp3" if quality == "mp3" else ".mp4"
         files = sorted(DOWNLOAD_DIR.glob(f"*{ext}"), key=lambda p: p.stat().st_mtime, reverse=True)
@@ -324,16 +339,7 @@ async def download_and_send(chat_id, reply_msg, context, url, quality):
         cleanup_old_files()
 
     except Exception as e:
-        error_msg = str(e)
-        if "cookies" in error_msg.lower():
-            await reply_msg.reply_text(
-                "❌ Cookie error! Please check:\n"
-                "1. File is in Netscape format\n"
-                "2. Cookies are fresh\n"
-                "3. Use /testcookies to debug"
-            )
-        else:
-            await reply_msg.reply_text(f"⚠️ Error: {e}")
+        await reply_msg.reply_text(f"⚠️ Error: {e}")
         log.error(f"Download failed: {e}")
 
 # =========================
@@ -341,7 +347,6 @@ async def download_and_send(chat_id, reply_msg, context, url, quality):
 # =========================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /start command"""
     ensure_user(update)
     start_text = (
         "<b>🎧 Welcome to SpotifyX Musix Bot 🎧</b>\n"
@@ -357,7 +362,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(start_text, parse_mode=ParseMode.HTML)
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /help command"""
     ensure_user(update)
     help_text = (
         "<b>✨ SpotifyX Musix Bot — Commands ✨</b>\n"
@@ -367,7 +371,8 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "<code>/help</code> — Show this help\n"
         "<code>/search &lt;name&gt;</code> — Search YouTube\n"
         "<code>/gen &lt;prompt&gt;</code> — Generate AI image\n"
-        "<code>/testcookies</code> — Debug cookies\n\n"
+        "<code>/testcookies</code> — Debug cookies\n"
+        "<code>/whereis</code> — Find files\n\n"
         "<b>Admin Commands:</b>\n"
         "<code>/stats</code> — View statistics\n"
         "<code>/broadcast</code> — Broadcast message\n"
@@ -380,8 +385,37 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await update.message.reply_text(help_text, parse_mode=ParseMode.HTML)
 
+async def whereis_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Debug command to find where files are"""
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("❌ You are not authorized!")
+        return
+    
+    cwd = Path.cwd()
+    cookies_path = Path("cookies.txt").absolute()
+    
+    debug_info = (
+        f"📁 <b>File Location Debug</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"<b>Working Directory:</b>\n<code>{cwd}</code>\n\n"
+        f"<b>Files in this directory:</b>\n"
+    )
+    
+    files = list(cwd.glob("*"))
+    file_list = "\n".join([f"• {f.name} ({f.stat().st_size} bytes)" for f in files[:10]])
+    if len(files) > 10:
+        file_list += f"\n... and {len(files) - 10} more"
+    
+    debug_info += f"<code>{file_list}</code>\n\n"
+    debug_info += f"<b>Looking for cookies at:</b>\n<code>{cookies_path}</code>\n\n"
+    debug_info += f"<b>File exists:</b> {cookies_path.exists()}\n\n"
+    
+    # Also check environment variable
+    debug_info += f"<b>COOKIES_TXT env var:</b>\n<code>{os.getenv('COOKIES_TXT')}</code>"
+    
+    await update.message.reply_text(debug_info, parse_mode=ParseMode.HTML)
+
 async def testcookies_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Test if cookies are working"""
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("❌ You are not authorized!")
         return
@@ -391,54 +425,27 @@ async def testcookies_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not cookies_file:
         await update.message.reply_text(
             f"❌ Cookie Error: {status}\n\n"
-            f"Path checked: <code>{Path(COOKIES_TXT).absolute()}</code>\n\n"
-            f"How to fix:\n"
-            f"1. Install 'cookies.txt' browser extension\n"
-            f"2. Export cookies from YouTube\n"
-            f"3. Save as <code>{COOKIES_TXT}</code> in bot directory",
+            f"Path checked: <code>{Path(COOKIES_TXT).absolute() if isinstance(COOKIES_TXT, Path) else COOKIES_TXT}</code>",
             parse_mode=ParseMode.HTML
         )
         return
     
-    # Test with a simple YouTube request
-    test_url = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"  # Rick Roll for test
-    
+    test_url = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
     try:
-        ydl_opts = {
-            "quiet": True,
-            "no_warnings": True,
-            "skip_download": True,
-        }
-        
+        ydl_opts = {"quiet": True, "no_warnings": True, "skip_download": True}
         if cookies_file:
             ydl_opts["cookiefile"] = cookies_file
         
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(test_url, download=False)
             await update.message.reply_text(
-                f"✅ Cookies are working!\n\n"
-                f"Title: <b>{info.get('title')}</b>\n"
-                f"Duration: {info.get('duration')}s\n"
-                f"Status: Ready for private videos",
+                f"✅ Cookies working!\nTitle: <b>{info.get('title')}</b>",
                 parse_mode=ParseMode.HTML
             )
-            
     except Exception as e:
-        error_msg = str(e)
-        if "cookies" in error_msg.lower():
-            await update.message.reply_text(
-                f"❌ Cookies failed: {error_msg[:200]}\n\n"
-                f"Your cookies.txt may be:\n"
-                f"• Expired (re-export)\n"
-                f"• Wrong format (use Netscape)\n"
-                f"• Corrupted (re-download)",
-                parse_mode=ParseMode.HTML
-            )
-        else:
-            await update.message.reply_text(f"⚠️ Error: {error_msg[:200]}")
+        await update.message.reply_text(f"❌ Failed: {str(e)[:200]}", parse_mode=ParseMode.HTML)
 
 async def search_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /search command"""
     ensure_user(update)
     query = " ".join(context.args)
     if not query:
@@ -482,7 +489,6 @@ async def search_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Choose:", reply_markup=InlineKeyboardMarkup(buttons))
 
 async def gen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /gen command - Generate AI images"""
     ensure_user(update)
     query = " ".join(context.args)
     if not query:
@@ -520,7 +526,6 @@ async def gen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await status_msg.edit_text(f"❌ Failed: {e}")
 
 async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /stats command - Show statistics"""
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("❌ You are not authorized!")
         return
@@ -535,7 +540,6 @@ async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"👥 Users: {total}\n\n{preview}")
 
 async def addadmin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Add a new admin (owner only)"""
     if not is_owner(update.effective_user.id):
         await update.message.reply_text("❌ Only the bot owner can add admins!")
         return
@@ -574,7 +578,6 @@ async def addadmin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Failed to add admin.")
 
 async def rmadmin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Remove an admin (owner only)"""
     if not is_owner(update.effective_user.id):
         await update.message.reply_text("❌ Only the bot owner can remove admins!")
         return
@@ -608,7 +611,6 @@ async def rmadmin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Failed to remove admin.")
 
 async def adminlist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """List all admins (admin only)"""
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("❌ You are not authorized!")
         return
@@ -644,7 +646,6 @@ async def adminlist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # =========================
 
 async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Start broadcast mode"""
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("❌ You are not authorized!")
         return
@@ -662,7 +663,6 @@ async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def handle_broadcast_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Collect broadcast messages"""
     admin_id = update.effective_user.id
     
     if not BROADCAST_STATE.get(admin_id):
@@ -683,7 +683,6 @@ async def handle_broadcast_message(update: Update, context: ContextTypes.DEFAULT
     await update.message.reply_text(f"✅ Message #{msg_count} added to broadcast queue")
 
 async def done_broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Preview broadcast messages"""
     if not is_admin(update.effective_user.id):
         return
     
@@ -719,7 +718,6 @@ async def done_broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
     )
 
 async def send_broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Send broadcast to all users"""
     if not is_admin(update.effective_user.id):
         return
     
@@ -799,7 +797,6 @@ async def send_broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
     )
 
 async def cancel_broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Cancel broadcast mode"""
     if not is_admin(update.effective_user.id):
         return
     
@@ -815,7 +812,6 @@ async def cancel_broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
 # =========================
 
 async def on_quality(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle quality selection callback"""
     q = update.callback_query
     await q.answer()
     try:
@@ -830,7 +826,6 @@ async def on_quality(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await download_and_send(q.message.chat.id, q.message, context, data["url"], qlt)
 
 async def on_search_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle search result selection callback"""
     q = update.callback_query
     await q.answer()
     _, token, _ = q.data.split("|")
@@ -845,7 +840,6 @@ async def on_search_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # =========================
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle text messages"""
     ensure_user(update)
     
     if update.effective_user and is_admin(update.effective_user.id):
@@ -874,12 +868,8 @@ def main():
     
     signal.signal(signal.SIGTERM, shutdown_handler)
     
-    # Validate cookies on startup
-    cookies_file, status = validate_cookies()
-    if cookies_file:
-        log.info(f"🍪 Cookie file ready: {cookies_file}")
-    else:
-        log.warning(f"⚠️ Cookie issue: {status}")
+    # Run debug on startup
+    debug_file_paths()
     
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_error_handler(error_handler)
@@ -895,6 +885,7 @@ def main():
     app.add_handler(CommandHandler("cancel_broadcast", cancel_broadcast_cmd))
     app.add_handler(CommandHandler("gen", gen_cmd))
     app.add_handler(CommandHandler("testcookies", testcookies_cmd))
+    app.add_handler(CommandHandler("whereis", whereis_cmd))
     app.add_handler(CommandHandler("addadmin", addadmin_cmd))
     app.add_handler(CommandHandler("rmadmin", rmadmin_cmd))
     app.add_handler(CommandHandler("adminlist", adminlist_cmd))
