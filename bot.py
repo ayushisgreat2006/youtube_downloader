@@ -4,6 +4,8 @@ import asyncio
 import logging
 from pathlib import Path
 from typing import Dict, Optional, List
+from datetime import datetime
+import secrets
 import aiohttp
 from pymongo import MongoClient
 from telegram import (
@@ -33,17 +35,18 @@ COOKIES_TXT = os.getenv("COOKIES_TXT")
 MONGO_URI = os.getenv("MONGO_URI")
 MONGO_DB = os.getenv("MONGO_DB", "youtube_bot")
 MONGO_USERS = os.getenv("MONGO_USERS", "users")
+MONGO_ADMINS = os.getenv("MONGO_ADMINS", "admins")
 
 # Constants
 DOWNLOAD_DIR = Path("downloads")
 DOWNLOAD_DIR.mkdir(exist_ok=True)
-MAX_FREE_SIZE = 50 * 1024 * 1024  # 50MB Telegram bot limit
-PREMIUM_SIZE = 450 * 1024 * 1024  # 450MB (will still fail, but shows premium message)
+MAX_FREE_SIZE = 50 * 1024 * 1024  # 50MB
+PREMIUM_SIZE = 450 * 1024 * 1024  # 450MB
 
 # Storage
 BROADCAST_STORE: Dict[int, List[dict]] = {}
 BROADCAST_STATE: Dict[int, bool] = {}
-PENDING: Dict[str, str] = {}
+PENDING: Dict[str, dict] = {}  # Updated structure
 
 # Logging
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
@@ -65,12 +68,24 @@ try:
     mongo.admin.command('ping')
     db = mongo[MONGO_DB]
     users_col = db[MONGO_USERS]
+    admins_col = db[MONGO_ADMINS]
     MONGO_AVAILABLE = True
     log.info("✅ MongoDB connected successfully")
+    
+    # Initialize owner as admin if collection is empty
+    if admins_col.count_documents({}) == 0:
+        admins_col.insert_one({
+            "_id": OWNER_ID,
+            "name": "Owner",
+            "added_by": OWNER_ID,
+            "added_at": datetime.now()
+        })
+        log.info("✅ Owner added to admin list")
+        
 except Exception as e:
     log.error(f"❌ MongoDB connection failed: {e}")
     MONGO_AVAILABLE = False
-    mongo = db = users_col = None
+    mongo = db = users_col = admins_col = None
 
 # =========================
 # Helper Functions
@@ -86,16 +101,27 @@ def ensure_user(update: Update):
             {"_id": u.id},
             {"$set": {
                 "name": u.full_name or u.username or str(u.id),
-                "premium": False  # Default non-premium
+                "premium": False
             }},
             upsert=True
         )
     except Exception as e:
         log.error(f"User tracking failed: {e}")
 
-def is_admin(user_id: int) -> bool:
-    """Check if user is admin"""
+def is_owner(user_id: int) -> bool:
+    """Check if user is the bot owner"""
     return int(user_id) == OWNER_ID
+
+def is_admin(user_id: int) -> bool:
+    """Check if user is admin or owner"""
+    if is_owner(user_id):
+        return True
+    if not MONGO_AVAILABLE:
+        return False
+    try:
+        return admins_col.find_one({"_id": user_id}) is not None
+    except:
+        return False
 
 def is_premium(user_id: int) -> bool:
     """Check if user has premium"""
@@ -112,6 +138,12 @@ def sanitize_filename(name: str) -> str:
     name = re.sub(r'[\\/*?:"<>|]', "", name)
     name = re.sub(r"\s+", " ", name).strip()
     return name or "output"
+
+def store_url(url: str) -> str:
+    """Generate secure token with expiration"""
+    token = secrets.token_urlsafe(16)
+    PENDING[token] = {"url": url, "exp": asyncio.get_event_loop().time() + 3600}
+    return token
 
 def cleanup_old_files():
     """Keep only last 10 files"""
@@ -130,8 +162,7 @@ YOUTUBE_REGEX = re.compile(r"(https?://)?(www\.)?(youtube\.com|youtu\.be)/[\w\-?
 
 def quality_keyboard(url: str) -> InlineKeyboardMarkup:
     """Create quality selection keyboard"""
-    token = str(abs(hash((url, os.urandom(4)))))[:10]
-    PENDING[token] = url
+    token = store_url(url)
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("360p", callback_data=f"q|{token}|360"),
          InlineKeyboardButton("480p", callback_data=f"q|{token}|480")],
@@ -149,7 +180,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     log.error("Exception while handling an update:", exc_info=context.error)
 
 # =========================
-# Core Download Function (with size check)
+# Core Download Function
 # =========================
 
 async def download_and_send(chat_id, reply_msg, context, url, quality):
@@ -161,7 +192,6 @@ async def download_and_send(chat_id, reply_msg, context, url, quality):
             "outtmpl": str(DOWNLOAD_DIR / "%(title)s.%(ext)s"),
         }
 
-        # Use cookies if available
         if COOKIES_TXT and Path(COOKIES_TXT).exists():
             ydl_opts["cookiefile"] = COOKIES_TXT
 
@@ -175,7 +205,6 @@ async def download_and_send(chat_id, reply_msg, context, url, quality):
                 }],
             })
         else:
-            # Optimized for Telegram streaming
             ydl_opts.update({
                 "format": f"bestvideo[height<={quality}][vcodec^=avc][ext=mp4]+bestaudio[acodec^=mp4a][ext=m4a]/best[height<={quality}][ext=mp4]",
                 "merge_output_format": "mp4",
@@ -190,12 +219,10 @@ async def download_and_send(chat_id, reply_msg, context, url, quality):
                 }
             })
 
-        # Download
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
             title = sanitize_filename(info.get("title", "video"))
 
-        # Find file and check size
         ext = ".mp3" if quality == "mp3" else ".mp4"
         files = sorted(DOWNLOAD_DIR.glob(f"*{ext}"), key=lambda p: p.stat().st_mtime, reverse=True)
         if not files:
@@ -204,16 +231,11 @@ async def download_and_send(chat_id, reply_msg, context, url, quality):
 
         final_path = files[0]
         file_size = final_path.stat().st_size
-
-        # Check size limits
         user_id = reply_msg.chat.id
         is_user_premium = is_premium(user_id)
 
         if file_size > MAX_FREE_SIZE and not is_user_premium:
-            # Clean up file
             final_path.unlink(missing_ok=True)
-            
-            # Show premium message
             premium_msg = (
                 f"❌ <b>File too large!</b>\n\n"
                 f"📦 Size: {file_size / 1024 / 1024:.1f}MB\n"
@@ -227,13 +249,11 @@ async def download_and_send(chat_id, reply_msg, context, url, quality):
             await reply_msg.reply_text(premium_msg, parse_mode=ParseMode.HTML)
             return
 
-        # If premium but still too large (theoretical)
         if file_size > PREMIUM_SIZE:
             final_path.unlink(missing_ok=True)
             await reply_msg.reply_text("❌ File exceeds maximum size (450MB). Try lower quality.")
             return
 
-        # Send file
         caption = f"📥 <b>{title}</b> ({file_size/1024/1024:.1f}MB)\n\nDownloaded by @spotifyxmusixbot"
         
         if quality == "mp3":
@@ -283,16 +303,20 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     help_text = (
         "<b>✨ SpotifyX Musix Bot — Commands ✨</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
+        "<b>User Commands:</b>\n"
         "<code>/start</code> — Start bot\n"
         "<code>/help</code> — Show this help\n"
         "<code>/search &lt;name&gt;</code> — Search YouTube\n"
-        "<code>/gen &lt;prompt&gt;</code> — Generate AI image\n"
-        "<code>/stats</code> — Admin stats\n"
-        "<code>/broadcast</code> — Admin broadcast\n"
-        "<b>📢 Links:</b>\n"
-        f"• Updates: {UPDATES_CHANNEL}\n"
-        "• Report: @mahadev_ki_iccha\n"
-        "• Premium: @ayushxchat_robot"
+        "<code>/gen &lt;prompt&gt;</code> — Generate AI image\n\n"
+        "<b>Admin Commands:</b>\n"
+        "<code>/stats</code> — View statistics\n"
+        "<code>/broadcast</code> — Broadcast message\n"
+        "<code>/adminlist</code> — List admins\n\n"
+        "<b>Owner Commands:</b>\n"
+        "<code>/addadmin &lt;id&gt;</code> — Add admin\n"
+        "<code>/rmadmin &lt;id&gt;</code> — Remove admin\n\n"
+        f"<b>Updates:</b> {UPDATES_CHANNEL}\n"
+        "<b>Support:</b> @mahadev_ki_iccha"
     )
     await update.message.reply_text(help_text, parse_mode=ParseMode.HTML)
 
@@ -331,8 +355,7 @@ async def search_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         title = sanitize_filename(e.get("title") or "video")
         video_id = e.get('id')
         url = f"https://youtube.com/watch?v={video_id}" if video_id else e.get('webpage_url')
-        token = str(abs(hash((url, os.urandom(4)))))[:10]
-        PENDING[token] = url
+        token = store_url(url)
         buttons.append([InlineKeyboardButton(title[:60], callback_data=f"s|{token}|pick")])
 
     await update.message.reply_text("Choose:", reply_markup=InlineKeyboardMarkup(buttons))
@@ -390,6 +413,111 @@ async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     preview = "\n".join([f"{d['name']} — {d['_id']}" for d in docs])
     await update.message.reply_text(f"👥 Users: {total}\n\n{preview}")
 
+async def addadmin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Add a new admin (owner only)"""
+    if not is_owner(update.effective_user.id):
+        await update.message.reply_text("❌ Only the bot owner can add admins!")
+        return
+    
+    if not context.args:
+        await update.message.reply_text("Usage: /addadmin <user_id>")
+        return
+    
+    try:
+        new_admin_id = int(context.args[0])
+        user = users_col.find_one({"_id": new_admin_id})
+        if not user:
+            await update.message.reply_text("❌ User not found. They must /start the bot first.")
+            return
+        
+        if admins_col.find_one({"_id": new_admin_id}):
+            await update.message.reply_text("❌ User is already an admin.")
+            return
+        
+        admins_col.insert_one({
+            "_id": new_admin_id,
+            "name": user.get("name", str(new_admin_id)),
+            "added_by": update.effective_user.id,
+            "added_at": datetime.now()
+        })
+        
+        await update.message.reply_text(
+            f"✅ Added <b>{user.get('name', new_admin_id)}</b> as admin.", 
+            parse_mode=ParseMode.HTML
+        )
+        
+    except ValueError:
+        await update.message.reply_text("❌ Invalid user ID format.")
+    except Exception as e:
+        log.error(f"Add admin failed: {e}")
+        await update.message.reply_text("❌ Failed to add admin.")
+
+async def rmadmin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Remove an admin (owner only)"""
+    if not is_owner(update.effective_user.id):
+        await update.message.reply_text("❌ Only the bot owner can remove admins!")
+        return
+    
+    if not context.args:
+        await update.message.reply_text("Usage: /rmadmin <user_id>")
+        return
+    
+    try:
+        admin_id_to_remove = int(context.args[0])
+        
+        if admin_id_to_remove == OWNER_ID:
+            await update.message.reply_text("❌ Cannot remove the owner!")
+            return
+        
+        admin = admins_col.find_one({"_id": admin_id_to_remove})
+        if not admin:
+            await update.message.reply_text("❌ User is not an admin.")
+            return
+        
+        admins_col.delete_one({"_id": admin_id_to_remove})
+        await update.message.reply_text(
+            f"✅ Removed <b>{admin.get('name', admin_id_to_remove)}</b> from admins.", 
+            parse_mode=ParseMode.HTML
+        )
+        
+    except ValueError:
+        await update.message.reply_text("❌ Invalid user ID format.")
+    except Exception as e:
+        log.error(f"Remove admin failed: {e}")
+        await update.message.reply_text("❌ Failed to remove admin.")
+
+async def adminlist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """List all admins (admin only)"""
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("❌ You are not authorized!")
+        return
+    
+    if not MONGO_AVAILABLE:
+        await update.message.reply_text("Database not available.")
+        return
+    
+    try:
+        admins = list(admins_col.find().sort("added_at", -1))
+        if not admins:
+            await update.message.reply_text("No admins found.")
+            return
+        
+        admin_list = "👥 <b>Admin List</b>\n"
+        admin_list += "━━━━━━━━━━━━━━━━━━━━\n\n"
+        
+        for admin in admins:
+            admin_id = admin["_id"]
+            name = admin.get("name", "Unknown")
+            role = "👑 Owner" if admin_id == OWNER_ID else "🔧 Admin"
+            admin_list += f"• <code>{admin_id}</code> - {name} ({role})\n"
+        
+        admin_list += f"\n<b>Total: {len(admins)} admins</b>"
+        await update.message.reply_text(admin_list, parse_mode=ParseMode.HTML)
+        
+    except Exception as e:
+        log.error(f"Admin list failed: {e}")
+        await update.message.reply_text("❌ Failed to fetch admin list.")
+
 # =========================
 # Broadcast System
 # =========================
@@ -417,7 +545,7 @@ async def handle_broadcast_message(update: Update, context: ContextTypes.DEFAULT
     admin_id = update.effective_user.id
     
     if not BROADCAST_STATE.get(admin_id):
-        return  # Not in broadcast mode
+        return
     
     message_data = {
         "text": update.message.text,
@@ -485,7 +613,6 @@ async def send_broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text("❌ No messages to broadcast.")
         return
     
-    # Get recipients
     recipients = set()
     if MONGO_AVAILABLE:
         users_cursor = users_col.find({}, {"_id": 1})
@@ -574,23 +701,23 @@ async def on_quality(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _, token, qlt = q.data.split("|")
     except:
         return
-    url = PENDING.get(token)
-    if not url:
+    data = PENDING.get(token)
+    if not data or data["exp"] < asyncio.get_event_loop().time():
         await q.edit_message_text("Session expired.")
         return
     await q.edit_message_text(f"Downloading {qlt}…")
-    await download_and_send(q.message.chat.id, q.message, context, url, qlt)
+    await download_and_send(q.message.chat.id, q.message, context, data["url"], qlt)
 
 async def on_search_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle search result selection callback"""
     q = update.callback_query
     await q.answer()
     _, token, _ = q.data.split("|")
-    url = PENDING.get(token)
-    if not url:
+    data = PENDING.get(token)
+    if not data or data["exp"] < asyncio.get_event_loop().time():
         await q.edit_message_text("Expired.")
         return
-    await q.edit_message_text("Choose quality:", reply_markup=quality_keyboard(url))
+    await q.edit_message_text("Choose quality:", reply_markup=quality_keyboard(data["url"]))
 
 # =========================
 # Message Handlers
@@ -600,13 +727,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle text messages"""
     ensure_user(update)
     
-    # Check if admin is in broadcast mode
     if update.effective_user and is_admin(update.effective_user.id):
         if BROADCAST_STATE.get(update.effective_user.id):
             await handle_broadcast_message(update, context)
             return
     
-    # Check for YouTube URLs
     txt = update.message.text.strip()
     match = YOUTUBE_REGEX.search(txt)
     if match:
@@ -614,7 +739,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Choose quality:", reply_markup=quality_keyboard(url))
 
 # =========================
-# Main Function (ABSOLUTELY LAST)
+# Main Function
 # =========================
 
 def main():
@@ -628,11 +753,10 @@ def main():
     
     signal.signal(signal.SIGTERM, shutdown_handler)
     
-    # Initialize bot
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_error_handler(error_handler)
 
-    # Add command handlers
+    # Command handlers
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("search", search_cmd))
@@ -642,12 +766,15 @@ def main():
     app.add_handler(CommandHandler("send_broadcast", send_broadcast_cmd))
     app.add_handler(CommandHandler("cancel_broadcast", cancel_broadcast_cmd))
     app.add_handler(CommandHandler("gen", gen_cmd))
+    app.add_handler(CommandHandler("addadmin", addadmin_cmd))
+    app.add_handler(CommandHandler("rmadmin", rmadmin_cmd))
+    app.add_handler(CommandHandler("adminlist", adminlist_cmd))
 
-    # Add message handlers
+    # Message handlers
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_broadcast_message))
     
-    # Add callback handlers
+    # Callback handlers
     app.add_handler(CallbackQueryHandler(on_quality, pattern=r"^q\|"))
     app.add_handler(CallbackQueryHandler(on_search_pick, pattern=r"^s\|"))
 
