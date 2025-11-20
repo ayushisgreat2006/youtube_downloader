@@ -10,7 +10,6 @@ from telegram import (
     Update,
     InlineKeyboardMarkup,
     InlineKeyboardButton,
-    InputFile,
 )
 from telegram.constants import ParseMode
 from telegram.ext import (
@@ -30,35 +29,25 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 OWNER_ID = int(os.getenv("OWNER_ID", "7941244038"))
 UPDATES_CHANNEL = os.getenv("UPDATES_CHANNEL", "")
 
-COOKIES_TXT = os.getenv("COOKIES_TXT")  # Should be a file path like /app/cookies.txt
+COOKIES_TXT = os.getenv("COOKIES_TXT")
 MONGO_URI = os.getenv("MONGO_URI")
 MONGO_DB = os.getenv("MONGO_DB", "youtube_bot")
 MONGO_USERS = os.getenv("MONGO_USERS", "users")
 
-# Paths
+# Constants
 DOWNLOAD_DIR = Path("downloads")
 DOWNLOAD_DIR.mkdir(exist_ok=True)
+MAX_FREE_SIZE = 50 * 1024 * 1024  # 50MB Telegram bot limit
+PREMIUM_SIZE = 450 * 1024 * 1024  # 450MB (will still fail, but shows premium message)
 
 # Storage
 BROADCAST_STORE: Dict[int, List[dict]] = {}
 BROADCAST_STATE: Dict[int, bool] = {}
 PENDING: Dict[str, str] = {}
 
-# Cookie validation flag
-COOKIE_FILE_VALID = False
-if COOKIES_TXT:
-    if Path(COOKIES_TXT).exists():
-        COOKIE_FILE_VALID = True
-        log_msg = f"✅ Cookie file found: {COOKIES_TXT}"
-    else:
-        log_msg = f"⚠️ Cookie file not found at: {COOKIES_TXT} (downloads may still work)"
-else:
-    log_msg = "ℹ️ No cookie file configured"
-
 # Logging
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
 log = logging.getLogger("ytbot")
-log.info(log_msg)
 
 # =========================
 # MongoDB Setup
@@ -95,7 +84,10 @@ def ensure_user(update: Update):
         u = update.effective_user
         users_col.update_one(
             {"_id": u.id},
-            {"$set": {"name": u.full_name or u.username or str(u.id)}},
+            {"$set": {
+                "name": u.full_name or u.username or str(u.id),
+                "premium": False  # Default non-premium
+            }},
             upsert=True
         )
     except Exception as e:
@@ -104,6 +96,16 @@ def ensure_user(update: Update):
 def is_admin(user_id: int) -> bool:
     """Check if user is admin"""
     return int(user_id) == OWNER_ID
+
+def is_premium(user_id: int) -> bool:
+    """Check if user has premium"""
+    if not MONGO_AVAILABLE:
+        return False
+    try:
+        user = users_col.find_one({"_id": user_id}, {"premium": 1})
+        return user.get("premium", False) if user else False
+    except:
+        return False
 
 def sanitize_filename(name: str) -> str:
     """Clean filename for saving"""
@@ -147,11 +149,11 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     log.error("Exception while handling an update:", exc_info=context.error)
 
 # =========================
-# Core Download Function
+# Core Download Function (with size check)
 # =========================
 
 async def download_and_send(chat_id, reply_msg, context, url, quality):
-    """Download and send media with proper formats"""
+    """Download and send media with size limits"""
     try:
         ydl_opts = {
             "quiet": True,
@@ -159,10 +161,9 @@ async def download_and_send(chat_id, reply_msg, context, url, quality):
             "outtmpl": str(DOWNLOAD_DIR / "%(title)s.%(ext)s"),
         }
 
-        # Use cookie file if valid
-        if COOKIE_FILE_VALID:
+        # Use cookies if available
+        if COOKIES_TXT and Path(COOKIES_TXT).exists():
             ydl_opts["cookiefile"] = COOKIES_TXT
-            log.info(f"Using cookies from: {COOKIES_TXT}")
 
         if quality == "mp3":
             ydl_opts.update({
@@ -174,18 +175,17 @@ async def download_and_send(chat_id, reply_msg, context, url, quality):
                 }],
             })
         else:
-            # FIXED: Force H.264 + AAC for Telegram streaming
+            # Optimized for Telegram streaming
             ydl_opts.update({
-                # Prioritize H.264 video and AAC audio
                 "format": f"bestvideo[height<={quality}][vcodec^=avc][ext=mp4]+bestaudio[acodec^=mp4a][ext=m4a]/best[height<={quality}][ext=mp4]",
                 "merge_output_format": "mp4",
                 "postprocessor_args": {
                     "MOV+FFmpegVideoConvertor+mp4": [
-                        "-movflags", "+faststart",  # Move MOOV atom to start for streaming
-                        "-c:v", "libx264",          # Force H.264 codec
-                        "-c:a", "aac",              # Force AAC audio
-                        "-preset", "faster",        # Faster encoding
-                        "-crf", "23"                # Good quality/size balance
+                        "-movflags", "+faststart",
+                        "-c:v", "libx264",
+                        "-c:a", "aac",
+                        "-preset", "faster",
+                        "-crf", "23"
                     ]
                 }
             })
@@ -195,7 +195,7 @@ async def download_and_send(chat_id, reply_msg, context, url, quality):
             info = ydl.extract_info(url, download=True)
             title = sanitize_filename(info.get("title", "video"))
 
-        # Find and send file
+        # Find file and check size
         ext = ".mp3" if quality == "mp3" else ".mp4"
         files = sorted(DOWNLOAD_DIR.glob(f"*{ext}"), key=lambda p: p.stat().st_mtime, reverse=True)
         if not files:
@@ -203,8 +203,39 @@ async def download_and_send(chat_id, reply_msg, context, url, quality):
             return
 
         final_path = files[0]
-        caption = f"📥 <b>{title}</b>\n\nDownloaded by @spotifyxmusixbot"
+        file_size = final_path.stat().st_size
 
+        # Check size limits
+        user_id = reply_msg.chat.id
+        is_user_premium = is_premium(user_id)
+
+        if file_size > MAX_FREE_SIZE and not is_user_premium:
+            # Clean up file
+            final_path.unlink(missing_ok=True)
+            
+            # Show premium message
+            premium_msg = (
+                f"❌ <b>File too large!</b>\n\n"
+                f"📦 Size: {file_size / 1024 / 1024:.1f}MB\n"
+                f"💳 Free limit: {MAX_FREE_SIZE / 1024 / 1024}MB\n\n"
+                f"🔓 <b>Premium users get:</b>\n"
+                f"• Up to 450MB files\n"
+                f"• Priority downloads\n"
+                f"• No ads\n\n"
+                f"👉 Contact @ayushxchat_robot to subscribe premium!"
+            )
+            await reply_msg.reply_text(premium_msg, parse_mode=ParseMode.HTML)
+            return
+
+        # If premium but still too large (theoretical)
+        if file_size > PREMIUM_SIZE:
+            final_path.unlink(missing_ok=True)
+            await reply_msg.reply_text("❌ File exceeds maximum size (450MB). Try lower quality.")
+            return
+
+        # Send file
+        caption = f"📥 <b>{title}</b> ({file_size/1024/1024:.1f}MB)\n\nDownloaded by @spotifyxmusixbot"
+        
         if quality == "mp3":
             await reply_msg.reply_document(
                 document=final_path,
@@ -217,7 +248,7 @@ async def download_and_send(chat_id, reply_msg, context, url, quality):
                 video=final_path,
                 caption=caption,
                 filename=f"{title}.mp4",
-                supports_streaming=True,  # This is key for Telegram streaming
+                supports_streaming=True,
                 parse_mode=ParseMode.HTML
             )
 
@@ -240,7 +271,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• Download MP3 music 🎧\n"
         "• Download Videos (360p/480p/720p/1080p) 🎬\n"
         "• Search YouTube 🔍\n"
-        "• Generate AI images 🎨\n\n"
+        "• Generate AI images 🎨\n"
+        "• Premium: Up to 450MB files 💳\n\n"
         "<b>📌 Use /help for commands</b>\n"
     )
     await update.message.reply_text(start_text, parse_mode=ParseMode.HTML)
@@ -257,12 +289,10 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "<code>/gen &lt;prompt&gt;</code> — Generate AI image\n"
         "<code>/stats</code> — Admin stats\n"
         "<code>/broadcast</code> — Admin broadcast\n"
-        "<code>/done_broadcast</code> — Preview broadcast\n"
-        "<code>/send_broadcast</code> — Send broadcast\n"
-        "<code>/cancel_broadcast</code> — Cancel broadcast\n\n"
         "<b>📢 Links:</b>\n"
         f"• Updates: {UPDATES_CHANNEL}\n"
-        "• Report: @mahadev_ki_iccha"
+        "• Report: @mahadev_ki_iccha\n"
+        "• Premium: @ayushxchat_robot"
     )
     await update.message.reply_text(help_text, parse_mode=ParseMode.HTML)
 
@@ -584,7 +614,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Choose quality:", reply_markup=quality_keyboard(url))
 
 # =========================
-# Main Function (LAST)
+# Main Function (ABSOLUTELY LAST)
 # =========================
 
 def main():
@@ -625,7 +655,7 @@ def main():
     app.run_polling()
 
 # =========================
-# Entry Point (ABSOLUTELY LAST)
+# Entry Point
 # =========================
 
 if __name__ == "__main__":
