@@ -30,7 +30,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 OWNER_ID = int(os.getenv("OWNER_ID", "7941244038"))
 UPDATES_CHANNEL = os.getenv("UPDATES_CHANNEL", "")
 
-COOKIES_TXT = os.getenv("COOKIES_TXT")  # Should be a file path like /app/cookies.txt
+COOKIES_TXT = os.getenv("COOKIES_TXT")
 MONGO_URI = os.getenv("MONGO_URI")
 MONGO_DB = os.getenv("MONGO_DB", "youtube_bot")
 MONGO_USERS = os.getenv("MONGO_USERS", "users")
@@ -39,9 +39,10 @@ MONGO_USERS = os.getenv("MONGO_USERS", "users")
 DOWNLOAD_DIR = Path("downloads")
 DOWNLOAD_DIR.mkdir(exist_ok=True)
 
-# Broadcast storage
+# Storage
 BROADCAST_STORE: Dict[int, List[dict]] = {}
 BROADCAST_STATE: Dict[int, bool] = {}
+PENDING: Dict[str, str] = {}
 
 # Logging
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
@@ -71,10 +72,11 @@ except Exception as e:
     mongo = db = users_col = None
 
 # =========================
-# Helpers
+# Helper Functions
 # =========================
 
 def ensure_user(update: Update):
+    """Track users in database"""
     if not MONGO_AVAILABLE or not update.effective_user:
         return
     try:
@@ -88,18 +90,26 @@ def ensure_user(update: Update):
         log.error(f"User tracking failed: {e}")
 
 def is_admin(user_id: int) -> bool:
+    """Check if user is admin"""
     return int(user_id) == OWNER_ID
 
 def sanitize_filename(name: str) -> str:
+    """Clean filename for saving"""
     name = re.sub(r'[\\/*?:"<>|]', "", name)
     name = re.sub(r"\s+", " ", name).strip()
     return name or "output"
 
-YOUTUBE_REGEX = re.compile(r"(https?://)?(www\.)?(youtube\.com|youtu\.be)/[\w\-?&=/%]+", re.I)
-
-PENDING: Dict[str, str] = {}
+def cleanup_old_files():
+    """Keep only last 10 files"""
+    try:
+        all_files = sorted(DOWNLOAD_DIR.glob("*"), key=lambda p: p.stat().st_mtime, reverse=True)
+        for f in all_files[10:]:
+            f.unlink()
+    except:
+        pass
 
 def quality_keyboard(url: str) -> InlineKeyboardMarkup:
+    """Create quality selection keyboard"""
     token = str(abs(hash((url, os.urandom(4)))))[:10]
     PENDING[token] = url
     return InlineKeyboardMarkup([
@@ -115,13 +125,15 @@ def quality_keyboard(url: str) -> InlineKeyboardMarkup:
 # =========================
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    """Global error handler"""
     log.error("Exception while handling an update:", exc_info=context.error)
 
 # =========================
-# yt-dlp Downloader
+# Core Functions
 # =========================
 
 async def download_and_send(chat_id, reply_msg, context, url, quality):
+    """Download and send media"""
     try:
         ydl_opts = {
             "quiet": True,
@@ -129,7 +141,7 @@ async def download_and_send(chat_id, reply_msg, context, url, quality):
             "outtmpl": str(DOWNLOAD_DIR / "%(title)s.%(ext)s"),
         }
 
-        # FIXED: Proper cookie file handling
+        # Cookie handling
         if COOKIES_TXT and Path(COOKIES_TXT).exists():
             ydl_opts["cookiefile"] = COOKIES_TXT
             log.info(f"Using cookies from: {COOKIES_TXT}")
@@ -191,21 +203,131 @@ async def download_and_send(chat_id, reply_msg, context, url, quality):
     except Exception as e:
         await reply_msg.reply_text(f"⚠️ Error: {e}")
 
-def cleanup_old_files():
-    """Keep only last 10 files"""
-    try:
-        all_files = sorted(DOWNLOAD_DIR.glob("*"), key=lambda p: p.stat().st_mtime, reverse=True)
-        for f in all_files[10:]:
-            f.unlink()
-    except:
-        pass
+# =========================
+# Command Handlers
+# =========================
 
-# =========================
-# AI Image Generation
-# =========================
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /start command"""
+    ensure_user(update)
+
+    start_text = (
+        "<b>🎧 Welcome to SpotifyX Musix Bot 🎧</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        
+        "<b>🔥 Your all-in-one YouTube downloader</b>\n"
+        "• Download <b>MP3 music</b> in 192kbps 🎧\n"
+        "• Download <b>Videos</b> in 360p/480p/720p/1080p 🎬\n"
+        "• Search any song using <code>/search &lt;name&gt;</code> 🔍\n"
+        "• Generate AI images with <code>/gen &lt;description&gt;</code> 🎨\n"
+        "• Fast, clean, no ads — ever 😎\n\n"
+
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "<b>📌 How to use the bot?</b>\n"
+        "1. Send any <b>YouTube link</b> → choose quality\n"
+        "2. Use <code>/search &lt;name&gt;</code> to find songs\n"
+        "3. Use <code>/gen &lt;description&gt;</code> to create AI images\n"
+        "4. All files sent instantly with Telegram streaming ⚡\n\n"
+
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "<b>📢 Important Links</b>\n"
+        f"• Updates: {UPDATES_CHANNEL}\n"
+        "• Report Issue: @mahadev_ki_iccha\n"
+        "• Paid Bots / Promo: @mahadev_ki_iccha\n\n"
+
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "<b>❓ Need help?</b>\n"
+        "Use <code>/help</code> for all commands.\n"
+    )
+
+    await update.message.reply_text(start_text, parse_mode=ParseMode.HTML)
+
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /help command"""
+    ensure_user(update)
+    
+    help_text = (
+        "<b>✨ SpotifyX Musix Bot — Full Guide ✨</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+
+        "<b>🔥 Features:</b>\n"
+        "• Download <b>MP3 music</b> 🎧\n"
+        "• Download <b>YouTube Videos</b> (360p/480p/720p/1080p) 🎬\n"
+        "• Search any song / video via <code>/search</code>\n"
+        "• Generate AI images with <code>/gen</code> 🎨\n"
+        "• All videos support Telegram streaming!\n\n"
+
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "<b>📌 Commands:</b>\n"
+        "• <code>/start</code> — Start the bot\n"
+        "• <code>/help</code> — Show this help\n"
+        "• <code>/search &lt;name&gt;</code> — Search YouTube\n"
+        "• <code>/gen &lt;description&gt;</code> — Generate AI image\n"
+        "• <code>/broadcast</code> — Admin: Start broadcast (multi-message)\n"
+        "• <code>/done_broadcast</code> — Admin: Preview broadcast\n"
+        "• <code>/send_broadcast</code> — Admin: Send broadcast\n"
+        "• <code>/cancel_broadcast</code> — Admin: Cancel broadcast\n"
+        "• <code>/stats</code> — Admin: Show user statistics\n\n"
+
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "<b>🎬 Quality Options:</b>\n"
+        "360p, 480p, 720p, 1080p, MP3\n\n"
+
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "<b>📢 Important Links</b>\n"
+        f"• Updates Channel: {UPDATES_CHANNEL}\n"
+        "• Report Issue: @ayushxchat_robot\n"
+        "• Contact for Paid Bots / Cross Promo: @mahadev_ki_iccha\n\n"
+
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "<b>🤖 Bot Created By</b>\n"
+        "• <b>Tony Stark Jr</b>⚡\n"
+    )
+    await update.message.reply_text(help_text, parse_mode=ParseMode.HTML)
+
+async def search_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /search command"""
+    ensure_user(update)
+    query = " ".join(context.args)
+    if not query:
+        await update.message.reply_text("Usage: /search <text>")
+        return
+
+    await update.message.reply_text(f"Searching '{query}'…")
+
+    ydl_opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+        "default_search": "ytsearch5",
+        "extract_flat": False,
+    }
+
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(query, download=False)
+    except Exception as e:
+        await update.message.reply_text(f"⚠️ Search failed: {e}")
+        return
+
+    entries = info.get("entries", [])
+    if not entries:
+        await update.message.reply_text("No results.")
+        return
+
+    buttons = []
+    for e in entries[:5]:
+        title = sanitize_filename(e.get("title") or "video")
+        video_id = e.get('id')
+        url = f"https://youtube.com/watch?v={video_id}" if video_id else e.get('webpage_url')
+        token = str(abs(hash((url, os.urandom(4)))))[:10]
+        PENDING[token] = url
+        buttons.append([InlineKeyboardButton(title[:60], callback_data=f"s|{token}|pick")])
+
+    await update.message.reply_text("Choose:", reply_markup=InlineKeyboardMarkup(buttons))
 
 async def gen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Generate image using Vercel AI"""
+    """Handle /gen command - Generate AI images"""
     ensure_user(update)
     
     query = " ".join(context.args)
@@ -243,12 +365,8 @@ async def gen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await status_msg.edit_text(f"❌ Failed: {e}")
 
-# =========================
-# Admin Commands
-# =========================
-
 async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show user statistics"""
+    """Handle /stats command - Show statistics"""
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("❌ You are not authorized!")
         return
@@ -261,6 +379,10 @@ async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     docs = users_col.find().limit(50)
     preview = "\n".join([f"{d['name']} — {d['_id']}" for d in docs])
     await update.message.reply_text(f"👥 Users: {total}\n\n{preview}")
+
+# =========================
+# Broadcast System
+# =========================
 
 async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Start broadcast mode"""
@@ -281,7 +403,7 @@ async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def handle_broadcast_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Collect messages during broadcast mode"""
+    """Collect broadcast messages"""
     admin_id = update.effective_user.id
     
     if not BROADCAST_STATE.get(admin_id):
@@ -302,7 +424,7 @@ async def handle_broadcast_message(update: Update, context: ContextTypes.DEFAULT
     await update.message.reply_text(f"✅ Message #{msg_count} added to broadcast queue")
 
 async def done_broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show broadcast preview"""
+    """Preview broadcast messages"""
     if not is_admin(update.effective_user.id):
         return
     
@@ -332,13 +454,13 @@ async def done_broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
     
     await update.message.reply_text(
         "✅ Preview complete!\n\n"
-        "Send <b>/send_broadcast</b> to broadcast to ALL users and groups.\n"
+        "Send <b>/send_broadcast</b> to broadcast to ALL users.\n"
         "Send <b>/cancel_broadcast</b> to cancel.",
         parse_mode=ParseMode.HTML
     )
 
 async def send_broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Send broadcast to all users and groups"""
+    """Send broadcast to all users"""
     if not is_admin(update.effective_user.id):
         return
     
@@ -353,16 +475,12 @@ async def send_broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text("❌ No messages to broadcast.")
         return
     
-    # Get all users from database
+    # Get recipients
     recipients = set()
     if MONGO_AVAILABLE:
         users_cursor = users_col.find({}, {"_id": 1})
         for u in users_cursor:
             recipients.add(u["_id"])
-    
-    # FIXED: Also get groups from chat history
-    # Add group IDs manually if you want, or track them separately
-    # For now, we'll just broadcast to users
     
     await update.message.reply_text(f"📢 Broadcasting to {len(recipients)} recipients...")
     
@@ -412,7 +530,6 @@ async def send_broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
             failed += 1
         await asyncio.sleep(0.05)
     
-    # Clear broadcast data
     BROADCAST_STORE.pop(admin_id, None)
     BROADCAST_STATE[admin_id] = False
     
@@ -436,86 +553,62 @@ async def cancel_broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
     await update.message.reply_text("❌ Broadcast cancelled.")
 
 # =========================
-# Handlers
+# Callback Handlers
 # =========================
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    ensure_user(update)
+async def on_quality(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle quality selection callback"""
+    q = update.callback_query
+    await q.answer()
+    try:
+        _, token, qlt = q.data.split("|")
+    except:
+        return
+    url = PENDING.get(token)
+    if not url:
+        await q.edit_message_text("Session expired.")
+        return
+    await q.edit_message_text(f"Downloading {qlt}…")
+    await download_and_send(q.message.chat.id, q.message, context, url, qlt)
 
-    start_text = (
-        "<b>🎧 Welcome to SpotifyX Musix Bot 🎧</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━\n\n"
-        
-        "<b>🔥 Your all-in-one YouTube downloader</b>\n"
-        "• Download <b>MP3 music</b> in 192kbps 🎧\n"
-        "• Download <b>Videos</b> in 360p/480p/720p/1080p 🎬\n"
-        "• Search any song using <code>/search &lt;name&gt;</code> 🔍\n"
-        "• Generate AI images with <code>/gen &lt;description&gt;</code> 🎨\n"
-        "• Fast, clean, no ads — ever 😎\n\n"
+async def on_search_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle search result selection callback"""
+    q = update.callback_query
+    await q.answer()
+    _, token, _ = q.data.split("|")
+    url = PENDING.get(token)
+    if not url:
+        await q.edit_message_text("Expired.")
+        return
+    await q.edit_message_text("Choose quality:", reply_markup=quality_keyboard(url))
 
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        "<b>📌 How to use the bot?</b>\n"
-        "1. Send any <b>YouTube link</b> → choose quality\n"
-        "2. Use <code>/search &lt;name&gt;</code> to find songs\n"
-        "3. Use <code>/gen &lt;description&gt;</code> to create AI images\n"
-        "4. All files sent instantly with Telegram streaming ⚡\n\n"
+# =========================
+# Message Handlers
+# =========================
 
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        "<b>📢 Important Links</b>\n"
-        f"• Updates: {UPDATES_CHANNEL}\n"
-        "• Report Issue: @mahadev_ki_iccha\n"
-        "• Paid Bots / Promo: @mahadev_ki_iccha\n\n"
-
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        "<b>❓ Need help?</b>\n"
-        "Use <code>/help</code> for all commands.\n"
-    )
-
-    await update.message.reply_text(start_text, parse_mode=ParseMode.HTML)
-
-async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle text messages"""
     ensure_user(update)
     
-    help_text = (
-        "<b>✨ SpotifyX Musix Bot — Full Guide ✨</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━\n\n"
+    # Check if admin is in broadcast mode
+    if update.effective_user and is_admin(update.effective_user.id):
+        if BROADCAST_STATE.get(update.effective_user.id):
+            await handle_broadcast_message(update, context)
+            return
+    
+    # Check for YouTube URLs
+    txt = update.message.text.strip()
+    match = YOUTUBE_REGEX.search(txt)
+    if match:
+        url = match.group(0)
+        await update.message.reply_text("Choose quality:", reply_markup=quality_keyboard(url))
 
-        "<b>🔥 Features:</b>\n"
-        "• Download <b>MP3 music</b> 🎧\n"
-        "• Download <b>YouTube Videos</b> (360p/480p/720p/1080p) 🎬\n"
-        "• Search any song / video via <code>/search</code>\n"
-        "• Generate AI images with <code>/gen</code> 🎨\n"
-        "• All videos support Telegram streaming!\n\n"
-
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        "<b>📌 Commands:</b>\n"
-        "• <code>/start</code> — Start the bot\n"
-        "• <code>/help</code> — Show this help\n"
-        "• <code>/search &lt;name&gt;</code> — Search YouTube\n"
-        "• <code>/gen &lt;description&gt;</code> — Generate AI image\n"
-        "• <code>/broadcast</code> — Admin: Start broadcast (multi-message)\n"
-        "• <code>/done_broadcast</code> — Admin: Preview broadcast\n"
-        "• <code>/send_broadcast</code> — Admin: Send broadcast\n"
-        "• <code>/cancel_broadcast</code> — Admin: Cancel broadcast\n"
-        "• <code>/stats</code> — Admin: Show user statistics\n\n"
-
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        "<b>🎬 Quality Options:</b>\n"
-        "360p, 480p, 720p, 1080p, MP3\n\n"
-
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        "<b>📢 Important Links</b>\n"
-        f"• Updates Channel: {UPDATES_CHANNEL}\n"
-        "• Report Issue: @ayushxchat_robot\n"
-        "• Contact for Paid Bots / Cross Promo: @mahadev_ki_iccha\n\n"
-
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        "<b>🤖 Bot Created By</b>\n"
-        "• <b>Tony Stark Jr</b>⚡\n"
-    )
-    await update.message.reply_text(help_text, parse_mode=ParseMode.HTML)
+# =========================
+# Main Function (MUST BE LAST)
+# =========================
 
 def main():
+    """Main bot function"""
     import signal
     import sys
     
@@ -525,10 +618,11 @@ def main():
     
     signal.signal(signal.SIGTERM, shutdown_handler)
     
+    # Initialize bot
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_error_handler(error_handler)
 
-    # Command handlers - ALL DEFINED NOW
+    # Add command handlers - ALL functions are now defined
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("search", search_cmd))
@@ -539,16 +633,20 @@ def main():
     app.add_handler(CommandHandler("cancel_broadcast", cancel_broadcast_cmd))
     app.add_handler(CommandHandler("gen", gen_cmd))
 
-    # Message handlers
+    # Add message handlers
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_broadcast_message))
     
-    # Callback handlers
+    # Add callback handlers
     app.add_handler(CallbackQueryHandler(on_quality, pattern=r"^q\|"))
     app.add_handler(CallbackQueryHandler(on_search_pick, pattern=r"^s\|"))
 
     log.info("Bot is starting...")
     app.run_polling()
+
+# =========================
+# Entry Point (ABSOLUTELY LAST)
+# =========================
 
 if __name__ == "__main__":
     main()
