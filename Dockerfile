@@ -14,3 +14,5 @@ ENV PYTHONUNBUFFERED=1
 # telegram bot runs as a worker, no web port needed
 CMD ["python", "bot.py"]
 
+# Add this line to copy cookies.txt into container
+COPY cookies.txt /app/
