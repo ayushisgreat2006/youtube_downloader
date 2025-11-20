@@ -30,7 +30,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 OWNER_ID = int(os.getenv("OWNER_ID", "7941244038"))
 UPDATES_CHANNEL = os.getenv("UPDATES_CHANNEL", "")
 
-COOKIES_TXT = os.getenv("COOKIES_TXT")
+COOKIES_TXT = os.getenv("COOKIES_TXT")  # Should be a file path like /app/cookies.txt
 MONGO_URI = os.getenv("MONGO_URI")
 MONGO_DB = os.getenv("MONGO_DB", "youtube_bot")
 MONGO_USERS = os.getenv("MONGO_USERS", "users")
@@ -44,9 +44,21 @@ BROADCAST_STORE: Dict[int, List[dict]] = {}
 BROADCAST_STATE: Dict[int, bool] = {}
 PENDING: Dict[str, str] = {}
 
+# Cookie validation flag
+COOKIE_FILE_VALID = False
+if COOKIES_TXT:
+    if Path(COOKIES_TXT).exists():
+        COOKIE_FILE_VALID = True
+        log_msg = f"✅ Cookie file found: {COOKIES_TXT}"
+    else:
+        log_msg = f"⚠️ Cookie file not found at: {COOKIES_TXT} (downloads may still work)"
+else:
+    log_msg = "ℹ️ No cookie file configured"
+
 # Logging
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
 log = logging.getLogger("ytbot")
+log.info(log_msg)
 
 # =========================
 # MongoDB Setup
@@ -108,6 +120,12 @@ def cleanup_old_files():
     except:
         pass
 
+# =========================
+# Regex & Keyboards
+# =========================
+
+YOUTUBE_REGEX = re.compile(r"(https?://)?(www\.)?(youtube\.com|youtu\.be)/[\w\-?&=/%]+", re.I)
+
 def quality_keyboard(url: str) -> InlineKeyboardMarkup:
     """Create quality selection keyboard"""
     token = str(abs(hash((url, os.urandom(4)))))[:10]
@@ -129,11 +147,11 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     log.error("Exception while handling an update:", exc_info=context.error)
 
 # =========================
-# Core Functions
+# Core Download Function
 # =========================
 
 async def download_and_send(chat_id, reply_msg, context, url, quality):
-    """Download and send media"""
+    """Download and send media with proper formats"""
     try:
         ydl_opts = {
             "quiet": True,
@@ -141,13 +159,10 @@ async def download_and_send(chat_id, reply_msg, context, url, quality):
             "outtmpl": str(DOWNLOAD_DIR / "%(title)s.%(ext)s"),
         }
 
-        # Cookie handling
-        if COOKIES_TXT and Path(COOKIES_TXT).exists():
+        # Use cookie file if valid
+        if COOKIE_FILE_VALID:
             ydl_opts["cookiefile"] = COOKIES_TXT
             log.info(f"Using cookies from: {COOKIES_TXT}")
-        elif COOKIES_TXT and not Path(COOKIES_TXT).exists():
-            log.warning(f"Cookie file not found at: {COOKIES_TXT}")
-            await reply_msg.reply_text("⚠️ Warning: Cookie file not found")
 
         if quality == "mp3":
             ydl_opts.update({
@@ -159,20 +174,28 @@ async def download_and_send(chat_id, reply_msg, context, url, quality):
                 }],
             })
         else:
+            # FIXED: Force H.264 + AAC for Telegram streaming
             ydl_opts.update({
-                "format": f"bestvideo[height<={quality}]+bestaudio/best[height<={quality}]",
+                # Prioritize H.264 video and AAC audio
+                "format": f"bestvideo[height<={quality}][vcodec^=avc][ext=mp4]+bestaudio[acodec^=mp4a][ext=m4a]/best[height<={quality}][ext=mp4]",
                 "merge_output_format": "mp4",
                 "postprocessor_args": {
                     "MOV+FFmpegVideoConvertor+mp4": [
-                        "-movflags", "+faststart",
+                        "-movflags", "+faststart",  # Move MOOV atom to start for streaming
+                        "-c:v", "libx264",          # Force H.264 codec
+                        "-c:a", "aac",              # Force AAC audio
+                        "-preset", "faster",        # Faster encoding
+                        "-crf", "23"                # Good quality/size balance
                     ]
                 }
             })
 
+        # Download
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
             title = sanitize_filename(info.get("title", "video"))
 
+        # Find and send file
         ext = ".mp3" if quality == "mp3" else ".mp4"
         files = sorted(DOWNLOAD_DIR.glob(f"*{ext}"), key=lambda p: p.stat().st_mtime, reverse=True)
         if not files:
@@ -194,7 +217,7 @@ async def download_and_send(chat_id, reply_msg, context, url, quality):
                 video=final_path,
                 caption=caption,
                 filename=f"{title}.mp4",
-                supports_streaming=True,
+                supports_streaming=True,  # This is key for Telegram streaming
                 parse_mode=ParseMode.HTML
             )
 
@@ -210,78 +233,36 @@ async def download_and_send(chat_id, reply_msg, context, url, quality):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /start command"""
     ensure_user(update)
-
     start_text = (
         "<b>🎧 Welcome to SpotifyX Musix Bot 🎧</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
-        
-        "<b>🔥 Your all-in-one YouTube downloader</b>\n"
-        "• Download <b>MP3 music</b> in 192kbps 🎧\n"
-        "• Download <b>Videos</b> in 360p/480p/720p/1080p 🎬\n"
-        "• Search any song using <code>/search &lt;name&gt;</code> 🔍\n"
-        "• Generate AI images with <code>/gen &lt;description&gt;</code> 🎨\n"
-        "• Fast, clean, no ads — ever 😎\n\n"
-
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        "<b>📌 How to use the bot?</b>\n"
-        "1. Send any <b>YouTube link</b> → choose quality\n"
-        "2. Use <code>/search &lt;name&gt;</code> to find songs\n"
-        "3. Use <code>/gen &lt;description&gt;</code> to create AI images\n"
-        "4. All files sent instantly with Telegram streaming ⚡\n\n"
-
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        "<b>📢 Important Links</b>\n"
-        f"• Updates: {UPDATES_CHANNEL}\n"
-        "• Report Issue: @mahadev_ki_iccha\n"
-        "• Paid Bots / Promo: @mahadev_ki_iccha\n\n"
-
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        "<b>❓ Need help?</b>\n"
-        "Use <code>/help</code> for all commands.\n"
+        "<b>🔥 Features:</b>\n"
+        "• Download MP3 music 🎧\n"
+        "• Download Videos (360p/480p/720p/1080p) 🎬\n"
+        "• Search YouTube 🔍\n"
+        "• Generate AI images 🎨\n\n"
+        "<b>📌 Use /help for commands</b>\n"
     )
-
     await update.message.reply_text(start_text, parse_mode=ParseMode.HTML)
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /help command"""
     ensure_user(update)
-    
     help_text = (
-        "<b>✨ SpotifyX Musix Bot — Full Guide ✨</b>\n"
+        "<b>✨ SpotifyX Musix Bot — Commands ✨</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
-
-        "<b>🔥 Features:</b>\n"
-        "• Download <b>MP3 music</b> 🎧\n"
-        "• Download <b>YouTube Videos</b> (360p/480p/720p/1080p) 🎬\n"
-        "• Search any song / video via <code>/search</code>\n"
-        "• Generate AI images with <code>/gen</code> 🎨\n"
-        "• All videos support Telegram streaming!\n\n"
-
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        "<b>📌 Commands:</b>\n"
-        "• <code>/start</code> — Start the bot\n"
-        "• <code>/help</code> — Show this help\n"
-        "• <code>/search &lt;name&gt;</code> — Search YouTube\n"
-        "• <code>/gen &lt;description&gt;</code> — Generate AI image\n"
-        "• <code>/broadcast</code> — Admin: Start broadcast (multi-message)\n"
-        "• <code>/done_broadcast</code> — Admin: Preview broadcast\n"
-        "• <code>/send_broadcast</code> — Admin: Send broadcast\n"
-        "• <code>/cancel_broadcast</code> — Admin: Cancel broadcast\n"
-        "• <code>/stats</code> — Admin: Show user statistics\n\n"
-
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        "<b>🎬 Quality Options:</b>\n"
-        "360p, 480p, 720p, 1080p, MP3\n\n"
-
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        "<b>📢 Important Links</b>\n"
-        f"• Updates Channel: {UPDATES_CHANNEL}\n"
-        "• Report Issue: @ayushxchat_robot\n"
-        "• Contact for Paid Bots / Cross Promo: @mahadev_ki_iccha\n\n"
-
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        "<b>🤖 Bot Created By</b>\n"
-        "• <b>Tony Stark Jr</b>⚡\n"
+        "<code>/start</code> — Start bot\n"
+        "<code>/help</code> — Show this help\n"
+        "<code>/search &lt;name&gt;</code> — Search YouTube\n"
+        "<code>/gen &lt;prompt&gt;</code> — Generate AI image\n"
+        "<code>/stats</code> — Admin stats\n"
+        "<code>/broadcast</code> — Admin broadcast\n"
+        "<code>/done_broadcast</code> — Preview broadcast\n"
+        "<code>/send_broadcast</code> — Send broadcast\n"
+        "<code>/cancel_broadcast</code> — Cancel broadcast\n\n"
+        "<b>📢 Links:</b>\n"
+        f"• Updates: {UPDATES_CHANNEL}\n"
+        "• Report: @mahadev_ki_iccha"
     )
     await update.message.reply_text(help_text, parse_mode=ParseMode.HTML)
 
@@ -329,7 +310,6 @@ async def search_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def gen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /gen command - Generate AI images"""
     ensure_user(update)
-    
     query = " ".join(context.args)
     if not query:
         await update.message.reply_text("Usage: /gen <description>\nExample: `/gen a ripe mango on mango tree`")
@@ -604,7 +584,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Choose quality:", reply_markup=quality_keyboard(url))
 
 # =========================
-# Main Function (MUST BE LAST)
+# Main Function (LAST)
 # =========================
 
 def main():
@@ -622,7 +602,7 @@ def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_error_handler(error_handler)
 
-    # Add command handlers - ALL functions are now defined
+    # Add command handlers
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("search", search_cmd))
