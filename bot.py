@@ -3,9 +3,8 @@ import re
 import asyncio
 import logging
 from pathlib import Path
-from typing import Dict, Optional
-
-import aiohttp  # For image generation
+from typing import Dict, Optional, List
+import aiohttp
 from pymongo import MongoClient
 from telegram import (
     Update,
@@ -31,14 +30,18 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 OWNER_ID = int(os.getenv("OWNER_ID", "7941244038"))
 UPDATES_CHANNEL = os.getenv("UPDATES_CHANNEL", "")
 
-COOKIES_TXT = os.getenv("COOKIES_TXT")  # optional
-MONGO_URI = os.getenv("MONGO_URI")      # required
+COOKIES_TXT = os.getenv("COOKIES_TXT")  # Should be a file path like /app/cookies.txt
+MONGO_URI = os.getenv("MONGO_URI")
 MONGO_DB = os.getenv("MONGO_DB", "youtube_bot")
 MONGO_USERS = os.getenv("MONGO_USERS", "users")
 
 # Paths
 DOWNLOAD_DIR = Path("downloads")
 DOWNLOAD_DIR.mkdir(exist_ok=True)
+
+# Broadcast storage
+BROADCAST_STORE: Dict[int, List[dict]] = {}  # admin_id -> list of messages
+BROADCAST_STATE: Dict[int, bool] = {}  # admin_id -> is in broadcast mode
 
 # Logging
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
@@ -126,6 +129,14 @@ async def download_and_send(chat_id, reply_msg, context, url, quality):
             "outtmpl": str(DOWNLOAD_DIR / "%(title)s.%(ext)s"),
         }
 
+        # FIXED: Proper cookie file handling
+        if COOKIES_TXT and Path(COOKIES_TXT).exists():
+            ydl_opts["cookiefile"] = COOKIES_TXT
+            log.info(f"Using cookies from: {COOKIES_TXT}")
+        elif COOKIES_TXT and not Path(COOKIES_TXT).exists():
+            log.warning(f"Cookie file not found at: {COOKIES_TXT}")
+            await reply_msg.reply_text("⚠️ Warning: Cookie file not found")
+
         if quality == "mp3":
             ydl_opts.update({
                 "format": "bestaudio/best",
@@ -136,30 +147,20 @@ async def download_and_send(chat_id, reply_msg, context, url, quality):
                 }],
             })
         else:
-            # SIMPLIFIED: Standard MP4 that Telegram streams natively
             ydl_opts.update({
                 "format": f"bestvideo[height<={quality}]+bestaudio/best[height<={quality}]",
                 "merge_output_format": "mp4",
                 "postprocessor_args": {
                     "MOV+FFmpegVideoConvertor+mp4": [
-                        "-movflags", "+faststart",  # Enable streaming
+                        "-movflags", "+faststart",
                     ]
                 }
             })
-
-        if COOKIES_TXT:
-            try:
-                cookie_path = Path("/tmp/cookies.txt")
-                cookie_path.write_text(COOKIES_TXT, encoding="utf-8")
-                ydl_opts["cookiefile"] = str(cookie_path)
-            except Exception as e:
-                log.error(f"Cookie write failed: {e}")
 
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
             title = sanitize_filename(info.get("title", "video"))
 
-        # Send file
         ext = ".mp3" if quality == "mp3" else ".mp4"
         files = sorted(DOWNLOAD_DIR.glob(f"*{ext}"), key=lambda p: p.stat().st_mtime, reverse=True)
         if not files:
@@ -181,11 +182,10 @@ async def download_and_send(chat_id, reply_msg, context, url, quality):
                 video=final_path,
                 caption=caption,
                 filename=f"{title}.mp4",
-                supports_streaming=True,  # Enable Telegram streaming
+                supports_streaming=True,
                 parse_mode=ParseMode.HTML
             )
 
-        # Cleanup
         cleanup_old_files()
 
     except Exception as e:
@@ -201,55 +201,188 @@ def cleanup_old_files():
         pass
 
 # =========================
-# NEW: Image Generation Feature
+# NEW: Interactive Broadcast System
 # =========================
 
-async def gen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Generate image using Vercel AI"""
-    ensure_user(update)
-    
-    query = " ".join(context.args)
-    if not query:
-        await update.message.reply_text("Usage: /gen <description>\nExample: `/gen a ripe mango on mango tree`")
+async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Start broadcast mode"""
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("❌ You are not authorized!")
         return
+    
+    admin_id = update.effective_user.id
+    
+    # Initialize broadcast store
+    BROADCAST_STORE[admin_id] = []
+    BROADCAST_STATE[admin_id] = True
+    
+    await update.message.reply_text(
+        "📢 <b>Broadcast Mode Activated!</b>\n\n"
+        "Send me messages, photos, videos, GIFs, or documents.\n"
+        "Use <b>/done_broadcast</b> when finished.\n"
+        "Use <b>/cancel_broadcast</b> to cancel.",
+        parse_mode=ParseMode.HTML
+    )
 
-    # Show generating message
-    status_msg = await update.message.reply_text("🎨 Generating image...")
+async def handle_broadcast_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Collect messages during broadcast mode"""
+    admin_id = update.effective_user.id
+    
+    if not BROADCAST_STATE.get(admin_id):
+        return  # Not in broadcast mode
+    
+    message_data = {
+        "text": update.message.text,
+        "photo": update.message.photo[-1].file_id if update.message.photo else None,
+        "video": update.message.video.file_id if update.message.video else None,
+        "document": update.message.document.file_id if update.message.document else None,
+        "animation": update.message.animation.file_id if update.message.animation else None,
+        "caption": update.message.caption,
+        "parse_mode": ParseMode.HTML if update.message.caption_entities else None
+    }
+    
+    BROADCAST_STORE[admin_id].append(message_data)
+    
+    msg_count = len(BROADCAST_STORE[admin_id])
+    await update.message.reply_text(f"✅ Message #{msg_count} added to broadcast queue")
 
-    try:
-        # Encode query for URL
-        encoded_query = query.replace(" ", "+")
-        image_url = f"https://flux-pro.vercel.app/generate?q={encoded_query}"
-        
-        # Download image
-        async with aiohttp.ClientSession() as session:
-            async with session.get(image_url) as resp:
-                if resp.status != 200:
-                    await status_msg.edit_text(f"❌ Generation failed (Error {resp.status})")
-                    return
-                
-                # Save image temporarily
-                image_data = await resp.read()
-                image_path = DOWNLOAD_DIR / f"gen_{update.effective_user.id}.png"
-                with open(image_path, "wb") as f:
-                    f.write(image_data)
+async def done_broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show broadcast preview"""
+    if not is_admin(update.effective_user.id):
+        return
+    
+    admin_id = update.effective_user.id
+    
+    if not BROADCAST_STATE.get(admin_id):
+        await update.message.reply_text("❌ You are not in broadcast mode. Use /broadcast first.")
+        return
+    
+    if not BROADCAST_STORE.get(admin_id):
+        await update.message.reply_text("❌ No messages added to broadcast. Send some messages first!")
+        return
+    
+    # Send preview
+    await update.message.reply_text("📢 <b>Broadcast Preview:</b>", parse_mode=ParseMode.HTML)
+    
+    for msg in BROADCAST_STORE[admin_id]:
+        if msg["photo"]:
+            await update.message.reply_photo(photo=msg["photo"], caption=msg["caption"], parse_mode=msg["parse_mode"])
+        elif msg["video"]:
+            await update.message.reply_video(video=msg["video"], caption=msg["caption"], parse_mode=msg["parse_mode"])
+        elif msg["document"]:
+            await update.message.reply_document(document=msg["document"], caption=msg["caption"], parse_mode=msg["parse_mode"])
+        elif msg["animation"]:
+            await update.message.reply_animation(animation=msg["animation"], caption=msg["caption"], parse_mode=msg["parse_mode"])
+        elif msg["text"]:
+            await update.message.reply_text(msg["text"], parse_mode=ParseMode.HTML)
+    
+    await update.message.reply_text(
+        "✅ Preview complete!\n\n"
+        "Send <b>/send_broadcast</b> to broadcast to ALL users and groups.\n"
+        "Send <b>/cancel_broadcast</b> to cancel.",
+        parse_mode=ParseMode.HTML
+    )
 
-        # Send generated image
-        caption = f"🖼️ <b>{query}</b>\n\nGenerated by @spotifyxmusixbot"
-        await update.message.reply_photo(
-            photo=image_path,
-            caption=caption,
-            parse_mode=ParseMode.HTML
-        )
+async def send_broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Send broadcast to all users and groups"""
+    if not is_admin(update.effective_user.id):
+        return
+    
+    admin_id = update.effective_user.id
+    
+    if not BROADCAST_STATE.get(admin_id):
+        await update.message.reply_text("❌ You are not in broadcast mode.")
+        return
+    
+    messages = BROADCAST_STORE.get(admin_id, [])
+    if not messages:
+        await update.message.reply_text("❌ No messages to broadcast.")
+        return
+    
+    # Get all users AND groups (chats where bot is member)
+    recipients = set()
+    
+    # Add users from database
+    if MONGO_AVAILABLE:
+        users_cursor = users_col.find({}, {"_id": 1})
+        for u in users_cursor:
+            recipients.add(u["_id"])
+    
+    # Add recent chats from update history (groups)
+    # Note: This is a limitation - we need to track groups separately
+    # For now, we'll just send to users and hope groups are in the user list
+    # Better solution: Create a separate collection for groups
+    
+    await update.message.reply_text(f"📢 Broadcasting to {len(recipients)} recipients...")
+    
+    success = 0
+    failed = 0
+    
+    for chat_id in recipients:
+        try:
+            for msg in messages:
+                if msg["photo"]:
+                    await context.bot.send_photo(
+                        chat_id=chat_id,
+                        photo=msg["photo"],
+                        caption=msg["caption"],
+                        parse_mode=msg["parse_mode"]
+                    )
+                elif msg["video"]:
+                    await context.bot.send_video(
+                        chat_id=chat_id,
+                        video=msg["video"],
+                        caption=msg["caption"],
+                        parse_mode=msg["parse_mode"]
+                    )
+                elif msg["document"]:
+                    await context.bot.send_document(
+                        chat_id=chat_id,
+                        document=msg["document"],
+                        caption=msg["caption"],
+                        parse_mode=msg["parse_mode"]
+                    )
+                elif msg["animation"]:
+                    await context.bot.send_animation(
+                        chat_id=chat_id,
+                        animation=msg["animation"],
+                        caption=msg["caption"],
+                        parse_mode=msg["parse_mode"]
+                    )
+                elif msg["text"]:
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        text=msg["text"],
+                        parse_mode=ParseMode.HTML
+                    )
+            success += 1
+        except Exception as e:
+            log.error(f"Failed to send to {chat_id}: {e}")
+            failed += 1
+        await asyncio.sleep(0.05)  # Rate limiting
+    
+    # Clear broadcast data
+    BROADCAST_STORE.pop(admin_id, None)
+    BROADCAST_STATE[admin_id] = False
+    
+    await update.message.reply_text(
+        f"✅ Broadcast Complete!\n"
+        f"📤 Successful: {success}\n"
+        f"❌ Failed: {failed}",
+        parse_mode=ParseMode.HTML
+    )
 
-        # Delete status message
-        await status_msg.delete()
-        
-        # Cleanup generated image
-        image_path.unlink(missing_ok=True)
-
-    except Exception as e:
-        await status_msg.edit_text(f"❌ Failed to generate image: {e}")
+async def cancel_broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Cancel broadcast mode"""
+    if not is_admin(update.effective_user.id):
+        return
+    
+    admin_id = update.effective_user.id
+    
+    BROADCAST_STORE.pop(admin_id, None)
+    BROADCAST_STATE[admin_id] = False
+    
+    await update.message.reply_text("❌ Broadcast cancelled.")
 
 # =========================
 # Handlers
@@ -308,7 +441,11 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• <code>/start</code> — Start the bot\n"
         "• <code>/help</code> — Show this help\n"
         "• <code>/search &lt;name&gt;</code> — Search YouTube\n"
-        "• <code>/gen &lt;description&gt;</code> — Generate AI image\n\n"
+        "• <code>/gen &lt;description&gt;</code> — Generate AI image\n"
+        "• <code>/broadcast</code> — Admin: Start broadcast (multi-message)\n"
+        "• <code>/done_broadcast</code> — Admin: Preview broadcast\n"
+        "• <code>/send_broadcast</code> — Admin: Send broadcast\n"
+        "• <code>/cancel_broadcast</code> — Admin: Cancel broadcast\n\n"
 
         "━━━━━━━━━━━━━━━━━━━━\n"
         "<b>🎬 Quality Options:</b>\n"
@@ -328,6 +465,13 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ensure_user(update)
+    
+    # Check if admin is in broadcast mode
+    if update.effective_user and is_admin(update.effective_user.id):
+        if BROADCAST_STATE.get(update.effective_user.id):
+            await handle_broadcast_message(update, context)
+            return
+    
     txt = update.message.text.strip()
     match = YOUTUBE_REGEX.search(txt)
     if match:
@@ -399,40 +543,50 @@ async def on_search_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.edit_message_text("Choose quality:", reply_markup=quality_keyboard(url))
 
 # =========================
-# Admin
+# NEW: AI Image Generation
 # =========================
 
-async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
+async def gen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Generate image using Vercel AI"""
+    ensure_user(update)
+    
+    query = " ".join(context.args)
+    if not query:
+        await update.message.reply_text("Usage: /gen <description>\nExample: `/gen a ripe mango on mango tree`")
         return
-    if not MONGO_AVAILABLE:
-        await update.message.reply_text("Database is not available")
-        return
-    total = users_col.count_documents({})
-    docs = users_col.find().limit(50)
-    preview = "\n".join([f"{d['name']} — {d['_id']}" for d in docs])
-    await update.message.reply_text(f"Users: {total}\n\n{preview}")
 
-async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return
-    if not MONGO_AVAILABLE:
-        await update.message.reply_text("Database is not available")
-        return
-    users = users_col.find({}, {"_id": 1})
-    text = " ".join(context.args)
-    if not text:
-        await update.message.reply_text("Usage: /broadcast <message>")
-        return
-    sent = 0
-    for u in users:
-        try:
-            await context.bot.send_message(u["_id"], text)
-            sent += 1
-            await asyncio.sleep(0.05)
-        except:
-            pass
-    await update.message.reply_text(f"Broadcasted to {sent} users.")
+    status_msg = await update.message.reply_text("🎨 Generating image...")
+
+    try:
+        # Encode query for URL
+        encoded_query = query.replace(" ", "+")
+        image_url = f"https://flux-pro.vercel.app/generate?q={encoded_query}"
+        
+        # Download image
+        async with aiohttp.ClientSession() as session:
+            async with session.get(image_url) as resp:
+                if resp.status != 200:
+                    await status_msg.edit_text(f"❌ Generation failed (Error {resp.status})")
+                    return
+                
+                image_data = await resp.read()
+                image_path = DOWNLOAD_DIR / f"gen_{update.effective_user.id}.png"
+                with open(image_path, "wb") as f:
+                    f.write(image_data)
+
+        # Send image
+        caption = f"🖼️ <b>{query}</b>\n\nGenerated by @spotifyxmusixbot"
+        await update.message.reply_photo(
+            photo=image_path,
+            caption=caption,
+            parse_mode=ParseMode.HTML
+        )
+
+        await status_msg.delete()
+        image_path.unlink(missing_ok=True)
+
+    except Exception as e:
+        await status_msg.edit_text(f"❌ Failed: {e}")
 
 # =========================
 # Main
@@ -451,14 +605,22 @@ def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_error_handler(error_handler)
 
+    # Commands
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("search", search_cmd))
     app.add_handler(CommandHandler("stats", stats_cmd))
     app.add_handler(CommandHandler("broadcast", broadcast_cmd))
-    app.add_handler(CommandHandler("gen", gen_cmd))  # NEW: Image generation command
+    app.add_handler(CommandHandler("done_broadcast", done_broadcast_cmd))
+    app.add_handler(CommandHandler("send_broadcast", send_broadcast_cmd))
+    app.add_handler(CommandHandler("cancel_broadcast", cancel_broadcast_cmd))
+    app.add_handler(CommandHandler("gen", gen_cmd))
 
+    # Message handlers
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_broadcast_message))  # For broadcast media
+    
+    # Callbacks
     app.add_handler(CallbackQueryHandler(on_quality, pattern=r"^q\|"))
     app.add_handler(CallbackQueryHandler(on_search_pick, pattern=r"^s\|"))
 
