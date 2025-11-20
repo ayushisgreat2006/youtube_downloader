@@ -108,13 +108,11 @@ def debug_file_paths():
     log.info(f"Cookies file resolved: {cookies_path_abs}")
     log.info(f"Cookies file exists: {cookies_path_abs.exists()}")
     
-    # List all files in current directory for debugging
     files = list(cwd.glob("*"))
     log.info(f"Files in {cwd}: {[f.name for f in files]}")
     
     if not cookies_path_abs.exists():
         log.error(f"❌ Cookies file NOT FOUND at {cookies_path_abs}")
-        # Try alternate locations
         alt_paths = [cwd / "cookies.txt", Path("/app/cookies.txt"), Path("./cookies.txt")]
         for alt in alt_paths:
             if alt.exists():
@@ -130,7 +128,6 @@ def debug_file_paths():
 
 def validate_cookies():
     """Validate cookies file with detailed error reporting"""
-    # First run debug
     actual_cookie_file = debug_file_paths()
     
     if actual_cookie_file:
@@ -150,7 +147,6 @@ def validate_cookies():
             return None, f"Read error: {e}"
     
     log.warning("⚠️ No cookies file found. Public videos only.")
-    # Show what we're actually looking for
     return None, f"File not found. Tried: {COOKIES_TXT.absolute() if isinstance(COOKIES_TXT, Path) else COOKIES_TXT}"
 
 # =========================
@@ -238,7 +234,15 @@ def quality_keyboard(url: str) -> InlineKeyboardMarkup:
     ])
 
 # =========================
-# Download Function (with improved error handling)
+# Error Handler (FIXED: Defined BEFORE main)
+# =========================
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    """Global error handler"""
+    log.error("Exception while handling an update:", exc_info=context.error)
+
+# =========================
+# Download Function
 # =========================
 
 async def download_and_send(chat_id, reply_msg, context, url, quality):
@@ -252,7 +256,6 @@ async def download_and_send(chat_id, reply_msg, context, url, quality):
             "outtmpl": str(DOWNLOAD_DIR / "%(title)s.%(ext)s"),
         }
 
-        # Only add cookies if they're valid
         if cookies_file and cookie_status == "OK":
             ydl_opts["cookiefile"] = cookies_file
             log.info("🍪 Using cookies for download")
@@ -386,7 +389,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(help_text, parse_mode=ParseMode.HTML)
 
 async def whereis_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Debug command to find where files are"""
+    """Debug command to find where files actually are"""
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("❌ You are not authorized!")
         return
@@ -409,13 +412,12 @@ async def whereis_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     debug_info += f"<code>{file_list}</code>\n\n"
     debug_info += f"<b>Looking for cookies at:</b>\n<code>{cookies_path}</code>\n\n"
     debug_info += f"<b>File exists:</b> {cookies_path.exists()}\n\n"
-    
-    # Also check environment variable
     debug_info += f"<b>COOKIES_TXT env var:</b>\n<code>{os.getenv('COOKIES_TXT')}</code>"
     
     await update.message.reply_text(debug_info, parse_mode=ParseMode.HTML)
 
 async def testcookies_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Test if cookies are working"""
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("❌ You are not authorized!")
         return
@@ -868,7 +870,7 @@ def main():
     
     signal.signal(signal.SIGTERM, shutdown_handler)
     
-    # Run debug on startup
+    # Validate cookies on startup
     debug_file_paths()
     
     app = ApplicationBuilder().token(BOT_TOKEN).build()
