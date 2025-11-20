@@ -5,6 +5,7 @@ import logging
 from pathlib import Path
 from typing import Dict, Optional
 
+import aiohttp  # For image generation
 from pymongo import MongoClient
 from telegram import (
     Update,
@@ -119,7 +120,6 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 
 async def download_and_send(chat_id, reply_msg, context, url, quality):
     try:
-        # SIMPLIFIED: Standard MP4 format that Telegram plays natively
         ydl_opts = {
             "quiet": True,
             "no_warnings": True,
@@ -127,7 +127,6 @@ async def download_and_send(chat_id, reply_msg, context, url, quality):
         }
 
         if quality == "mp3":
-            # Audio download
             ydl_opts.update({
                 "format": "bestaudio/best",
                 "postprocessors": [{
@@ -137,15 +136,13 @@ async def download_and_send(chat_id, reply_msg, context, url, quality):
                 }],
             })
         else:
-            # SIMPLIFIED: Just get best video up to selected quality + best audio
-            # Telegram natively supports MP4 with H.264 and AAC
+            # SIMPLIFIED: Standard MP4 that Telegram streams natively
             ydl_opts.update({
                 "format": f"bestvideo[height<={quality}]+bestaudio/best[height<={quality}]",
-                "merge_output_format": "mp4",  # Ensure MP4 output
+                "merge_output_format": "mp4",
                 "postprocessor_args": {
                     "MOV+FFmpegVideoConvertor+mp4": [
                         "-movflags", "+faststart",  # Enable streaming
-                        "-preset", "faster",        # Faster encoding
                     ]
                 }
             })
@@ -158,12 +155,11 @@ async def download_and_send(chat_id, reply_msg, context, url, quality):
             except Exception as e:
                 log.error(f"Cookie write failed: {e}")
 
-        # Download
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
             title = sanitize_filename(info.get("title", "video"))
 
-        # Find downloaded file
+        # Send file
         ext = ".mp3" if quality == "mp3" else ".mp4"
         files = sorted(DOWNLOAD_DIR.glob(f"*{ext}"), key=lambda p: p.stat().st_mtime, reverse=True)
         if not files:
@@ -173,7 +169,6 @@ async def download_and_send(chat_id, reply_msg, context, url, quality):
         final_path = files[0]
         caption = f"📥 <b>{title}</b>\n\nDownloaded by @spotifyxmusixbot"
 
-        # FIXED: Send as document for MP3, video with streaming for MP4
         if quality == "mp3":
             await reply_msg.reply_document(
                 document=final_path,
@@ -186,24 +181,75 @@ async def download_and_send(chat_id, reply_msg, context, url, quality):
                 video=final_path,
                 caption=caption,
                 filename=f"{title}.mp4",
-                supports_streaming=True,  # This enables Telegram streaming!
+                supports_streaming=True,  # Enable Telegram streaming
                 parse_mode=ParseMode.HTML
             )
 
-        # Cleanup old files
+        # Cleanup
         cleanup_old_files()
 
     except Exception as e:
         await reply_msg.reply_text(f"⚠️ Error: {e}")
 
 def cleanup_old_files():
-    """Keep only last 10 files to save space"""
+    """Keep only last 10 files"""
     try:
         all_files = sorted(DOWNLOAD_DIR.glob("*"), key=lambda p: p.stat().st_mtime, reverse=True)
         for f in all_files[10:]:
             f.unlink()
     except:
         pass
+
+# =========================
+# NEW: Image Generation Feature
+# =========================
+
+async def gen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Generate image using Vercel AI"""
+    ensure_user(update)
+    
+    query = " ".join(context.args)
+    if not query:
+        await update.message.reply_text("Usage: /gen <description>\nExample: `/gen a ripe mango on mango tree`")
+        return
+
+    # Show generating message
+    status_msg = await update.message.reply_text("🎨 Generating image...")
+
+    try:
+        # Encode query for URL
+        encoded_query = query.replace(" ", "+")
+        image_url = f"https://flux-pro.vercel.app/generate?q={encoded_query}"
+        
+        # Download image
+        async with aiohttp.ClientSession() as session:
+            async with session.get(image_url) as resp:
+                if resp.status != 200:
+                    await status_msg.edit_text(f"❌ Generation failed (Error {resp.status})")
+                    return
+                
+                # Save image temporarily
+                image_data = await resp.read()
+                image_path = DOWNLOAD_DIR / f"gen_{update.effective_user.id}.png"
+                with open(image_path, "wb") as f:
+                    f.write(image_data)
+
+        # Send generated image
+        caption = f"🖼️ <b>{query}</b>\n\nGenerated by @spotifyxmusixbot"
+        await update.message.reply_photo(
+            photo=image_path,
+            caption=caption,
+            parse_mode=ParseMode.HTML
+        )
+
+        # Delete status message
+        await status_msg.delete()
+        
+        # Cleanup generated image
+        image_path.unlink(missing_ok=True)
+
+    except Exception as e:
+        await status_msg.edit_text(f"❌ Failed to generate image: {e}")
 
 # =========================
 # Handlers
@@ -220,13 +266,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• Download <b>MP3 music</b> in 192kbps 🎧\n"
         "• Download <b>Videos</b> in 360p/480p/720p/1080p 🎬\n"
         "• Search any song using <code>/search &lt;name&gt;</code> 🔍\n"
+        "• Generate AI images with <code>/gen &lt;description&gt;</code> 🎨\n"
         "• Fast, clean, no ads — ever 😎\n\n"
 
         "━━━━━━━━━━━━━━━━━━━━\n"
         "<b>📌 How to use the bot?</b>\n"
         "1. Send any <b>YouTube link</b> → choose quality\n"
-        "2. Or use <code>/search</code> to find songs\n"
-        "3. Audio & video sent instantly ⚡\n\n"
+        "2. Use <code>/search &lt;name&gt;</code> to find songs\n"
+        "3. Use <code>/gen &lt;description&gt;</code> to create AI images\n"
+        "4. All files sent instantly with Telegram streaming ⚡\n\n"
 
         "━━━━━━━━━━━━━━━━━━━━\n"
         "<b>📢 Important Links</b>\n"
@@ -235,8 +283,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• Paid Bots / Promo: @mahadev_ki_iccha\n\n"
 
         "━━━━━━━━━━━━━━━━━━━━\n"
-        "<b>❓ Need full guide?</b>\n"
-        "Use <code>/help</code> to view all commands and details.\n"
+        "<b>❓ Need help?</b>\n"
+        "Use <code>/help</code> for all commands.\n"
     )
 
     await update.message.reply_text(start_text, parse_mode=ParseMode.HTML)
@@ -248,30 +296,29 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "<b>✨ SpotifyX Musix Bot — Full Guide ✨</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
 
-        "<b>🔥 What this bot can do?</b>\n"
+        "<b>🔥 Features:</b>\n"
         "• Download <b>MP3 music</b> 🎧\n"
         "• Download <b>YouTube Videos</b> (360p/480p/720p/1080p) 🎬\n"
         "• Search any song / video via <code>/search</code>\n"
-        "• Fast, free, no ads — ever 😎\n"
-        "• Auto quality menu on YouTube link\n\n"
+        "• Generate AI images with <code>/gen</code> 🎨\n"
+        "• All videos support Telegram streaming!\n\n"
 
         "━━━━━━━━━━━━━━━━━━━━\n"
-        "<b>📌 How to use the bot?</b>\n"
-        "1. Send <b>any YouTube link</b> → choose quality\n"
-        "2. Use <code>/search &lt;name&gt;</code> → pick result → choose quality\n"
-        "3. Use <code>/start</code> anytime if bot feels sleepy 😴\n"
-        "4. MP3 download gives best audio 192kbps\n\n"
+        "<b>📌 Commands:</b>\n"
+        "• <code>/start</code> — Start the bot\n"
+        "• <code>/help</code> — Show this help\n"
+        "• <code>/search &lt;name&gt;</code> — Search YouTube\n"
+        "• <code>/gen &lt;description&gt;</code> — Generate AI image\n\n"
+
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "<b>🎬 Quality Options:</b>\n"
+        "360p, 480p, 720p, 1080p, MP3\n\n"
 
         "━━━━━━━━━━━━━━━━━━━━\n"
         "<b>📢 Important Links</b>\n"
         f"• Updates Channel: {UPDATES_CHANNEL}\n"
         "• Report Issue: @ayushxchat_robot\n"
         "• Contact for Paid Bots / Cross Promo: @mahadev_ki_iccha\n\n"
-
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        "<b>👑 Admin Commands</b>\n"
-        "• /stats — Show user count\n"
-        "• /broadcast &lt;text&gt; — send message to all users\n\n"
 
         "━━━━━━━━━━━━━━━━━━━━\n"
         "<b>🤖 Bot Created By</b>\n"
@@ -409,6 +456,7 @@ def main():
     app.add_handler(CommandHandler("search", search_cmd))
     app.add_handler(CommandHandler("stats", stats_cmd))
     app.add_handler(CommandHandler("broadcast", broadcast_cmd))
+    app.add_handler(CommandHandler("gen", gen_cmd))  # NEW: Image generation command
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(CallbackQueryHandler(on_quality, pattern=r"^q\|"))
