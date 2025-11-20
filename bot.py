@@ -31,7 +31,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 OWNER_ID = int(os.getenv("OWNER_ID", "7941244038"))
 UPDATES_CHANNEL = os.getenv("UPDATES_CHANNEL", "")
 
-COOKIES_TXT = os.getenv("COOKIES_TXT")
+COOKIES_TXT = os.getenv("COOKIES_TXT", "cookies.txt")  # Default path
 MONGO_URI = os.getenv("MONGO_URI")
 MONGO_DB = os.getenv("MONGO_DB", "youtube_bot")
 MONGO_USERS = os.getenv("MONGO_USERS", "users")
@@ -46,7 +46,7 @@ PREMIUM_SIZE = 450 * 1024 * 1024  # 450MB
 # Storage
 BROADCAST_STORE: Dict[int, List[dict]] = {}
 BROADCAST_STATE: Dict[int, bool] = {}
-PENDING: Dict[str, dict] = {}  # Updated structure
+PENDING: Dict[str, dict] = {}
 
 # Logging
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
@@ -86,6 +86,34 @@ except Exception as e:
     log.error(f"❌ MongoDB connection failed: {e}")
     MONGO_AVAILABLE = False
     mongo = db = users_col = admins_col = None
+
+# =========================
+# Cookie Validation Helper
+# =========================
+
+def validate_cookies():
+    """Validate cookies file and return status"""
+    if not COOKIES_TXT or not Path(COOKIES_TXT).exists():
+        log.warning("⚠️ No cookies file found. Public videos only.")
+        return None, "No cookies file"
+    
+    try:
+        # Check if file is readable
+        with open(COOKIES_TXT, 'r') as f:
+            content = f.read(500)  # Read first 500 chars
+        
+        # Check for Netscape format
+        if "# Netscape HTTP Cookie File" not in content:
+            log.error("❌ Cookies file is NOT in Netscape format!")
+            log.error("   Export cookies using 'cookies.txt' browser extension")
+            return None, "Invalid format"
+        
+        log.info("✅ Cookies file validated (Netscape format)")
+        return COOKIES_TXT, "OK"
+        
+    except Exception as e:
+        log.error(f"❌ Cannot read cookies file: {e}")
+        return None, str(e)
 
 # =========================
 # Helper Functions
@@ -180,11 +208,13 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     log.error("Exception while handling an update:", exc_info=context.error)
 
 # =========================
-# Core Download Function
+# Core Download Function (with cookie fallback)
 # =========================
 
 async def download_and_send(chat_id, reply_msg, context, url, quality):
     """Download and send media with size limits"""
+    cookies_file, cookie_status = validate_cookies()
+    
     try:
         ydl_opts = {
             "quiet": True,
@@ -192,8 +222,10 @@ async def download_and_send(chat_id, reply_msg, context, url, quality):
             "outtmpl": str(DOWNLOAD_DIR / "%(title)s.%(ext)s"),
         }
 
-        if COOKIES_TXT and Path(COOKIES_TXT).exists():
-            ydl_opts["cookiefile"] = COOKIES_TXT
+        # Add cookies if validated
+        if cookies_file and cookie_status == "OK":
+            ydl_opts["cookiefile"] = cookies_file
+            log.info("🍪 Using cookies for download")
 
         if quality == "mp3":
             ydl_opts.update({
@@ -219,9 +251,26 @@ async def download_and_send(chat_id, reply_msg, context, url, quality):
                 }
             })
 
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            title = sanitize_filename(info.get("title", "video"))
+        # Attempt download
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                title = sanitize_filename(info.get("title", "video"))
+        except yt_dlp.utils.DownloadError as e:
+            if "cookies" in str(e).lower() or "Cookie" in str(e):
+                log.error(f"❌ Cookie error: {e}")
+                await reply_msg.reply_text(
+                    "⚠️ Cookie error! Retrying without cookies...\n"
+                    "(This may fail for private/age-restricted videos)"
+                )
+                
+                # Retry without cookies
+                ydl_opts.pop("cookiefile", None)
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    info = ydl.extract_info(url, download=True)
+                    title = sanitize_filename(info.get("title", "video"))
+            else:
+                raise e
 
         ext = ".mp3" if quality == "mp3" else ".mp4"
         files = sorted(DOWNLOAD_DIR.glob(f"*{ext}"), key=lambda p: p.stat().st_mtime, reverse=True)
@@ -275,7 +324,17 @@ async def download_and_send(chat_id, reply_msg, context, url, quality):
         cleanup_old_files()
 
     except Exception as e:
-        await reply_msg.reply_text(f"⚠️ Error: {e}")
+        error_msg = str(e)
+        if "cookies" in error_msg.lower():
+            await reply_msg.reply_text(
+                "❌ Cookie error! Please check:\n"
+                "1. File is in Netscape format\n"
+                "2. Cookies are fresh\n"
+                "3. Use /testcookies to debug"
+            )
+        else:
+            await reply_msg.reply_text(f"⚠️ Error: {e}")
+        log.error(f"Download failed: {e}")
 
 # =========================
 # Command Handlers
@@ -307,7 +366,8 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "<code>/start</code> — Start bot\n"
         "<code>/help</code> — Show this help\n"
         "<code>/search &lt;name&gt;</code> — Search YouTube\n"
-        "<code>/gen &lt;prompt&gt;</code> — Generate AI image\n\n"
+        "<code>/gen &lt;prompt&gt;</code> — Generate AI image\n"
+        "<code>/testcookies</code> — Debug cookies\n\n"
         "<b>Admin Commands:</b>\n"
         "<code>/stats</code> — View statistics\n"
         "<code>/broadcast</code> — Broadcast message\n"
@@ -319,6 +379,63 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "<b>Support:</b> @mahadev_ki_iccha"
     )
     await update.message.reply_text(help_text, parse_mode=ParseMode.HTML)
+
+async def testcookies_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Test if cookies are working"""
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("❌ You are not authorized!")
+        return
+    
+    cookies_file, status = validate_cookies()
+    
+    if not cookies_file:
+        await update.message.reply_text(
+            f"❌ Cookie Error: {status}\n\n"
+            f"Path checked: <code>{Path(COOKIES_TXT).absolute()}</code>\n\n"
+            f"How to fix:\n"
+            f"1. Install 'cookies.txt' browser extension\n"
+            f"2. Export cookies from YouTube\n"
+            f"3. Save as <code>{COOKIES_TXT}</code> in bot directory",
+            parse_mode=ParseMode.HTML
+        )
+        return
+    
+    # Test with a simple YouTube request
+    test_url = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"  # Rick Roll for test
+    
+    try:
+        ydl_opts = {
+            "quiet": True,
+            "no_warnings": True,
+            "skip_download": True,
+        }
+        
+        if cookies_file:
+            ydl_opts["cookiefile"] = cookies_file
+        
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(test_url, download=False)
+            await update.message.reply_text(
+                f"✅ Cookies are working!\n\n"
+                f"Title: <b>{info.get('title')}</b>\n"
+                f"Duration: {info.get('duration')}s\n"
+                f"Status: Ready for private videos",
+                parse_mode=ParseMode.HTML
+            )
+            
+    except Exception as e:
+        error_msg = str(e)
+        if "cookies" in error_msg.lower():
+            await update.message.reply_text(
+                f"❌ Cookies failed: {error_msg[:200]}\n\n"
+                f"Your cookies.txt may be:\n"
+                f"• Expired (re-export)\n"
+                f"• Wrong format (use Netscape)\n"
+                f"• Corrupted (re-download)",
+                parse_mode=ParseMode.HTML
+            )
+        else:
+            await update.message.reply_text(f"⚠️ Error: {error_msg[:200]}")
 
 async def search_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /search command"""
@@ -337,6 +454,10 @@ async def search_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "default_search": "ytsearch5",
         "extract_flat": False,
     }
+
+    cookies_file, _ = validate_cookies()
+    if cookies_file:
+        ydl_opts["cookiefile"] = cookies_file
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -753,6 +874,13 @@ def main():
     
     signal.signal(signal.SIGTERM, shutdown_handler)
     
+    # Validate cookies on startup
+    cookies_file, status = validate_cookies()
+    if cookies_file:
+        log.info(f"🍪 Cookie file ready: {cookies_file}")
+    else:
+        log.warning(f"⚠️ Cookie issue: {status}")
+    
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_error_handler(error_handler)
 
@@ -766,6 +894,7 @@ def main():
     app.add_handler(CommandHandler("send_broadcast", send_broadcast_cmd))
     app.add_handler(CommandHandler("cancel_broadcast", cancel_broadcast_cmd))
     app.add_handler(CommandHandler("gen", gen_cmd))
+    app.add_handler(CommandHandler("testcookies", testcookies_cmd))
     app.add_handler(CommandHandler("addadmin", addadmin_cmd))
     app.add_handler(CommandHandler("rmadmin", rmadmin_cmd))
     app.add_handler(CommandHandler("adminlist", adminlist_cmd))
