@@ -9,14 +9,17 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 OWNER_ID = int(os.getenv("OWNER_ID", "7941244038"))
 UPDATES_CHANNEL = os.getenv("UPDATES_CHANNEL", "")
 
-# Force Join Channel (e.g., @yourchannelhandle)
+# Force Join Channel
 FORCE_JOIN_CHANNEL = os.getenv("FORCE_JOIN_CHANNEL", "@tonystark_jr")
 
-# MegaLLM API Config
+# Log Group (for tracking all bot activity)
+LOG_GROUP_ID = int(os.getenv("LOG_GROUP_ID", "-1001234567890"))  # Your private group ID
+
+# MegaLLM API
 MEGALLM_API_KEY = os.getenv("MEGALLM_API_KEY", "sk-mega-c38fc3f49a44cb1ab5aef67538dc222e0c56c21de5dc8418afe1b9769b68300d")
 MEGALLM_API_URL = "https://megallm.io/v1/chat/completions"
 
-# Cookies Path (Auto-detects absolute vs relative)
+# Cookies
 COOKIES_ENV = os.getenv("COOKIES_TXT")
 if COOKIES_ENV and COOKIES_ENV.startswith('/'):
     COOKIES_TXT = Path(COOKIES_ENV)
@@ -33,8 +36,8 @@ MONGO_ADMINS = os.getenv("MONGO_ADMINS", "admins")
 # CONSTANTS
 # =========================
 DOWNLOAD_DIR = Path("downloads")
-MAX_FREE_SIZE = 50 * 1024 * 1024  # 50MB
-PREMIUM_SIZE = 450 * 1024 * 1024  # 450MB
+MAX_FREE_SIZE = 50 * 1024 * 1024
+PREMIUM_SIZE = 450 * 1024 * 1024
 
 # Regex
 YOUTUBE_REGEX = re.compile(r"(https?://)?(www\.)?(youtube\.com|youtu\.be)/[\w\-?&=/%]+", re.I)
