@@ -15,7 +15,7 @@ from telegram.ext import (
 )
 import yt_dlp
 from pymongo import MongoClient
-from openai import OpenAI
+import openai  # Added import
 
 # =========================
 # CONFIGURATION
@@ -26,19 +26,6 @@ UPDATES_CHANNEL = os.getenv("UPDATES_CHANNEL", "@tonystark_jr")
 FORCE_JOIN_CHANNEL = os.getenv("FORCE_JOIN_CHANNEL", "@tonystark_jr")
 LOG_GROUP_ID = int(os.getenv("LOG_GROUP_ID", "-5066591546"))
 MEGALLM_API_KEY = os.getenv("MEGALLM_API_KEY", "")
-MEGALLM_API_URL = os.getenv("MEGALLM_API_URL", "https://ai.megallm.io/v1")
-
-# OpenAI Client for MegaLLM
-openai_client = None
-if MEGALLM_API_KEY:
-    try:
-        openai_client = OpenAI(
-            base_url=MEGALLM_API_URL,
-            api_key=MEGALLM_API_KEY
-        )
-        log.info("✅ MegaLLM OpenAI client initialized")
-    except Exception as e:
-        log.error(f"❌ Failed to initialize OpenAI client: {e}")
 
 # Cookies path handling
 COOKIES_ENV = os.getenv("COOKIES_TXT")
@@ -69,7 +56,21 @@ DOWNLOAD_DIR.mkdir(exist_ok=True)
 BROADCAST_STORE: Dict[int, List[dict]] = {}
 BROADCAST_STATE: Dict[int, bool] = {}
 PENDING: Dict[str, dict] = {}
-USER_CONVERSATIONS: Dict[int, List[dict]] = {}  # Store conversation history per user
+USER_CONVERSATIONS: Dict[int, List[dict]] = {}
+
+# =========================
+# MegaLLM Client Setup
+# =========================
+client = None
+if MEGALLM_API_KEY:
+    try:
+        client = openai.OpenAI(
+            base_url="https://ai.megallm.io/v1",
+            api_key=MEGALLM_API_KEY
+        )
+        log.info("✅ MegaLLM client initialized")
+    except Exception as e:
+        log.error(f"❌ Failed to initialize MegaLLM client: {e}")
 
 # =========================
 # MongoDB Setup
@@ -102,7 +103,6 @@ except Exception as e:
 # Keyboard Generator
 # =========================
 def quality_keyboard(url: str) -> InlineKeyboardMarkup:
-    """Generate quality selection keyboard"""
     token = store_url(url)
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🎵 MP3 Audio", callback_data=f"q|{token}|mp3")],
@@ -116,9 +116,7 @@ def quality_keyboard(url: str) -> InlineKeyboardMarkup:
 # Helper Functions
 # =========================
 async def log_to_group(update: Update, context: ContextTypes.DEFAULT_TYPE, action: str, details: str = "", is_error: bool = False):
-    """Send logs to private log group with verification"""
     if not LOG_GROUP_ID:
-        log.warning("LOG_GROUP_ID not set, skipping log")
         return
         
     try:
@@ -138,7 +136,6 @@ async def log_to_group(update: Update, context: ContextTypes.DEFAULT_TYPE, actio
             f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
         )
         
-        # Try to send to log group
         await context.bot.send_message(
             chat_id=LOG_GROUP_ID,
             text=log_text,
@@ -147,10 +144,9 @@ async def log_to_group(update: Update, context: ContextTypes.DEFAULT_TYPE, actio
         log.info(f"✅ Log sent to group {LOG_GROUP_ID}")
         
     except Exception as e:
-        log.error(f"❌ Failed to send log to group {LOG_GROUP_ID}: {e}")
+        log.error(f"❌ Failed to send log to group: {e}")
 
 def ensure_user(update: Update):
-    """Track users in DB"""
     if not MONGO_AVAILABLE or not update.effective_user:
         return
     try:
@@ -204,7 +200,6 @@ def cleanup_old_files():
         pass
 
 def validate_cookies():
-    """Validate cookies file"""
     if not COOKIES_TXT.exists():
         log.warning("⚠️ No cookies file")
         return None, "No cookies file"
@@ -221,7 +216,6 @@ def validate_cookies():
         return None, str(e)
 
 async def ensure_membership(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """Check if user is in FORCE_JOIN_CHANNEL"""
     if not FORCE_JOIN_CHANNEL:
         return True
     
@@ -258,11 +252,9 @@ async def ensure_membership(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 # Download Function
 # =========================
 async def download_and_send(chat_id, reply_msg, context, url, quality):
-    """Download and send media with size limits"""
     cookies_file, cookie_status = validate_cookies()
     
     try:
-        # Send initial status
         status_msg = await reply_msg.reply_text("⏳ Preparing download...")
         
         ydl_opts = {
@@ -301,7 +293,6 @@ async def download_and_send(chat_id, reply_msg, context, url, quality):
                 }
             })
 
-        # Update status
         await status_msg.edit_text("⬇️ Downloading from YouTube...")
         
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -319,7 +310,6 @@ async def download_and_send(chat_id, reply_msg, context, url, quality):
         user_id = reply_msg.chat.id
         is_user_premium = is_premium(user_id)
 
-        # Check size limits
         if file_size > MAX_FREE_SIZE and not is_user_premium:
             final_path.unlink(missing_ok=True)
             premium_msg = (
@@ -342,7 +332,6 @@ async def download_and_send(chat_id, reply_msg, context, url, quality):
 
         caption = f"📥 <b>{title}</b> ({file_size/1024/1024:.1f}MB)\n\nDownloaded by @spotifyxmusixbot"
         
-        # Update status before sending
         await status_msg.edit_text("⬆️ Uploading to Telegram...")
         
         if quality == "mp3":
@@ -397,8 +386,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ensure_user(update)
     await log_to_group(update, context, action="/help", details="User requested help")
     
-    # Show API status in help
-    api_status = "✅" if openai_client else "❌"
+    api_status = "✅" if client else "❌"
     
     help_text = (
         "<b>✨ SpotifyX Musix Bot — Commands ✨</b>\n"
@@ -418,12 +406,11 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "<code>/rmadmin &lt;id&gt;</code> — Remove admin\n\n"
         f"<b>Updates:</b> {UPDATES_CHANNEL}\n"
         f"<b>Support:</b> @mahadev_ki_iccha\n\n"
-        f"<b>AI Status:</b> {api_status} {'Configured' if openai_client else 'Not Set'}"
+        f"<b>AI Status:</b> {api_status} {'Configured' if client else 'Not Set'}"
     )
     await update.message.reply_text(help_text, parse_mode=ParseMode.HTML)
 
 async def search_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Search YouTube videos"""
     ensure_user(update)
     
     if not await ensure_membership(update, context):
@@ -515,7 +502,7 @@ async def gen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await log_to_group(update, context, action="/gen", details=f"Error: {e}", is_error=True)
 
 async def gpt_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Chat with AI - Using OpenAI client for MegaLLM"""
+    """Direct MegaLLM integration as requested"""
     ensure_user(update)
     
     if not await ensure_membership(update, context):
@@ -526,12 +513,9 @@ async def gpt_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Usage: /gpt <your question>")
         return
     
-    # Check if OpenAI client is initialized
-    if not openai_client:
+    if not client:
         await update.message.reply_text(
-            "❌ AI feature is not configured.\n\n"
-            "Please set the <code>MEGALLM_API_KEY</code> environment variable.\n"
-            "If you don't have a key, contact @ayushxchat_robot for premium access.",
+            "❌ AI not configured. Set MEGALLM_API_KEY env variable.",
             parse_mode=ParseMode.HTML
         )
         return
@@ -539,65 +523,54 @@ async def gpt_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     status_msg = await update.message.reply_text("🤖 Thinking...")
     
+    # Initialize conversation history if needed
+    if user_id not in USER_CONVERSATIONS:
+        USER_CONVERSATIONS[user_id] = [
+            {"role": "system", "content": "You are a helpful assistant."}
+        ]
+    
+    # Add user query
+    USER_CONVERSATIONS[user_id].append({"role": "user", "content": query})
+    
     try:
-        # Initialize conversation history for user if not exists
-        if user_id not in USER_CONVERSATIONS:
-            USER_CONVERSATIONS[user_id] = [
-                {"role": "system", "content": "You are a helpful assistant."}
-            ]
-        
-        # Add user message to history
-        USER_CONVERSATIONS[user_id].append({"role": "user", "content": query})
-        
-        log.info(f"GPT Request from {user_id}: {query[:50]}...")
-        
-        # Run in executor to avoid blocking
-        loop = asyncio.get_event_loop()
-        response = await loop.run_in_executor(
-            None,
-            lambda: openai_client.chat.completions.create(
-                model="gpt-4",
-                messages=USER_CONVERSATIONS[user_id],
-                max_tokens=1000,
-                temperature=0.7
-            )
+        # Simple, direct API call as you requested
+        response = client.chat.completions.create(
+            model="gpt-4",
+            messages=USER_CONVERSATIONS[user_id],
+            max_tokens=1000,
+            temperature=0.7
         )
         
-        # Get response text
-        response_text = response.choices[0].message.content
+        # Get response
+        answer = response.choices[0].message.content
         
-        # Add assistant response to history
-        USER_CONVERSATIONS[user_id].append({"role": "assistant", "content": response_text})
+        # Add to history
+        USER_CONVERSATIONS[user_id].append({"role": "assistant", "content": answer})
         
-        # Keep only last 10 messages to prevent token overflow
+        # Keep last 10 messages
         if len(USER_CONVERSATIONS[user_id]) > 10:
             USER_CONVERSATIONS[user_id] = USER_CONVERSATIONS[user_id][-10:]
         
-        # Truncate if too long
-        if len(response_text) > 4000:
-            response_text = response_text[:4000] + "\n\n... (truncated)"
+        # Truncate long messages
+        if len(answer) > 4000:
+            answer = answer[:4000] + "\n\n... (truncated)"
         
         await status_msg.edit_text(
             f"💬 <b>Query:</b> <code>{query}</code>\n\n"
-            f"<b>Answer:</b>\n{response_text}",
+            f"<b>Answer:</b>\n{answer}",
             parse_mode=ParseMode.HTML
         )
         
         await log_to_group(update, context, action="/gpt", details=f"Query: {query[:50]}...")
         
-    except asyncio.TimeoutError:
-        await status_msg.edit_text("❌ Request timed out after 30 seconds. Please try again.")
-        await log_to_group(update, context, action="/gpt", details="Timeout error", is_error=True)
     except Exception as e:
         await status_msg.edit_text(f"❌ AI Error: {str(e)[:200]}")
         await log_to_group(update, context, action="/gpt", details=f"Error: {e}", is_error=True)
         
-        # Clear conversation history on error to prevent repeated failures
-        if user_id in USER_CONVERSATIONS:
-            USER_CONVERSATIONS[user_id] = [{"role": "system", "content": "You are a helpful assistant."}]
+        # Reset history on error
+        USER_CONVERSATIONS[user_id] = [{"role": "system", "content": "You are a helpful assistant."}]
 
 async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show bot statistics (admin only)"""
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("❌ Not authorized!")
         return
@@ -624,14 +597,10 @@ async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         
         await update.message.reply_text(stats_text, parse_mode=ParseMode.HTML)
-        await log_to_group(
-            update, context, 
-            action="/stats", 
-            details=f"Users: {total_users}, Premium: {premium_users}, Admins: {total_admins}"
-        )
+        await log_to_group(update, context, action="/stats", details=f"Users: {total_users}, Premium: {premium_users}, Admins: {total_admins}")
         
     except Exception as e:
-        await update.message.reply_text(f"❌ Failed to fetch stats: {e}")
+        await update.message.reply_text(f"❌ Failed: {e}")
         await log_to_group(update, context, action="/stats", details=f"Error: {e}", is_error=True)
 
 async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -792,7 +761,6 @@ async def adminlist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # Broadcast Message Handler
 # =========================
 async def handle_broadcast_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle broadcast message collection"""
     if not update.effective_user or not is_admin(update.effective_user.id):
         return
     
@@ -802,7 +770,6 @@ async def handle_broadcast_message(update: Update, context: ContextTypes.DEFAULT
     
     msg = {}
     
-    # Handle different message types
     if update.message.text:
         msg = {"text": update.message.text, "parse_mode": ParseMode.HTML}
     elif update.message.photo:
@@ -926,16 +893,13 @@ def main():
     log.info(f"Files in /app: {[f.name for f in Path.cwd().glob('*')]}")
     log.info(f"Force Join: {FORCE_JOIN_CHANNEL}")
     log.info(f"Log Group: {LOG_GROUP_ID}")
-    log.info(f"AI API Key: {'✅ Set' if openai_client else '❌ Not Set'}")
+    log.info(f"AI API Key: {'✅ Set' if client else '❌ Not Set'}")
     log.info("="*60)
     
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     
-    # Error handler
     async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
         log.error("Exception while handling an update:", exc_info=context.error)
-        
-        # Try to log errors to group
         try:
             if LOG_GROUP_ID and update and hasattr(update, 'effective_user') and update.effective_user:
                 error_text = (
@@ -953,7 +917,6 @@ def main():
             pass
     app.add_error_handler(error_handler)
 
-    # Commands
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("search", search_cmd))
@@ -967,8 +930,6 @@ def main():
     app.add_handler(CommandHandler("addadmin", addadmin_cmd))
     app.add_handler(CommandHandler("rmadmin", rmadmin_cmd))
     app.add_handler(CommandHandler("adminlist", adminlist_cmd))
-
-    # Messages & Callbacks
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_broadcast_message))
     app.add_handler(CallbackQueryHandler(on_quality, pattern=r"^q\|"))
