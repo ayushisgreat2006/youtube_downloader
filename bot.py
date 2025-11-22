@@ -398,9 +398,21 @@ async def gpt_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Usage: /gpt <your question>")
         return
     
+    # Check if API key is configured
+    if not MEGALLM_API_KEY or MEGALLM_API_KEY == "your-api-key-here":
+        await update.message.reply_text(
+            "❌ AI feature is not configured.\n\n"
+            "Please set the `MEGALLM_API_KEY` environment variable.\n"
+            "If you don't have a key, contact @ayushxchat_robot for premium access."
+        )
+        return
+    
     status_msg = await update.message.reply_text("🤖 Thinking...")
     
     try:
+        # Debug log
+        log.info(f"GPT Request: {query[:50]}... to {MEGALLM_API_URL}")
+        
         async with aiohttp.ClientSession() as session:
             headers = {
                 "Authorization": f"Bearer {MEGALLM_API_KEY}",
@@ -414,6 +426,22 @@ async def gpt_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             }
             
             async with session.post(MEGALLM_API_URL, json=payload, headers=headers) as resp:
+                if resp.status == 404:
+                    error_text = await resp.text()
+                    await status_msg.edit_text(
+                        f"❌ API Endpoint Not Found (404)\n\n"
+                        f"This usually means:\n"
+                        f"• The API URL is incorrect\n"
+                        f"• The service is down\n"
+                        f"• Your API key is invalid\n\n"
+                        f"Debug Info:\n"
+                        f"URL: {MEGALLM_API_URL}\n"
+                        f"Response: {error_text[:100]}...\n\n"
+                        f"Contact @ayushxchat_robot for support."
+                    )
+                    await log_to_group(update, context, action="/gpt", details=f"API 404 Error", is_error=True)
+                    return
+                
                 if resp.status != 200:
                     error_text = await resp.text()
                     await status_msg.edit_text(f"❌ API Error {resp.status}: {error_text[:100]}")
@@ -437,55 +465,6 @@ async def gpt_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await status_msg.edit_text(f"❌ AI Error: {str(e)[:200]}")
         await log_to_group(update, context, action="/gpt", details=f"Error: {e}", is_error=True)
-
-async def search_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    ensure_user(update)
-    
-    if not await ensure_membership(update, context):
-        return
-    
-    query = " ".join(context.args)
-    if not query:
-        await update.message.reply_text("Usage: /search <text>")
-        return
-    
-    await log_to_group(update, context, action="/search", details=f"Query: {query}")
-    await update.message.reply_text(f"Searching '{query}'…")
-
-    ydl_opts = {
-        "quiet": True,
-        "no_warnings": True,
-        "skip_download": True,
-        "default_search": "ytsearch5",
-        "extract_flat": False,
-    }
-
-    cookies_file, _ = validate_cookies()
-    if cookies_file:
-        ydl_opts["cookiefile"] = cookies_file
-
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(query, download=False)
-    except Exception as e:
-        await update.message.reply_text(f"⚠️ Search failed: {e}")
-        await log_to_group(update, context, action="/search", details=f"Error: {e}", is_error=True)
-        return
-
-    entries = info.get("entries", [])
-    if not entries:
-        await update.message.reply_text("No results.")
-        return
-
-    buttons = []
-    for e in entries[:5]:
-        title = sanitize_filename(e.get("title") or "video")
-        video_id = e.get('id')
-        url = f"https://youtube.com/watch?v={video_id}" if video_id else e.get('webpage_url')
-        token = store_url(url)
-        buttons.append([InlineKeyboardButton(title[:60], callback_data=f"s|{token}|pick")])
-
-    await update.message.reply_text("Choose:", reply_markup=InlineKeyboardMarkup(buttons))
 
 async def gen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ensure_user(update)
