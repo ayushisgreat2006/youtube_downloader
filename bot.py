@@ -24,7 +24,7 @@ OWNER_ID = int(os.getenv("OWNER_ID", "7941244038"))
 UPDATES_CHANNEL = os.getenv("UPDATES_CHANNEL", "@tonystark_jr")
 FORCE_JOIN_CHANNEL = os.getenv("FORCE_JOIN_CHANNEL", "@tonystark_jr")
 LOG_GROUP_ID = int(os.getenv("LOG_GROUP_ID", "-5066591546"))
-MEGALLM_API_KEY = os.getenv("MEGALLM_API_KEY", "")
+MEGALLM_API_KEY = os.getenv("MEGALLM_API_KEY", "sk-mega-c38fc3f49a44cb1ab5aef67538dc222e0c56c21de5dc8418afe1b9769b68300d")
 MEGALLM_API_URL = os.getenv("MEGALLM_API_URL", "https://ai.megallm.io/v1")
 
 # Cookies path handling
