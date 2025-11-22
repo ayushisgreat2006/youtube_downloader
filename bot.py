@@ -24,8 +24,12 @@ OWNER_ID = int(os.getenv("OWNER_ID", "7941244038"))
 UPDATES_CHANNEL = os.getenv("UPDATES_CHANNEL", "@tonystark_jr")
 FORCE_JOIN_CHANNEL = os.getenv("FORCE_JOIN_CHANNEL", "@tonystark_jr")
 LOG_GROUP_ID = int(os.getenv("LOG_GROUP_ID", "-5066591546"))
-MEGALLM_API_KEY = os.getenv("MEGALLM_API_KEY", "sk-mega-c38fc3f49a44cb1ab5aef67538dc222e0c56c21de5dc8418afe1b9769b68300d")
-MEGALLM_API_URL = os.getenv("MEGALLM_API_URL", "https://ai.megallm.io/v1")
+MEGALLM_API_KEY = os.getenv("MEGALLM_API_KEY", "")
+MEGALLM_API_URL = os.getenv("MEGALLM_API_URL", "https://api.openai.com/v1/chat/completions")
+
+# Fallback API for GPT (OpenRouter - free tier)
+FALLBACK_API_URL = "https://openrouter.ai/api/v1/chat/completions"
+FALLBACK_API_KEY = os.getenv("FALLBACK_API_KEY", "sk-or-v1-xxxxxxxxxxxxxx")  # Get from openrouter.ai
 
 # Cookies path handling
 COOKIES_ENV = os.getenv("COOKIES_TXT")
@@ -102,12 +106,16 @@ def quality_keyboard(url: str) -> InlineKeyboardMarkup:
 # Helper Functions
 # =========================
 async def log_to_group(update: Update, context: ContextTypes.DEFAULT_TYPE, action: str, details: str = "", is_error: bool = False):
-    """Send logs to private log group"""
+    """Send logs to private log group with verification"""
     if not LOG_GROUP_ID:
+        log.warning("LOG_GROUP_ID not set, skipping log")
         return
         
     try:
         user = update.effective_user
+        if not user:
+            return
+            
         user_info = f"👤 User: {user.full_name or user.username or 'Unknown'} (<code>{user.id}</code>)"
         action_info = f"🎯 Action: {action}"
         details_info = f"📄 Details: {details}" if details else ""
@@ -120,13 +128,16 @@ async def log_to_group(update: Update, context: ContextTypes.DEFAULT_TYPE, actio
             f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
         )
         
+        # Try to send to log group
         await context.bot.send_message(
             chat_id=LOG_GROUP_ID,
             text=log_text,
             parse_mode=ParseMode.HTML
         )
+        log.info(f"✅ Log sent to group {LOG_GROUP_ID}")
+        
     except Exception as e:
-        log.error(f"Failed to send log to group: {e}")
+        log.error(f"❌ Failed to send log to group {LOG_GROUP_ID}: {e}")
 
 def ensure_user(update: Update):
     """Track users in DB"""
@@ -234,6 +245,17 @@ async def ensure_membership(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     return False
 
 # =========================
+# Async Download Wrapper
+# =========================
+async def async_download_and_send(chat_id, reply_msg, context, url, quality):
+    """Run download in executor to avoid blocking"""
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(
+        None, 
+        lambda: asyncio.run(download_and_send(chat_id, reply_msg, context, url, quality))
+    )
+
+# =========================
 # Download Function
 # =========================
 async def download_and_send(chat_id, reply_msg, context, url, quality):
@@ -241,6 +263,9 @@ async def download_and_send(chat_id, reply_msg, context, url, quality):
     cookies_file, cookie_status = validate_cookies()
     
     try:
+        # Send initial status
+        status_msg = await reply_msg.reply_text("⏳ Preparing download...")
+        
         ydl_opts = {
             "quiet": True,
             "no_warnings": True,
@@ -277,6 +302,9 @@ async def download_and_send(chat_id, reply_msg, context, url, quality):
                 }
             })
 
+        # Update status
+        await status_msg.edit_text("⬇️ Downloading from YouTube...")
+        
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
             title = sanitize_filename(info.get("title", "video"))
@@ -284,7 +312,7 @@ async def download_and_send(chat_id, reply_msg, context, url, quality):
         ext = ".mp3" if quality == "mp3" else ".mp4"
         files = sorted(DOWNLOAD_DIR.glob(f"*{ext}"), key=lambda p: p.stat().st_mtime, reverse=True)
         if not files:
-            await reply_msg.reply_text("⚠️ File not found after download.")
+            await status_msg.edit_text("⚠️ File not found after download.")
             return
 
         final_path = files[0]
@@ -292,6 +320,7 @@ async def download_and_send(chat_id, reply_msg, context, url, quality):
         user_id = reply_msg.chat.id
         is_user_premium = is_premium(user_id)
 
+        # Check size limits
         if file_size > MAX_FREE_SIZE and not is_user_premium:
             final_path.unlink(missing_ok=True)
             premium_msg = (
@@ -304,15 +333,18 @@ async def download_and_send(chat_id, reply_msg, context, url, quality):
                 f"• No ads\n\n"
                 f"👉 Contact @ayushxchat_robot to subscribe premium!"
             )
-            await reply_msg.reply_text(premium_msg, parse_mode=ParseMode.HTML)
+            await status_msg.edit_text(premium_msg, parse_mode=ParseMode.HTML)
             return
 
         if file_size > PREMIUM_SIZE:
             final_path.unlink(missing_ok=True)
-            await reply_msg.reply_text("❌ File exceeds maximum size (450MB). Try lower quality.")
+            await status_msg.edit_text("❌ File exceeds maximum size (450MB). Try lower quality.")
             return
 
         caption = f"📥 <b>{title}</b> ({file_size/1024/1024:.1f}MB)\n\nDownloaded by @spotifyxmusixbot"
+        
+        # Update status before sending
+        await status_msg.edit_text("⬆️ Uploading to Telegram...")
         
         if quality == "mp3":
             await reply_msg.reply_document(
@@ -330,6 +362,7 @@ async def download_and_send(chat_id, reply_msg, context, url, quality):
                 parse_mode=ParseMode.HTML
             )
 
+        await status_msg.delete()
         cleanup_old_files()
 
     except Exception as e:
@@ -365,6 +398,9 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ensure_user(update)
     await log_to_group(update, context, action="/help", details="User requested help")
     
+    # Show API status in help
+    api_status = "✅" if MEGALLM_API_KEY else "❌"
+    
     help_text = (
         "<b>✨ SpotifyX Musix Bot — Commands ✨</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -382,7 +418,8 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "<code>/addadmin &lt;id&gt;</code> — Add admin\n"
         "<code>/rmadmin &lt;id&gt;</code> — Remove admin\n\n"
         f"<b>Updates:</b> {UPDATES_CHANNEL}\n"
-        "<b>Support:</b> @mahadev_ki_iccha"
+        f"<b>Support:</b> @mahadev_ki_iccha\n\n"
+        f"<b>AI Status:</b> {api_status} {'Configured' if MEGALLM_API_KEY else 'Not Set'}"
     )
     await update.message.reply_text(help_text, parse_mode=ParseMode.HTML)
 
@@ -479,7 +516,7 @@ async def gen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await log_to_group(update, context, action="/gen", details=f"Error: {e}", is_error=True)
 
 async def gpt_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Chat with MegaLLM AI"""
+    """Chat with AI - Improved error handling"""
     ensure_user(update)
     
     if not await ensure_membership(update, context):
@@ -490,13 +527,29 @@ async def gpt_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Usage: /gpt <your question>")
         return
     
+    # Check if API is configured
+    if not MEGALLM_API_KEY:
+        await update.message.reply_text(
+            "❌ AI feature is not configured.\n\n"
+            "Please set the <code>MEGALLM_API_KEY</code> environment variable.\n"
+            "If you don't have a key, contact @ayushxchat_robot for premium access.",
+            parse_mode=ParseMode.HTML
+        )
+        return
+    
     status_msg = await update.message.reply_text("🤖 Thinking...")
     
     try:
-        async with aiohttp.ClientSession() as session:
+        # Debug info
+        log.info(f"GPT Request: {query[:50]}... to {MEGALLM_API_URL}")
+        
+        # Use connection pool for better performance
+        timeout = aiohttp.ClientTimeout(total=30)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
             headers = {
                 "Authorization": f"Bearer {MEGALLM_API_KEY}",
-                "Content-Type": "application/json"
+                "Content-Type": "application/json",
+                "User-Agent": "SpotifyXBot/1.0"
             }
             payload = {
                 "model": "gpt-3.5-turbo",
@@ -506,9 +559,25 @@ async def gpt_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             }
             
             async with session.post(MEGALLM_API_URL, json=payload, headers=headers) as resp:
+                if resp.status == 404:
+                    error_text = await resp.text()
+                    await status_msg.edit_text(
+                        f"❌ API Endpoint Not Found (404)\n\n"
+                        f"This usually means the API URL is incorrect or the service is down.\n\n"
+                        f"Debug:\n<code>{MEGALLM_API_URL}</code>\n\n"
+                        f"Try using OpenRouter API instead.",
+                        parse_mode=ParseMode.HTML
+                    )
+                    await log_to_group(update, context, action="/gpt", details=f"API 404 Error", is_error=True)
+                    return
+                
                 if resp.status != 200:
                     error_text = await resp.text()
-                    await status_msg.edit_text(f"❌ API Error {resp.status}: {error_text[:100]}")
+                    await status_msg.edit_text(
+                        f"❌ API Error {resp.status}\n\n"
+                        f"<code>{error_text[:100]}...</code>",
+                        parse_mode=ParseMode.HTML
+                    )
                     await log_to_group(update, context, action="/gpt", details=f"API Error: {resp.status}", is_error=True)
                     return
                 
@@ -526,6 +595,9 @@ async def gpt_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         await log_to_group(update, context, action="/gpt", details=f"Query: {query[:50]}...")
         
+    except asyncio.TimeoutError:
+        await status_msg.edit_text("❌ Request timed out. Please try again.")
+        await log_to_group(update, context, action="/gpt", details="Timeout error", is_error=True)
     except Exception as e:
         await status_msg.edit_text(f"❌ AI Error: {str(e)[:200]}")
         await log_to_group(update, context, action="/gpt", details=f"Error: {e}", is_error=True)
@@ -708,7 +780,7 @@ async def adminlist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         admins = list(admins_col.find().sort("added_at", -1))
         if not admins: 
-            await update.message.reply_text("No admins.")
+            await update_message.reply_text("No admins.")
             return
         admin_list = "👥 <b>Admin List</b>\n━━━━━━━━━━━━\n\n"
         for admin in admins:
@@ -785,7 +857,7 @@ async def on_quality(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not data or data["exp"] < asyncio.get_event_loop().time():
         await q.edit_message_text("Session expired.")
         return
-    await q.edit_message_text(f"Downloading {qlt}…")
+    await q.edit_message_text(f"⬇️ Downloading {qlt}p quality...")
     await download_and_send(q.message.chat.id, q.message, context, data["url"], qlt)
 
 async def on_search_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -860,6 +932,7 @@ def main():
     log.info(f"Files in /app: {[f.name for f in Path.cwd().glob('*')]}")
     log.info(f"Force Join: {FORCE_JOIN_CHANNEL}")
     log.info(f"Log Group: {LOG_GROUP_ID}")
+    log.info(f"AI API Key: {'✅ Set' if MEGALLM_API_KEY else '❌ Not Set'}")
     log.info("="*60)
     
     app = ApplicationBuilder().token(BOT_TOKEN).build()
@@ -867,6 +940,23 @@ def main():
     # Error handler
     async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
         log.error("Exception while handling an update:", exc_info=context.error)
+        
+        # Try to log errors to group
+        try:
+            if LOG_GROUP_ID and update.effective_user:
+                error_text = (
+                    f"❌ <b>Bot Error</b>\n\n"
+                    f"User: {update.effective_user.id}\n"
+                    f"Error: {str(context.error)[:100]}\n\n"
+                    f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                )
+                await context.bot.send_message(
+                    chat_id=LOG_GROUP_ID,
+                    text=error_text,
+                    parse_mode=ParseMode.HTML
+                )
+        except:
+            pass
     app.add_error_handler(error_handler)
 
     # Commands
