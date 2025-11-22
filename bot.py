@@ -1,9 +1,10 @@
+import os
+import re
 import asyncio
 import logging
 from datetime import datetime
 import secrets
 import aiohttp
-import re
 from pathlib import Path
 from typing import Dict, List
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
@@ -15,13 +16,35 @@ from telegram.ext import (
 import yt_dlp
 from pymongo import MongoClient
 
-# Import from config.py
-from config import (
-    BOT_TOKEN, OWNER_ID, UPDATES_CHANNEL, FORCE_JOIN_CHANNEL,
-    LOG_GROUP_ID, MEGALLM_API_KEY, MEGALLM_API_URL, COOKIES_TXT,
-    MONGO_URI, MONGO_DB, MONGO_USERS, MONGO_ADMINS,
-    DOWNLOAD_DIR, MAX_FREE_SIZE, PREMIUM_SIZE, YOUTUBE_REGEX
-)
+# =========================
+# CONFIGURATION - INLINED (No separate config.py needed)
+# =========================
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+OWNER_ID = int(os.getenv("OWNER_ID", "7941244038"))
+UPDATES_CHANNEL = os.getenv("UPDATES_CHANNEL", "")
+FORCE_JOIN_CHANNEL = os.getenv("FORCE_JOIN_CHANNEL", "@tonystark_jr")
+LOG_GROUP_ID = int(os.getenv("LOG_GROUP_ID", "-5066591546"))
+MEGALLM_API_KEY = os.getenv("MEGALLM_API_KEY", "sk-mega-c38fc3f49a44cb1ab5aef67538dc222e0c56c21de5dc8418afe1b9769b68300d")
+MEGALLM_API_URL = "https://megallm.io/v1/chat/completions"
+
+# Cookies path handling
+COOKIES_ENV = os.getenv("COOKIES_TXT")
+if COOKIES_ENV and COOKIES_ENV.startswith('/'):
+    COOKIES_TXT = Path(COOKIES_ENV)
+else:
+    COOKIES_TXT = Path(COOKIES_ENV or "cookies.txt")
+
+# MongoDB
+MONGO_URI = os.getenv("MONGO_URI")
+MONGO_DB = os.getenv("MONGO_DB", "youtube_bot")
+MONGO_USERS = os.getenv("MONGO_USERS", "users")
+MONGO_ADMINS = os.getenv("MONGO_ADMINS", "admins")
+
+# Constants
+DOWNLOAD_DIR = Path("downloads")
+MAX_FREE_SIZE = 50 * 1024 * 1024
+PREMIUM_SIZE = 450 * 1024 * 1024
+YOUTUBE_REGEX = re.compile(r"(https?://)?(www\.)?(youtube\.com|youtu\.be)/[\w\-?&=/%]+", re.I)
 
 # =========================
 # Logging & Storage
@@ -200,6 +223,109 @@ async def ensure_membership(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     return False
 
 # =========================
+# Download Function
+# =========================
+async def download_and_send(chat_id, reply_msg, context, url, quality):
+    """Download and send media with size limits"""
+    cookies_file, cookie_status = validate_cookies()
+    
+    try:
+        ydl_opts = {
+            "quiet": True,
+            "no_warnings": True,
+            "outtmpl": str(DOWNLOAD_DIR / "%(title)s.%(ext)s"),
+        }
+
+        if cookies_file and cookie_status == "OK":
+            ydl_opts["cookiefile"] = cookies_file
+            log.info("🍪 Using cookies for download")
+        else:
+            log.info("🍪 No cookies - downloading public content only")
+
+        if quality == "mp3":
+            ydl_opts.update({
+                "format": "bestaudio/best",
+                "postprocessors": [{
+                    "key": "FFmpegExtractAudio",
+                    "preferredcodec": "mp3",
+                    "preferredquality": "192",
+                }],
+            })
+        else:
+            ydl_opts.update({
+                "format": f"bestvideo[height<={quality}][vcodec^=avc][ext=mp4]+bestaudio[acodec^=mp4a][ext=m4a]/best[height<={quality}][ext=mp4]",
+                "merge_output_format": "mp4",
+                "postprocessor_args": {
+                    "MOV+FFmpegVideoConvertor+mp4": [
+                        "-movflags", "+faststart",
+                        "-c:v", "libx264",
+                        "-c:a", "aac",
+                        "-preset", "faster",
+                        "-crf", "23"
+                    ]
+                }
+            })
+
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            title = sanitize_filename(info.get("title", "video"))
+
+        ext = ".mp3" if quality == "mp3" else ".mp4"
+        files = sorted(DOWNLOAD_DIR.glob(f"*{ext}"), key=lambda p: p.stat().st_mtime, reverse=True)
+        if not files:
+            await reply_msg.reply_text("⚠️ File not found after download.")
+            return
+
+        final_path = files[0]
+        file_size = final_path.stat().st_size
+        user_id = reply_msg.chat.id
+        is_user_premium = is_premium(user_id)
+
+        if file_size > MAX_FREE_SIZE and not is_user_premium:
+            final_path.unlink(missing_ok=True)
+            premium_msg = (
+                f"❌ <b>File too large!</b>\n\n"
+                f"📦 Size: {file_size / 1024 / 1024:.1f}MB\n"
+                f"💳 Free limit: {MAX_FREE_SIZE / 1024 / 1024}MB\n\n"
+                f"🔓 <b>Premium users get:</b>\n"
+                f"• Up to 450MB files\n"
+                f"• Priority downloads\n"
+                f"• No ads\n\n"
+                f"👉 Contact @ayushxchat_robot to subscribe premium!"
+            )
+            await reply_msg.reply_text(premium_msg, parse_mode=ParseMode.HTML)
+            return
+
+        if file_size > PREMIUM_SIZE:
+            final_path.unlink(missing_ok=True)
+            await reply_msg.reply_text("❌ File exceeds maximum size (450MB). Try lower quality.")
+            return
+
+        caption = f"📥 <b>{title}</b> ({file_size/1024/1024:.1f}MB)\n\nDownloaded by @spotifyxmusixbot"
+        
+        if quality == "mp3":
+            await reply_msg.reply_document(
+                document=final_path,
+                caption=caption,
+                filename=f"{title}.mp3",
+                parse_mode=ParseMode.HTML
+            )
+        else:
+            await reply_msg.reply_video(
+                video=final_path,
+                caption=caption,
+                filename=f"{title}.mp4",
+                supports_streaming=True,
+                parse_mode=ParseMode.HTML
+            )
+
+        cleanup_old_files()
+
+    except Exception as e:
+        await reply_msg.reply_text(f"⚠️ Error: {e}")
+        log.error(f"Download failed: {e}")
+
+# =========================
 # Command Handlers
 # =========================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -249,41 +375,313 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await update.message.reply_text(help_text, parse_mode=ParseMode.HTML)
 
-# [INCLUDE ALL OTHER COMMAND HANDLERS FROM PREVIOUS CODE]
-# ... (keep all gpt, search, gen, admin, broadcast handlers) ...
-
-# For brevity, I'll include the most important ones:
 async def gpt_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Chat with MegaLLM AI"""
     ensure_user(update)
-    if not await ensure_membership(update, context): return
+    
+    if not await ensure_membership(update, context):
+        return
+    
     query = " ".join(context.args)
-    if not query: return await update.message.reply_text("Usage: /gpt <your question>")
+    if not query:
+        await update.message.reply_text("Usage: /gpt <your question>")
+        return
     
     status_msg = await update.message.reply_text("🤖 Thinking...")
+    
     try:
         async with aiohttp.ClientSession() as session:
-            headers = {"Authorization": f"Bearer {MEGALLM_API_KEY}", "Content-Type": "application/json"}
+            headers = {
+                "Authorization": f"Bearer {MEGALLM_API_KEY}",
+                "Content-Type": "application/json"
+            }
             payload = {
                 "model": "gpt-3.5-turbo",
                 "messages": [{"role": "user", "content": query}],
-                "max_tokens": 1000, "temperature": 0.7
+                "max_tokens": 1000,
+                "temperature": 0.7
             }
+            
             async with session.post(MEGALLM_API_URL, json=payload, headers=headers) as resp:
                 if resp.status != 200:
-                    await status_msg.edit_text(f"❌ API Error {resp.status}")
-                    await log_to_group(update, context, action="/gpt", details=f"Error: {resp.status}", is_error=True)
+                    error_text = await resp.text()
+                    await status_msg.edit_text(f"❌ API Error {resp.status}: {error_text[:100]}")
+                    await log_to_group(update, context, action="/gpt", details=f"API Error: {resp.status}", is_error=True)
                     return
+                
                 data = await resp.json()
                 response_text = data["choices"][0]["message"]["content"].strip()
+
+        if len(response_text) > 4000:
+            response_text = response_text[:4000] + "\n\n... (truncated)"
         
-        if len(response_text) > 4000: response_text = response_text[:4000] + "\n\n... (truncated)"
-        await status_msg.edit_text(f"💬 <b>Query:</b> <code>{query}</code>\n\n<b>Answer:</b>\n{response_text}", parse_mode=ParseMode.HTML)
+        await status_msg.edit_text(
+            f"💬 <b>Query:</b> <code>{query}</code>\n\n"
+            f"<b>Answer:</b>\n{response_text}",
+            parse_mode=ParseMode.HTML
+        )
+        
         await log_to_group(update, context, action="/gpt", details=f"Query: {query[:50]}...")
+        
     except Exception as e:
-        await status_msg.edit_text(f"❌ Error: {str(e)[:200]}")
+        await status_msg.edit_text(f"❌ AI Error: {str(e)[:200]}")
         await log_to_group(update, context, action="/gpt", details=f"Error: {e}", is_error=True)
 
-# [ADD ALL OTHER HANDLERS HERE...]
+async def search_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    ensure_user(update)
+    
+    if not await ensure_membership(update, context):
+        return
+    
+    query = " ".join(context.args)
+    if not query:
+        await update.message.reply_text("Usage: /search <text>")
+        return
+    
+    await log_to_group(update, context, action="/search", details=f"Query: {query}")
+    await update.message.reply_text(f"Searching '{query}'…")
+
+    ydl_opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+        "default_search": "ytsearch5",
+        "extract_flat": False,
+    }
+
+    cookies_file, _ = validate_cookies()
+    if cookies_file:
+        ydl_opts["cookiefile"] = cookies_file
+
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(query, download=False)
+    except Exception as e:
+        await update.message.reply_text(f"⚠️ Search failed: {e}")
+        await log_to_group(update, context, action="/search", details=f"Error: {e}", is_error=True)
+        return
+
+    entries = info.get("entries", [])
+    if not entries:
+        await update.message.reply_text("No results.")
+        return
+
+    buttons = []
+    for e in entries[:5]:
+        title = sanitize_filename(e.get("title") or "video")
+        video_id = e.get('id')
+        url = f"https://youtube.com/watch?v={video_id}" if video_id else e.get('webpage_url')
+        token = store_url(url)
+        buttons.append([InlineKeyboardButton(title[:60], callback_data=f"s|{token}|pick")])
+
+    await update.message.reply_text("Choose:", reply_markup=InlineKeyboardMarkup(buttons))
+
+async def gen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    ensure_user(update)
+    
+    if not await ensure_membership(update, context):
+        return
+    
+    query = " ".join(context.args)
+    if not query:
+        await update.message.reply_text("Usage: /gen <description>")
+        return
+    
+    await log_to_group(update, context, action="/gen", details=f"Prompt: {query}")
+
+    status_msg = await update.message.reply_text("🎨 Generating image...")
+
+    try:
+        encoded_query = query.replace(" ", "+")
+        image_url = f"https://flux-pro.vercel.app/generate?q={encoded_query}"
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.get(image_url) as resp:
+                if resp.status != 200:
+                    await status_msg.edit_text(f"❌ Generation failed (Error {resp.status})")
+                    await log_to_group(update, context, action="/gen", details=f"Error: {resp.status}", is_error=True)
+                    return
+                
+                image_data = await resp.read()
+                image_path = DOWNLOAD_DIR / f"gen_{update.effective_user.id}.png"
+                with open(image_path, "wb") as f:
+                    f.write(image_data)
+
+        caption = f"🖼️ <b>{query}</b>\n\nGenerated by @spotifyxmusixbot"
+        await update.message.reply_photo(photo=image_path, caption=caption, parse_mode=ParseMode.HTML)
+        await status_msg.delete()
+        image_path.unlink(missing_ok=True)
+        
+        await log_to_group(update, context, action="/gen", details="Image generated successfully")
+        
+    except Exception as e:
+        await status_msg.edit_text(f"❌ Failed: {e}")
+        await log_to_group(update, context, action="/gen", details=f"Error: {e}", is_error=True)
+
+# [ADD ALL ADMIN & BROADCAST HANDLERS HERE COMPACTLY]
+# For brevity, I'll include them in compact form:
+
+async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id): return await update.message.reply_text("❌ Not authorized!")
+    BROADCAST_STORE[update.effective_user.id] = []; BROADCAST_STATE[update.effective_user.id] = True
+    await log_to_group(update, context, action="/broadcast", details="Broadcast mode started")
+    await update.message.reply_text("📢 Broadcast mode ON. Send messages, then /done_broadcast or /cancel_broadcast", parse_mode=ParseMode.HTML)
+
+async def done_broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id): return
+    admin_id = update.effective_user.id
+    if not BROADCAST_STATE.get(admin_id): await update.message.reply_text("❌ Not in broadcast mode."); return
+    if not BROADCAST_STORE.get(admin_id): await update.message.reply_text("❌ No messages to preview."); return
+    await log_to_group(update, context, action="/done_broadcast", details=f"Previewing {len(BROADCAST_STORE[admin_id])} messages")
+    await update.message.reply_text("📢 Preview:", parse_mode=ParseMode.HTML)
+    for msg in BROADCAST_STORE[admin_id]:
+        if msg["photo"]: await update.message.reply_photo(photo=msg["photo"], caption=msg["caption"], parse_mode=msg["parse_mode"])
+        elif msg["video"]: await update.message.reply_video(video=msg["video"], caption=msg["caption"], parse_mode=msg["parse_mode"])
+        elif msg["document"]: await update.message.reply_document(document=msg["document"], caption=msg["caption"], parse_mode=msg["parse_mode"])
+        elif msg["animation"]: await update.message.reply_animation(animation=msg["animation"], caption=msg["caption"], parse_mode=msg["parse_mode"])
+        elif msg["text"]: await update.message.reply_text(msg["text"], parse_mode=ParseMode.HTML)
+    await update.message.reply_text("✅ Preview done. Send /send_broadcast to send or /cancel_broadcast to cancel.", parse_mode=ParseMode.HTML)
+
+async def send_broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id): return
+    admin_id = update.effective_user.id
+    if not BROADCAST_STATE.get(admin_id): return
+    messages = BROADCAST_STORE.get(admin_id, [])
+    if not messages: await update.message.reply_text("❌ No messages."); return
+    recipients = set()
+    if MONGO_AVAILABLE:
+        for u in users_col.find({}, {"_id": 1}): recipients.add(u["_id"])
+    await update.message.reply_text(f"📢 Broadcasting to {len(recipients)}...")
+    success, failed = 0, 0
+    for chat_id in recipients:
+        try:
+            for msg in messages:
+                if msg["photo"]: await context.bot.send_photo(chat_id=chat_id, photo=msg["photo"], caption=msg["caption"], parse_mode=msg["parse_mode"])
+                elif msg["video"]: await context.bot.send_video(chat_id=chat_id, video=msg["video"], caption=msg["caption"], parse_mode=msg["parse_mode"])
+                elif msg["document"]: await context.bot.send_document(chat_id=chat_id, document=msg["document"], caption=msg["caption"], parse_mode=msg["parse_mode"])
+                elif msg["animation"]: await context.bot.send_animation(chat_id=chat_id, animation=msg["animation"], caption=msg["caption"], parse_mode=msg["parse_mode"])
+                elif msg["text"]: await context.bot.send_message(chat_id=chat_id, text=msg["text"], parse_mode=ParseMode.HTML)
+            success += 1
+        except Exception as e:
+            log.error(f"Broadcast failed to {chat_id}: {e}")
+            failed += 1
+        await asyncio.sleep(0.05)
+    BROADCAST_STORE.pop(admin_id, None); BROADCAST_STATE[admin_id] = False
+    await update.message.reply_text(f"✅ Broadcast Complete!\n📤 Successful: {success}\n❌ Failed: {failed}", parse_mode=ParseMode.HTML)
+    await log_to_group(update, context, action="/send_broadcast", details=f"Sent to {success} users, {failed} failed")
+
+async def cancel_broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id): return
+    admin_id = update.effective_user.id
+    BROADCAST_STORE.pop(admin_id, None); BROADCAST_STATE[admin_id] = False
+    await log_to_group(update, context, action="/cancel_broadcast", details="Broadcast cancelled")
+    await update.message.reply_text("❌ Broadcast cancelled.")
+
+async def addadmin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update.effective_user.id): return await update.message.reply_text("❌ Owner only!")
+    if not context.args: return await update.message.reply_text("Usage: /addadmin <user_id>")
+    try:
+        new_id = int(context.args[0])
+        user = users_col.find_one({"_id": new_id})
+        if not user: return await update.message.reply_text("❌ User not found. They must /start first.")
+        if admins_col.find_one({"_id": new_id}): return await update.message.reply_text("❌ Already admin.")
+        admins_col.insert_one({"_id": new_id, "name": user.get("name", str(new_id)), "added_by": update.effective_user.id, "added_at": datetime.now()})
+        await log_to_group(update, context, action="/addadmin", details=f"Added admin {new_id}")
+        await update.message.reply_text(f"✅ Added <b>{user.get('name', new_id)}</b> as admin.", parse_mode=ParseMode.HTML)
+    except Exception as e: await update.message.reply_text(f"❌ Failed: {e}")
+
+async def rmadmin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update.effective_user.id): return await update.message.reply_text("❌ Owner only!")
+    if not context.args: return await update.message.reply_text("Usage: /rmadmin <user_id>")
+    try:
+        rm_id = int(context.args[0])
+        if rm_id == OWNER_ID: return await update.message.reply_text("❌ Cannot remove owner!")
+        if not admins_col.find_one({"_id": rm_id}): return await update.message.reply_text("❌ Not an admin.")
+        admins_col.delete_one({"_id": rm_id})
+        await log_to_group(update, context, action="/rmadmin", details=f"Removed admin {rm_id}")
+        await update.message.reply_text(f"✅ Removed admin.", parse_mode=ParseMode.HTML)
+    except Exception as e: await update.message.reply_text(f"❌ Failed: {e}")
+
+async def adminlist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id): return await update.message.reply_text("❌ Not authorized!")
+    if not MONGO_AVAILABLE: return await update.message.reply_text("Database not available.")
+    try:
+        admins = list(admins_col.find().sort("added_at", -1))
+        if not admins: return await update.message.reply_text("No admins.")
+        admin_list = "👥 <b>Admin List</b>\n━━━━━━━━━━━━\n\n"
+        for admin in admins:
+            admin_id = admin["_id"]
+            name = admin.get("name", "Unknown")
+            role = "👑 Owner" if admin_id == OWNER_ID else "🔧 Admin"
+            admin_list += f"• <code>{admin_id}</code> - {name} ({role})\n"
+        admin_list += f"\n<b>Total: {len(admins)}</b>"
+        await update.message.reply_text(admin_list, parse_mode=ParseMode.HTML)
+        await log_to_group(update, context, action="/adminlist", details=f"Listed {len(admins)} admins")
+    except Exception as e: await update.message.reply_text(f"❌ Failed: {e}")
+
+# =========================
+# Callback Handlers
+# =========================
+async def on_quality(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    try: _, token, qlt = q.data.split("|")
+    except: return
+    data = PENDING.get(token)
+    if not data or data["exp"] < asyncio.get_event_loop().time():
+        await q.edit_message_text("Session expired."); return
+    await q.edit_message_text(f"Downloading {qlt}…")
+    await download_and_send(q.message.chat.id, q.message, context, data["url"], qlt)
+
+async def on_search_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    try: _, token, _ = q.data.split("|")
+    except: return
+    data = PENDING.get(token)
+    if not data or data["exp"] < asyncio.get_event_loop().time():
+        await q.edit_message_text("Expired."); return
+    await q.edit_message_text("Choose quality:", reply_markup=quality_keyboard(data["url"]))
+
+async def on_verify_membership(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    try:
+        member = await context.bot.get_chat_member(
+            chat_id=FORCE_JOIN_CHANNEL,
+            user_id=q.from_user.id
+        )
+        if member.status not in ["left", "kicked"]:
+            await q.edit_message_text("✅ Verified! You can now use the bot.")
+            await start(update, context)
+            await log_to_group(update, context, action="Channel Verified", details=f"User {q.from_user.id} verified membership")
+        else:
+            await q.answer("❌ Please join the channel first!", show_alert=True)
+    except Exception as e:
+        log.error(f"Membership verification failed: {e}")
+        await q.answer("❌ Error verifying. Try again.", show_alert=True)
+
+# =========================
+# Message Handlers
+# =========================
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    ensure_user(update)
+    
+    if not await ensure_membership(update, context):
+        return
+    
+    if update.effective_user and is_admin(update.effective_user.id):
+        if BROADCAST_STATE.get(update.effective_user.id):
+            await handle_broadcast_message(update, context)
+            return
+    
+    txt = update.message.text.strip()
+    match = YOUTUBE_REGEX.search(txt)
+    if match:
+        url = match.group(0)
+        user_id = update.effective_user.id
+        await log_to_group(update, context, action="YouTube URL", details=f"User {user_id} sent: {url[:50]}...")
+        await update.message.reply_text("Choose quality:", reply_markup=quality_keyboard(url))
 
 # =========================
 # Main Function
@@ -298,32 +696,43 @@ def main():
     signal.signal(signal.SIGTERM, shutdown_handler)
     
     log.info("="*60)
-    log.info("🔍 DEPLOYMENT DEBUG INFO")
+    log.info("🔍 FINAL DEPLOYMENT DEBUG")
     log.info(f"Current Directory: {Path.cwd()}")
-    log.info(f"Files in /app: {list(Path.cwd().glob('*'))}")
-    log.info(f"Config file exists: {Path('config.py').exists()}")
+    log.info(f"Files in /app: {[f.name for f in Path.cwd().glob('*')]}")
     log.info(f"Force Join: {FORCE_JOIN_CHANNEL}")
     log.info(f"Log Group: {LOG_GROUP_ID}")
     log.info("="*60)
     
-    if not Path('config.py').exists():
-        log.error("❌ config.py NOT FOUND! Make sure it's deployed!")
-        sys.exit(1)
-    
     app = ApplicationBuilder().token(BOT_TOKEN).build()
+    
+    # Error handler
+    async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+        log.error("Exception while handling an update:", exc_info=context.error)
     app.add_error_handler(error_handler)
 
     # Commands
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("gpt", gpt_cmd))
-    # [ADD ALL OTHER COMMAND HANDLERS HERE]
+    app.add_handler(CommandHandler("search", search_cmd))
+    app.add_handler(CommandHandler("gen", gen_cmd))
+    app.add_handler(CommandHandler("stats", stats_cmd))
+    app.add_handler(CommandHandler("broadcast", broadcast_cmd))
+    app.add_handler(CommandHandler("done_broadcast", done_broadcast_cmd))
+    app.add_handler(CommandHandler("send_broadcast", send_broadcast_cmd))
+    app.add_handler(CommandHandler("cancel_broadcast", cancel_broadcast_cmd))
+    app.add_handler(CommandHandler("addadmin", addadmin_cmd))
+    app.add_handler(CommandHandler("rmadmin", rmadmin_cmd))
+    app.add_handler(CommandHandler("adminlist", adminlist_cmd))
 
     # Messages & Callbacks
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-    # [ADD CALLBACK HANDLERS HERE]
+    app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_broadcast_message))
+    app.add_handler(CallbackQueryHandler(on_quality, pattern=r"^q\|"))
+    app.add_handler(CallbackQueryHandler(on_search_pick, pattern=r"^s\|"))
+    app.add_handler(CallbackQueryHandler(on_verify_membership, pattern="^verify_membership$"))
 
-    log.info("Bot started successfully!")
+    log.info("Bot started successfully! No config.py needed.")
     app.run_polling()
 
 if __name__ == "__main__":
