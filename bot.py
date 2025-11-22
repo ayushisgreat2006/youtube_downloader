@@ -15,6 +15,7 @@ from telegram.ext import (
 )
 import yt_dlp
 from pymongo import MongoClient
+from openai import OpenAI
 
 # =========================
 # CONFIGURATION
@@ -25,11 +26,19 @@ UPDATES_CHANNEL = os.getenv("UPDATES_CHANNEL", "@tonystark_jr")
 FORCE_JOIN_CHANNEL = os.getenv("FORCE_JOIN_CHANNEL", "@tonystark_jr")
 LOG_GROUP_ID = int(os.getenv("LOG_GROUP_ID", "-5066591546"))
 MEGALLM_API_KEY = os.getenv("MEGALLM_API_KEY", "")
-MEGALLM_API_URL = os.getenv("MEGALLM_API_URL", "https://api.openai.com/v1/chat/completions")
+MEGALLM_API_URL = os.getenv("MEGALLM_API_URL", "https://ai.megallm.io/v1")
 
-# Fallback API for GPT (OpenRouter - free tier)
-FALLBACK_API_URL = "https://openrouter.ai/api/v1/chat/completions"
-FALLBACK_API_KEY = os.getenv("FALLBACK_API_KEY", "sk-or-v1-xxxxxxxxxxxxxx")  # Get from openrouter.ai
+# OpenAI Client for MegaLLM
+openai_client = None
+if MEGALLM_API_KEY:
+    try:
+        openai_client = OpenAI(
+            base_url=MEGALLM_API_URL,
+            api_key=MEGALLM_API_KEY
+        )
+        log.info("✅ MegaLLM OpenAI client initialized")
+    except Exception as e:
+        log.error(f"❌ Failed to initialize OpenAI client: {e}")
 
 # Cookies path handling
 COOKIES_ENV = os.getenv("COOKIES_TXT")
@@ -60,6 +69,7 @@ DOWNLOAD_DIR.mkdir(exist_ok=True)
 BROADCAST_STORE: Dict[int, List[dict]] = {}
 BROADCAST_STATE: Dict[int, bool] = {}
 PENDING: Dict[str, dict] = {}
+USER_CONVERSATIONS: Dict[int, List[dict]] = {}  # Store conversation history per user
 
 # =========================
 # MongoDB Setup
@@ -245,17 +255,6 @@ async def ensure_membership(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     return False
 
 # =========================
-# Async Download Wrapper
-# =========================
-async def async_download_and_send(chat_id, reply_msg, context, url, quality):
-    """Run download in executor to avoid blocking"""
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(
-        None, 
-        lambda: asyncio.run(download_and_send(chat_id, reply_msg, context, url, quality))
-    )
-
-# =========================
 # Download Function
 # =========================
 async def download_and_send(chat_id, reply_msg, context, url, quality):
@@ -399,7 +398,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await log_to_group(update, context, action="/help", details="User requested help")
     
     # Show API status in help
-    api_status = "✅" if MEGALLM_API_KEY else "❌"
+    api_status = "✅" if openai_client else "❌"
     
     help_text = (
         "<b>✨ SpotifyX Musix Bot — Commands ✨</b>\n"
@@ -419,7 +418,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "<code>/rmadmin &lt;id&gt;</code> — Remove admin\n\n"
         f"<b>Updates:</b> {UPDATES_CHANNEL}\n"
         f"<b>Support:</b> @mahadev_ki_iccha\n\n"
-        f"<b>AI Status:</b> {api_status} {'Configured' if MEGALLM_API_KEY else 'Not Set'}"
+        f"<b>AI Status:</b> {api_status} {'Configured' if openai_client else 'Not Set'}"
     )
     await update.message.reply_text(help_text, parse_mode=ParseMode.HTML)
 
@@ -516,7 +515,7 @@ async def gen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await log_to_group(update, context, action="/gen", details=f"Error: {e}", is_error=True)
 
 async def gpt_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Chat with AI - Improved error handling"""
+    """Chat with AI - Using OpenAI client for MegaLLM"""
     ensure_user(update)
     
     if not await ensure_membership(update, context):
@@ -527,8 +526,8 @@ async def gpt_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Usage: /gpt <your question>")
         return
     
-    # Check if API is configured
-    if not MEGALLM_API_KEY:
+    # Check if OpenAI client is initialized
+    if not openai_client:
         await update.message.reply_text(
             "❌ AI feature is not configured.\n\n"
             "Please set the <code>MEGALLM_API_KEY</code> environment variable.\n"
@@ -537,53 +536,44 @@ async def gpt_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     
+    user_id = update.effective_user.id
     status_msg = await update.message.reply_text("🤖 Thinking...")
     
     try:
-        # Debug info
-        log.info(f"GPT Request: {query[:50]}... to {MEGALLM_API_URL}")
+        # Initialize conversation history for user if not exists
+        if user_id not in USER_CONVERSATIONS:
+            USER_CONVERSATIONS[user_id] = [
+                {"role": "system", "content": "You are a helpful assistant."}
+            ]
         
-        # Use connection pool for better performance
-        timeout = aiohttp.ClientTimeout(total=30)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            headers = {
-                "Authorization": f"Bearer {MEGALLM_API_KEY}",
-                "Content-Type": "application/json",
-                "User-Agent": "SpotifyXBot/1.0"
-            }
-            payload = {
-                "model": "gpt-3.5-turbo",
-                "messages": [{"role": "user", "content": query}],
-                "max_tokens": 1000,
-                "temperature": 0.7
-            }
-            
-            async with session.post(MEGALLM_API_URL, json=payload, headers=headers) as resp:
-                if resp.status == 404:
-                    error_text = await resp.text()
-                    await status_msg.edit_text(
-                        f"❌ API Endpoint Not Found (404)\n\n"
-                        f"This usually means the API URL is incorrect or the service is down.\n\n"
-                        f"Debug:\n<code>{MEGALLM_API_URL}</code>\n\n"
-                        f"Try using OpenRouter API instead.",
-                        parse_mode=ParseMode.HTML
-                    )
-                    await log_to_group(update, context, action="/gpt", details=f"API 404 Error", is_error=True)
-                    return
-                
-                if resp.status != 200:
-                    error_text = await resp.text()
-                    await status_msg.edit_text(
-                        f"❌ API Error {resp.status}\n\n"
-                        f"<code>{error_text[:100]}...</code>",
-                        parse_mode=ParseMode.HTML
-                    )
-                    await log_to_group(update, context, action="/gpt", details=f"API Error: {resp.status}", is_error=True)
-                    return
-                
-                data = await resp.json()
-                response_text = data["choices"][0]["message"]["content"].strip()
-
+        # Add user message to history
+        USER_CONVERSATIONS[user_id].append({"role": "user", "content": query})
+        
+        log.info(f"GPT Request from {user_id}: {query[:50]}...")
+        
+        # Run in executor to avoid blocking
+        loop = asyncio.get_event_loop()
+        response = await loop.run_in_executor(
+            None,
+            lambda: openai_client.chat.completions.create(
+                model="gpt-4",
+                messages=USER_CONVERSATIONS[user_id],
+                max_tokens=1000,
+                temperature=0.7
+            )
+        )
+        
+        # Get response text
+        response_text = response.choices[0].message.content
+        
+        # Add assistant response to history
+        USER_CONVERSATIONS[user_id].append({"role": "assistant", "content": response_text})
+        
+        # Keep only last 10 messages to prevent token overflow
+        if len(USER_CONVERSATIONS[user_id]) > 10:
+            USER_CONVERSATIONS[user_id] = USER_CONVERSATIONS[user_id][-10:]
+        
+        # Truncate if too long
         if len(response_text) > 4000:
             response_text = response_text[:4000] + "\n\n... (truncated)"
         
@@ -596,11 +586,15 @@ async def gpt_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await log_to_group(update, context, action="/gpt", details=f"Query: {query[:50]}...")
         
     except asyncio.TimeoutError:
-        await status_msg.edit_text("❌ Request timed out. Please try again.")
+        await status_msg.edit_text("❌ Request timed out after 30 seconds. Please try again.")
         await log_to_group(update, context, action="/gpt", details="Timeout error", is_error=True)
     except Exception as e:
         await status_msg.edit_text(f"❌ AI Error: {str(e)[:200]}")
         await log_to_group(update, context, action="/gpt", details=f"Error: {e}", is_error=True)
+        
+        # Clear conversation history on error to prevent repeated failures
+        if user_id in USER_CONVERSATIONS:
+            USER_CONVERSATIONS[user_id] = [{"role": "system", "content": "You are a helpful assistant."}]
 
 async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show bot statistics (admin only)"""
@@ -780,7 +774,7 @@ async def adminlist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         admins = list(admins_col.find().sort("added_at", -1))
         if not admins: 
-            await update_message.reply_text("No admins.")
+            await update.message.reply_text("No admins.")
             return
         admin_list = "👥 <b>Admin List</b>\n━━━━━━━━━━━━\n\n"
         for admin in admins:
@@ -932,7 +926,7 @@ def main():
     log.info(f"Files in /app: {[f.name for f in Path.cwd().glob('*')]}")
     log.info(f"Force Join: {FORCE_JOIN_CHANNEL}")
     log.info(f"Log Group: {LOG_GROUP_ID}")
-    log.info(f"AI API Key: {'✅ Set' if MEGALLM_API_KEY else '❌ Not Set'}")
+    log.info(f"AI API Key: {'✅ Set' if openai_client else '❌ Not Set'}")
     log.info("="*60)
     
     app = ApplicationBuilder().token(BOT_TOKEN).build()
@@ -943,7 +937,7 @@ def main():
         
         # Try to log errors to group
         try:
-            if LOG_GROUP_ID and update.effective_user:
+            if LOG_GROUP_ID and update and hasattr(update, 'effective_user') and update.effective_user:
                 error_text = (
                     f"❌ <b>Bot Error</b>\n\n"
                     f"User: {update.effective_user.id}\n"
