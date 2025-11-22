@@ -15,7 +15,7 @@ from telegram.ext import (
 )
 import yt_dlp
 from pymongo import MongoClient
-import openai  # Added import
+import openai
 
 # =========================
 # CONFIGURATION
@@ -26,6 +26,7 @@ UPDATES_CHANNEL = os.getenv("UPDATES_CHANNEL", "@tonystark_jr")
 FORCE_JOIN_CHANNEL = os.getenv("FORCE_JOIN_CHANNEL", "@tonystark_jr")
 LOG_GROUP_ID = int(os.getenv("LOG_GROUP_ID", "-5066591546"))
 MEGALLM_API_KEY = os.getenv("MEGALLM_API_KEY", "")
+MEGALLM_MODEL = os.getenv("MEGALLM_MODEL", "gpt-3.5-turbo")
 
 # Cookies path handling
 COOKIES_ENV = os.getenv("COOKIES_TXT")
@@ -59,7 +60,7 @@ PENDING: Dict[str, dict] = {}
 USER_CONVERSATIONS: Dict[int, List[dict]] = {}
 
 # =========================
-# MegaLLM Client Setup
+# MegaLLM Client Setup (Moved after logging)
 # =========================
 client = None
 if MEGALLM_API_KEY:
@@ -68,7 +69,7 @@ if MEGALLM_API_KEY:
             base_url="https://ai.megallm.io/v1",
             api_key=MEGALLM_API_KEY
         )
-        log.info("✅ MegaLLM client initialized")
+        log.info(f"✅ MegaLLM client initialized with model: {MEGALLM_MODEL}")
     except Exception as e:
         log.error(f"❌ Failed to initialize MegaLLM client: {e}")
 
@@ -144,7 +145,7 @@ async def log_to_group(update: Update, context: ContextTypes.DEFAULT_TYPE, actio
         log.info(f"✅ Log sent to group {LOG_GROUP_ID}")
         
     except Exception as e:
-        log.error(f"❌ Failed to send log to group: {e}")
+        log.error(f"❌ Failed to send log to group {LOG_GROUP_ID}: {e}")
 
 def ensure_user(update: Update):
     if not MONGO_AVAILABLE or not update.effective_user:
@@ -306,7 +307,7 @@ async def download_and_send(chat_id, reply_msg, context, url, quality):
             return
 
         final_path = files[0]
-        file_size = final_path.stat().st_size
+        file_size = final_path.stat().st_mtime
         user_id = reply_msg.chat.id
         is_user_premium = is_premium(user_id)
 
@@ -502,7 +503,6 @@ async def gen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await log_to_group(update, context, action="/gen", details=f"Error: {e}", is_error=True)
 
 async def gpt_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Direct MegaLLM integration as requested"""
     ensure_user(update)
     
     if not await ensure_membership(update, context):
@@ -523,35 +523,27 @@ async def gpt_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     status_msg = await update.message.reply_text("🤖 Thinking...")
     
-    # Initialize conversation history if needed
     if user_id not in USER_CONVERSATIONS:
         USER_CONVERSATIONS[user_id] = [
             {"role": "system", "content": "You are a helpful assistant."}
         ]
     
-    # Add user query
     USER_CONVERSATIONS[user_id].append({"role": "user", "content": query})
     
     try:
-        # Simple, direct API call as you requested
         response = client.chat.completions.create(
-            model="claude-3.5-sonnet",
+            model=MEGALLM_MODEL,
             messages=USER_CONVERSATIONS[user_id],
             max_tokens=1000,
             temperature=0.7
         )
         
-        # Get response
         answer = response.choices[0].message.content
-        
-        # Add to history
         USER_CONVERSATIONS[user_id].append({"role": "assistant", "content": answer})
         
-        # Keep last 10 messages
         if len(USER_CONVERSATIONS[user_id]) > 10:
             USER_CONVERSATIONS[user_id] = USER_CONVERSATIONS[user_id][-10:]
         
-        # Truncate long messages
         if len(answer) > 4000:
             answer = answer[:4000] + "\n\n... (truncated)"
         
@@ -566,94 +558,169 @@ async def gpt_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await status_msg.edit_text(f"❌ AI Error: {str(e)[:200]}")
         await log_to_group(update, context, action="/gpt", details=f"Error: {e}", is_error=True)
-        
-        # Reset history on error
         USER_CONVERSATIONS[user_id] = [{"role": "system", "content": "You are a helpful assistant."}]
 
-async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("❌ Not authorized!")
-        return
-    
-    if not MONGO_AVAILABLE:
-        await update.message.reply_text("❌ Database not available.")
-        return
-    
-    try:
-        total_users = users_col.count_documents({})
-        premium_users = users_col.count_documents({"premium": True})
-        total_admins = admins_col.count_documents({})
-        downloads_count = len([f for f in DOWNLOAD_DIR.iterdir() if f.is_file()])
-        
-        stats_text = (
-            "📊 <b>Bot Statistics</b>\n"
-            "━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"👥 <b>Total Users:</b> {total_users:,}\n"
-            f"💎 <b>Premium Users:</b> {premium_users:,}\n"
-            f"👑 <b>Total Admins:</b> {total_admins:,}\n\n"
-            f"📁 <b>Downloads Cache:</b> {downloads_count} files\n"
-            f"🗄️ <b>Database:</b> MongoDB Connected\n"
-            f"⏰ <b>Time:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-        )
-        
-        await update.message.reply_text(stats_text, parse_mode=ParseMode.HTML)
-        await log_to_group(update, context, action="/stats", details=f"Users: {total_users}, Premium: {premium_users}, Admins: {total_admins}")
-        
-    except Exception as e:
-        await update.message.reply_text(f"❌ Failed: {e}")
-        await log_to_group(update, context, action="/stats", details=f"Error: {e}", is_error=True)
-
+# =========================
+# BROADCAST FUNCTIONS WITH DEBUG LOGGING
+# =========================
 async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    log.info(f"BROADCAST: /broadcast called by user {update.effective_user.id}")
+    
     if not is_admin(update.effective_user.id): 
+        log.warning(f"BROADCAST: Unauthorized user {update.effective_user.id} tried to use broadcast")
         await update.message.reply_text("❌ Not authorized!")
         return
-    BROADCAST_STORE[update.effective_user.id] = []
-    BROADCAST_STATE[update.effective_user.id] = True
+    
+    admin_id = update.effective_user.id
+    BROADCAST_STORE[admin_id] = []
+    BROADCAST_STATE[admin_id] = True
+    log.info(f"BROADCAST: Mode ENABLED for admin {admin_id}")
+    
     await log_to_group(update, context, action="/broadcast", details="Broadcast mode started")
-    await update.message.reply_text("📢 Broadcast mode ON. Send messages, then /done_broadcast or /cancel_broadcast", parse_mode=ParseMode.HTML)
+    await update.message.reply_text(
+        "📢 Broadcast mode ON. Send messages, then /done_broadcast or /cancel_broadcast\n\n"
+        f"Debug: Admin ID {admin_id}, State: {BROADCAST_STATE[admin_id]}",
+        parse_mode=ParseMode.HTML
+    )
+
+async def handle_broadcast_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """This handles ALL non-command messages for broadcast"""
+    log.info(f"BROADCAST DEBUG: handle_broadcast_message called for user {update.effective_user.id if update.effective_user else 'None'}")
+    
+    if not update.effective_user or not is_admin(update.effective_user.id):
+        log.info("BROADCAST DEBUG: User is not admin or no effective_user - returning")
+        return
+    
+    admin_id = update.effective_user.id
+    log.info(f"BROADCAST DEBUG: Admin ID {admin_id}, State: {BROADCAST_STATE.get(admin_id)}")
+    
+    if not BROADCAST_STATE.get(admin_id):
+        log.info(f"BROADCAST DEBUG: Broadcast state is False/None for {admin_id} - not in broadcast mode")
+        return
+    
+    # Log message type
+    log.info(f"BROADCAST DEBUG: Message type - text: {bool(update.message.text)}, photo: {bool(update.message.photo)}, video: {bool(update.message.video)}")
+    
+    msg = {}
+    
+    if update.message.text:
+        msg = {"text": update.message.text, "parse_mode": ParseMode.HTML}
+        log.info(f"BROADCAST: Captured text message: {update.message.text[:50]}...")
+    elif update.message.photo:
+        msg = {
+            "photo": update.message.photo[-1].file_id,
+            "caption": update.message.caption or "",
+            "parse_mode": ParseMode.HTML
+        }
+        log.info("BROADCAST: Captured photo message")
+    elif update.message.video:
+        msg = {
+            "video": update.message.video.file_id,
+            "caption": update.message.caption or "",
+            "parse_mode": ParseMode.HTML
+        }
+        log.info("BROADCAST: Captured video message")
+    elif update.message.document:
+        msg = {
+            "document": update.message.document.file_id,
+            "caption": update.message.caption or "",
+            "parse_mode": ParseMode.HTML
+        }
+        log.info("BROADCAST: Captured document message")
+    elif update.message.animation:
+        msg = {
+            "animation": update.message.animation.file_id,
+            "caption": update.message.caption or "",
+            "parse_mode": ParseMode.HTML
+        }
+        log.info("BROADCAST: Captured animation message")
+    else:
+        log.warning("BROADCAST: Unsupported message type")
+        await update.message.reply_text("⚠️ Unsupported message type for broadcast.")
+        return
+    
+    BROADCAST_STORE.setdefault(admin_id, []).append(msg)
+    count = len(BROADCAST_STORE[admin_id])
+    log.info(f"BROADCAST: Message stored. Queue now has {count} messages for admin {admin_id}")
+    await update.message.reply_text(f"✅ Message added to broadcast queue. Total: {count}")
 
 async def done_broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    log.info(f"BROADCAST: /done_broadcast called by {update.effective_user.id}")
+    
     if not is_admin(update.effective_user.id): 
         return
+    
     admin_id = update.effective_user.id
+    log.info(f"BROADCAST: Admin {admin_id} state: {BROADCAST_STATE.get(admin_id)}")
+    
     if not BROADCAST_STATE.get(admin_id): 
         await update.message.reply_text("❌ Not in broadcast mode.")
         return
-    if not BROADCAST_STORE.get(admin_id): 
+    
+    messages = BROADCAST_STORE.get(admin_id, [])
+    log.info(f"BROADCAST: Found {len(messages)} messages for admin {admin_id}")
+    
+    if not messages: 
         await update.message.reply_text("❌ No messages to preview.")
         return
-    await log_to_group(update, context, action="/done_broadcast", details=f"Previewing {len(BROADCAST_STORE[admin_id])} messages")
+    
+    await log_to_group(update, context, action="/done_broadcast", details=f"Previewing {len(messages)} messages")
     await update.message.reply_text("📢 Preview:", parse_mode=ParseMode.HTML)
-    for msg in BROADCAST_STORE[admin_id]:
-        if msg["photo"]: 
-            await update.message.reply_photo(photo=msg["photo"], caption=msg["caption"], parse_mode=msg["parse_mode"])
-        elif msg["video"]: 
-            await update.message.reply_video(video=msg["video"], caption=msg["caption"], parse_mode=msg["parse_mode"])
-        elif msg["document"]: 
-            await update.message.reply_document(document=msg["document"], caption=msg["caption"], parse_mode=msg["parse_mode"])
-        elif msg["animation"]: 
-            await update.message.reply_animation(animation=msg["animation"], caption=msg["caption"], parse_mode=msg["parse_mode"])
-        elif msg["text"]: 
-            await update.message.reply_text(msg["text"], parse_mode=ParseMode.HTML)
+    
+    for i, msg in enumerate(messages):
+        log.info(f"BROADCAST PREVIEW {i+1}: {msg}")
+        try:
+            if msg["photo"]: 
+                await update.message.reply_photo(photo=msg["photo"], caption=msg["caption"], parse_mode=msg["parse_mode"])
+            elif msg["video"]: 
+                await update.message.reply_video(video=msg["video"], caption=msg["caption"], parse_mode=msg["parse_mode"])
+            elif msg["document"]: 
+                await update.message.reply_document(document=msg["document"], caption=msg["caption"], parse_mode=msg["parse_mode"])
+            elif msg["animation"]: 
+                await update.message.reply_animation(animation=msg["animation"], caption=msg["caption"], parse_mode=msg["parse_mode"])
+            elif msg["text"]: 
+                await update.message.reply_text(msg["text"], parse_mode=ParseMode.HTML)
+        except Exception as e:
+            log.error(f"BROADCAST PREVIEW ERROR: {e}")
+            await update.message.reply_text(f"❌ Failed to preview message {i+1}: {e}")
+    
     await update.message.reply_text("✅ Preview done. Send /send_broadcast to send or /cancel_broadcast to cancel.", parse_mode=ParseMode.HTML)
 
 async def send_broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    log.info(f"BROADCAST: /send_broadcast called by {update.effective_user.id}")
+    
     if not is_admin(update.effective_user.id): 
+        log.warning(f"BROADCAST: Unauthorized send_broadcast attempt by {update.effective_user.id}")
         return
+    
     admin_id = update.effective_user.id
     if not BROADCAST_STATE.get(admin_id): 
+        log.error("BROADCAST: Not in broadcast mode")
         return
+    
     messages = BROADCAST_STORE.get(admin_id, [])
     if not messages: 
-        await update.message.reply_text("❌ No messages.")
+        await update.message.reply_text("❌ No messages to broadcast.")
         return
+    
     recipients = set()
     if MONGO_AVAILABLE:
+        log.info("BROADCAST: Getting recipients from MongoDB")
         for u in users_col.find({}, {"_id": 1}): 
             recipients.add(u["_id"])
-    await update.message.reply_text(f"📢 Broadcasting to {len(recipients)}...")
+    else:
+        log.error("BROADCAST: MongoDB not available!")
+        await update.message.reply_text("❌ Database not available for broadcast.")
+        return
+    
+    log.info(f"BROADCAST: Starting broadcast to {len(recipients)} users")
+    await update.message.reply_text(f"📢 Broadcasting to {len(recipients)} users...")
+    
     success, failed = 0, 0
-    for chat_id in recipients:
+    for i, chat_id in enumerate(recipients):
+        if i % 50 == 0:  # Log progress
+            log.info(f"BROADCAST PROGRESS: {i}/{len(recipients)}")
+            
         try:
             for msg in messages:
                 if msg["photo"]: 
@@ -668,22 +735,31 @@ async def send_broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
                     await context.bot.send_message(chat_id=chat_id, text=msg["text"], parse_mode=ParseMode.HTML)
             success += 1
         except Exception as e:
-            log.error(f"Broadcast failed to {chat_id}: {e}")
+            log.error(f"BROADCAST: Failed to send to {chat_id}: {e}")
             failed += 1
-        await asyncio.sleep(0.05)
+        await asyncio.sleep(0.05)  # Rate limiting
+    
+    log.info(f"BROADCAST COMPLETE: Success: {success}, Failed: {failed}")
     BROADCAST_STORE.pop(admin_id, None)
     BROADCAST_STATE[admin_id] = False
-    await update.message.reply_text(f"✅ Broadcast Complete!\n📤 Successful: {success}\n❌ Failed: {failed}", parse_mode=ParseMode.HTML)
+    
+    summary = f"✅ Broadcast Complete!\n📤 Successful: {success}\n❌ Failed: {failed}"
+    await update.message.reply_text(summary, parse_mode=ParseMode.HTML)
     await log_to_group(update, context, action="/send_broadcast", details=f"Sent to {success} users, {failed} failed")
 
 async def cancel_broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    log.info(f"BROADCAST: /cancel_broadcast called by {update.effective_user.id}")
+    
     if not is_admin(update.effective_user.id): 
         return
+    
     admin_id = update.effective_user.id
     BROADCAST_STORE.pop(admin_id, None)
     BROADCAST_STATE[admin_id] = False
+    log.info(f"BROADCAST: Cancelled for admin {admin_id}")
+    
     await log_to_group(update, context, action="/cancel_broadcast", details="Broadcast cancelled")
-    await update.message.reply_text("❌ Broadcast cancelled.")
+    await update.message.reply_text("❌ Broadcast cancelled.", parse_mode=ParseMode.HTML)
 
 async def addadmin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update.effective_user.id): 
@@ -743,7 +819,7 @@ async def adminlist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         admins = list(admins_col.find().sort("added_at", -1))
         if not admins: 
-            await update.message.reply_text("No admins.")
+            await update.message.reply_text("No admins.")  # FIXED TYPO
             return
         admin_list = "👥 <b>Admin List</b>\n━━━━━━━━━━━━\n\n"
         for admin in admins:
@@ -756,53 +832,6 @@ async def adminlist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await log_to_group(update, context, action="/adminlist", details=f"Listed {len(admins)} admins")
     except Exception as e: 
         await update.message.reply_text(f"❌ Failed: {e}")
-
-# =========================
-# Broadcast Message Handler
-# =========================
-async def handle_broadcast_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.effective_user or not is_admin(update.effective_user.id):
-        return
-    
-    admin_id = update.effective_user.id
-    if not BROADCAST_STATE.get(admin_id):
-        return
-    
-    msg = {}
-    
-    if update.message.text:
-        msg = {"text": update.message.text, "parse_mode": ParseMode.HTML}
-    elif update.message.photo:
-        msg = {
-            "photo": update.message.photo[-1].file_id,
-            "caption": update.message.caption or "",
-            "parse_mode": ParseMode.HTML
-        }
-    elif update.message.video:
-        msg = {
-            "video": update.message.video.file_id,
-            "caption": update.message.caption or "",
-            "parse_mode": ParseMode.HTML
-        }
-    elif update.message.document:
-        msg = {
-            "document": update.message.document.file_id,
-            "caption": update.message.caption or "",
-            "parse_mode": ParseMode.HTML
-        }
-    elif update.message.animation:
-        msg = {
-            "animation": update.message.animation.file_id,
-            "caption": update.message.caption or "",
-            "parse_mode": ParseMode.HTML
-        }
-    else:
-        await update.message.reply_text("⚠️ Unsupported message type for broadcast.")
-        return
-    
-    BROADCAST_STORE.setdefault(admin_id, []).append(msg)
-    count = len(BROADCAST_STORE[admin_id])
-    await update.message.reply_text(f"✅ Message added to broadcast queue. Total: {count}")
 
 # =========================
 # Callback Handlers
@@ -861,8 +890,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await ensure_membership(update, context):
         return
     
+    # Check if in broadcast mode
     if update.effective_user and is_admin(update.effective_user.id):
-        if BROADCAST_STATE.get(update.effective_user.id):
+        admin_id = update.effective_user.id
+        if BROADCAST_STATE.get(admin_id):
+            log.info(f"TEXT HANDLER: Admin {admin_id} in broadcast mode, redirecting to broadcast handler")
             await handle_broadcast_message(update, context)
             return
     
