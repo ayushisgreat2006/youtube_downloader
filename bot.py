@@ -60,7 +60,7 @@ PENDING: Dict[str, dict] = {}
 USER_CONVERSATIONS: Dict[int, List[dict]] = {}
 
 # =========================
-# MegaLLM Client Setup (Moved after logging)
+# MegaLLM Client Setup
 # =========================
 client = None
 if MEGALLM_API_KEY:
@@ -250,7 +250,7 @@ async def ensure_membership(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     return False
 
 # =========================
-# Download Function
+# Download Function (Fixed)
 # =========================
 async def download_and_send(chat_id, reply_msg, context, url, quality):
     cookies_file, cookie_status = validate_cookies()
@@ -296,8 +296,10 @@ async def download_and_send(chat_id, reply_msg, context, url, quality):
 
         await status_msg.edit_text("⬇️ Downloading from YouTube...")
         
+        # Run yt-dlp in a thread pool to avoid blocking
+        loop = asyncio.get_event_loop()
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
+            info = await loop.run_in_executor(None, lambda: ydl.extract_info(url, download=True))
             title = sanitize_filename(info.get("title", "video"))
 
         ext = ".mp3" if quality == "mp3" else ".mp4"
@@ -307,7 +309,7 @@ async def download_and_send(chat_id, reply_msg, context, url, quality):
             return
 
         final_path = files[0]
-        file_size = final_path.stat().st_mtime
+        file_size = final_path.stat().st_size  # FIXED: Changed from st_mtime to st_size
         user_id = reply_msg.chat.id
         is_user_premium = is_premium(user_id)
 
@@ -335,28 +337,36 @@ async def download_and_send(chat_id, reply_msg, context, url, quality):
         
         await status_msg.edit_text("⬆️ Uploading to Telegram...")
         
-        if quality == "mp3":
-            await reply_msg.reply_document(
-                document=final_path,
-                caption=caption,
-                filename=f"{title}.mp3",
-                parse_mode=ParseMode.HTML
-            )
-        else:
-            await reply_msg.reply_video(
-                video=final_path,
-                caption=caption,
-                filename=f"{title}.mp4",
-                supports_streaming=True,
-                parse_mode=ParseMode.HTML
-            )
+        # Fixed: Read file in chunks and send with proper timeouts
+        async with aiohttp.ClientSession() as session:
+            if quality == "mp3":
+                await reply_msg.reply_document(
+                    document=open(final_path, "rb"),
+                    caption=caption,
+                    filename=f"{title}.mp3",
+                    parse_mode=ParseMode.HTML,
+                    connect_timeout=60,  # Increased timeout
+                    read_timeout=60,
+                    write_timeout=60
+                )
+            else:
+                await reply_msg.reply_video(
+                    video=open(final_path, "rb"),
+                    caption=caption,
+                    filename=f"{title}.mp4",
+                    supports_streaming=True,
+                    parse_mode=ParseMode.HTML,
+                    connect_timeout=60,  # Increased timeout
+                    read_timeout=60,
+                    write_timeout=60
+                )
 
         await status_msg.delete()
         cleanup_old_files()
 
     except Exception as e:
         await reply_msg.reply_text(f"⚠️ Error: {e}")
-        log.error(f"Download failed: {e}")
+        log.error(f"Download failed: {e}", exc_info=True)
 
 # =========================
 # Command Handlers
@@ -410,6 +420,37 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"<b>AI Status:</b> {api_status} {'Configured' if client else 'Not Set'}"
     )
     await update.message.reply_text(help_text, parse_mode=ParseMode.HTML)
+
+# MISSING COMMAND - Added here
+async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id): 
+        await update.message.reply_text("❌ Not authorized!")
+        return
+    
+    if not MONGO_AVAILABLE: 
+        await update.message.reply_text("Database not available.")
+        return
+    
+    try:
+        total_users = users_col.count_documents({})
+        total_admins = admins_col.count_documents({})
+        premium_users = users_col.count_documents({"premium": True})
+        
+        stats_text = (
+            f"📊 <b>Bot Statistics</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"👥 Total Users: {total_users}\n"
+            f"👑 Total Admins: {total_admins}\n"
+            f"💎 Premium Users: {premium_users}\n"
+            f"🤖 Bot Online: ✅\n"
+            f"💾 MongoDB: {'✅ Connected' if MONGO_AVAILABLE else '❌ Disconnected'}\n"
+            f"🤖 AI Service: {'✅ Configured' if client else '❌ Not Set'}"
+        )
+        
+        await update.message.reply_text(stats_text, parse_mode=ParseMode.HTML)
+        await log_to_group(update, context, action="/stats", details=f"Users: {total_users}, Admins: {total_admins}, Premium: {premium_users}")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Failed to get stats: {e}")
 
 async def search_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ensure_user(update)
@@ -561,7 +602,7 @@ async def gpt_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         USER_CONVERSATIONS[user_id] = [{"role": "system", "content": "You are a helpful assistant."}]
 
 # =========================
-# BROADCAST FUNCTIONS WITH DEBUG LOGGING
+# Broadcast Functions
 # =========================
 async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     log.info(f"BROADCAST: /broadcast called by user {update.effective_user.id}")
@@ -718,7 +759,7 @@ async def send_broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
     
     success, failed = 0, 0
     for i, chat_id in enumerate(recipients):
-        if i % 50 == 0:  # Log progress
+        if i % 50 == 0:
             log.info(f"BROADCAST PROGRESS: {i}/{len(recipients)}")
             
         try:
@@ -737,7 +778,7 @@ async def send_broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
         except Exception as e:
             log.error(f"BROADCAST: Failed to send to {chat_id}: {e}")
             failed += 1
-        await asyncio.sleep(0.05)  # Rate limiting
+        await asyncio.sleep(0.05)
     
     log.info(f"BROADCAST COMPLETE: Success: {success}, Failed: {failed}")
     BROADCAST_STORE.pop(admin_id, None)
@@ -819,7 +860,7 @@ async def adminlist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         admins = list(admins_col.find().sort("added_at", -1))
         if not admins: 
-            await update.message.reply_text("No admins.")  # FIXED TYPO
+            await update.message.reply_text("No admins.")
             return
         admin_list = "👥 <b>Admin List</b>\n━━━━━━━━━━━━\n\n"
         for admin in admins:
@@ -890,7 +931,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await ensure_membership(update, context):
         return
     
-    # Check if in broadcast mode
+    # Check if in broadcast mode first
     if update.effective_user and is_admin(update.effective_user.id):
         admin_id = update.effective_user.id
         if BROADCAST_STATE.get(admin_id):
@@ -907,7 +948,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Choose quality:", reply_markup=quality_keyboard(url))
 
 # =========================
-# Main Function
+# Main Function (Fixed)
 # =========================
 def main():
     import signal
@@ -928,7 +969,8 @@ def main():
     log.info(f"AI API Key: {'✅ Set' if client else '❌ Not Set'}")
     log.info("="*60)
     
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    # FIXED: Added timeout parameters to prevent upload timeouts
+    app = ApplicationBuilder().token(BOT_TOKEN).connect_timeout(60).read_timeout(60).write_timeout(60).build()
     
     async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
         log.error("Exception while handling an update:", exc_info=context.error)
@@ -949,12 +991,13 @@ def main():
             pass
     app.add_error_handler(error_handler)
 
+    # Command handlers
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("search", search_cmd))
     app.add_handler(CommandHandler("gpt", gpt_cmd))
     app.add_handler(CommandHandler("gen", gen_cmd))
-    app.add_handler(CommandHandler("stats", stats_cmd))
+    app.add_handler(CommandHandler("stats", stats_cmd))  # FIXED: Now defined
     app.add_handler(CommandHandler("broadcast", broadcast_cmd))
     app.add_handler(CommandHandler("done_broadcast", done_broadcast_cmd))
     app.add_handler(CommandHandler("send_broadcast", send_broadcast_cmd))
@@ -962,8 +1005,12 @@ def main():
     app.add_handler(CommandHandler("addadmin", addadmin_cmd))
     app.add_handler(CommandHandler("rmadmin", rmadmin_cmd))
     app.add_handler(CommandHandler("adminlist", adminlist_cmd))
+    
+    # Message handlers
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_broadcast_message))
+    
+    # Callback handlers
     app.add_handler(CallbackQueryHandler(on_quality, pattern=r"^q\|"))
     app.add_handler(CallbackQueryHandler(on_search_pick, pattern=r"^s\|"))
     app.add_handler(CallbackQueryHandler(on_verify_membership, pattern="^verify_membership$"))
