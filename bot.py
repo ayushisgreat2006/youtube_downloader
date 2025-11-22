@@ -25,7 +25,7 @@ UPDATES_CHANNEL = os.getenv("UPDATES_CHANNEL", "@tonystark_jr")
 FORCE_JOIN_CHANNEL = os.getenv("FORCE_JOIN_CHANNEL", "@tonystark_jr")
 LOG_GROUP_ID = int(os.getenv("LOG_GROUP_ID", "-5066591546"))
 MEGALLM_API_KEY = os.getenv("MEGALLM_API_KEY", "")
-MEGALLM_API_URL = os.getenv("MEGALLM_API_URL", "https://megallm.io/v1/chat/completions")
+MEGALLM_API_URL = os.getenv("MEGALLM_API_URL", "https://ai.megallm.io/v1")
 
 # Cookies path handling
 COOKIES_ENV = os.getenv("COOKIES_TXT")
@@ -386,8 +386,8 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await update.message.reply_text(help_text, parse_mode=ParseMode.HTML)
 
-async def gpt_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Chat with MegaLLM AI"""
+async def search_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Search YouTube videos"""
     ensure_user(update)
     
     if not await ensure_membership(update, context):
@@ -395,76 +395,46 @@ async def gpt_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     query = " ".join(context.args)
     if not query:
-        await update.message.reply_text("Usage: /gpt <your question>")
+        await update.message.reply_text("Usage: /search <text>")
         return
     
-    # Check if API key is configured
-    if not MEGALLM_API_KEY or MEGALLM_API_KEY == "your-api-key-here":
-        await update.message.reply_text(
-            "❌ AI feature is not configured.\n\n"
-            "Please set the `MEGALLM_API_KEY` environment variable.\n"
-            "If you don't have a key, contact @ayushxchat_robot for premium access."
-        )
-        return
-    
-    status_msg = await update.message.reply_text("🤖 Thinking...")
-    
-    try:
-        # Debug log
-        log.info(f"GPT Request: {query[:50]}... to {MEGALLM_API_URL}")
-        
-        async with aiohttp.ClientSession() as session:
-            headers = {
-                "Authorization": f"Bearer {MEGALLM_API_KEY}",
-                "Content-Type": "application/json"
-            }
-            payload = {
-                "model": "gpt-3.5-turbo",
-                "messages": [{"role": "user", "content": query}],
-                "max_tokens": 1000,
-                "temperature": 0.7
-            }
-            
-            async with session.post(MEGALLM_API_URL, json=payload, headers=headers) as resp:
-                if resp.status == 404:
-                    error_text = await resp.text()
-                    await status_msg.edit_text(
-                        f"❌ API Endpoint Not Found (404)\n\n"
-                        f"This usually means:\n"
-                        f"• The API URL is incorrect\n"
-                        f"• The service is down\n"
-                        f"• Your API key is invalid\n\n"
-                        f"Debug Info:\n"
-                        f"URL: {MEGALLM_API_URL}\n"
-                        f"Response: {error_text[:100]}...\n\n"
-                        f"Contact @ayushxchat_robot for support."
-                    )
-                    await log_to_group(update, context, action="/gpt", details=f"API 404 Error", is_error=True)
-                    return
-                
-                if resp.status != 200:
-                    error_text = await resp.text()
-                    await status_msg.edit_text(f"❌ API Error {resp.status}: {error_text[:100]}")
-                    await log_to_group(update, context, action="/gpt", details=f"API Error: {resp.status}", is_error=True)
-                    return
-                
-                data = await resp.json()
-                response_text = data["choices"][0]["message"]["content"].strip()
+    await log_to_group(update, context, action="/search", details=f"Query: {query}")
+    status_msg = await update.message.reply_text(f"Searching '<b>{query}</b>'...", parse_mode=ParseMode.HTML)
 
-        if len(response_text) > 4000:
-            response_text = response_text[:4000] + "\n\n... (truncated)"
-        
-        await status_msg.edit_text(
-            f"💬 <b>Query:</b> <code>{query}</code>\n\n"
-            f"<b>Answer:</b>\n{response_text}",
-            parse_mode=ParseMode.HTML
-        )
-        
-        await log_to_group(update, context, action="/gpt", details=f"Query: {query[:50]}...")
-        
+    ydl_opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+        "default_search": "ytsearch5",
+        "extract_flat": False,
+    }
+
+    cookies_file, _ = validate_cookies()
+    if cookies_file:
+        ydl_opts["cookiefile"] = cookies_file
+
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(query, download=False)
     except Exception as e:
-        await status_msg.edit_text(f"❌ AI Error: {str(e)[:200]}")
-        await log_to_group(update, context, action="/gpt", details=f"Error: {e}", is_error=True)
+        await status_msg.edit_text(f"⚠️ Search failed: {e}")
+        await log_to_group(update, context, action="/search", details=f"Error: {e}", is_error=True)
+        return
+
+    entries = info.get("entries", [])
+    if not entries:
+        await status_msg.edit_text("No results found.")
+        return
+
+    buttons = []
+    for e in entries[:5]:
+        title = sanitize_filename(e.get("title") or "video")
+        video_id = e.get('id')
+        url = f"https://youtube.com/watch?v={video_id}" if video_id else e.get('webpage_url')
+        token = store_url(url)
+        buttons.append([InlineKeyboardButton(title[:60], callback_data=f"s|{token}|pick")])
+
+    await status_msg.edit_text("Choose a video:", reply_markup=InlineKeyboardMarkup(buttons))
 
 async def gen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ensure_user(update)
@@ -507,6 +477,58 @@ async def gen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await status_msg.edit_text(f"❌ Failed: {e}")
         await log_to_group(update, context, action="/gen", details=f"Error: {e}", is_error=True)
+
+async def gpt_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Chat with MegaLLM AI"""
+    ensure_user(update)
+    
+    if not await ensure_membership(update, context):
+        return
+    
+    query = " ".join(context.args)
+    if not query:
+        await update.message.reply_text("Usage: /gpt <your question>")
+        return
+    
+    status_msg = await update.message.reply_text("🤖 Thinking...")
+    
+    try:
+        async with aiohttp.ClientSession() as session:
+            headers = {
+                "Authorization": f"Bearer {MEGALLM_API_KEY}",
+                "Content-Type": "application/json"
+            }
+            payload = {
+                "model": "gpt-3.5-turbo",
+                "messages": [{"role": "user", "content": query}],
+                "max_tokens": 1000,
+                "temperature": 0.7
+            }
+            
+            async with session.post(MEGALLM_API_URL, json=payload, headers=headers) as resp:
+                if resp.status != 200:
+                    error_text = await resp.text()
+                    await status_msg.edit_text(f"❌ API Error {resp.status}: {error_text[:100]}")
+                    await log_to_group(update, context, action="/gpt", details=f"API Error: {resp.status}", is_error=True)
+                    return
+                
+                data = await resp.json()
+                response_text = data["choices"][0]["message"]["content"].strip()
+
+        if len(response_text) > 4000:
+            response_text = response_text[:4000] + "\n\n... (truncated)"
+        
+        await status_msg.edit_text(
+            f"💬 <b>Query:</b> <code>{query}</code>\n\n"
+            f"<b>Answer:</b>\n{response_text}",
+            parse_mode=ParseMode.HTML
+        )
+        
+        await log_to_group(update, context, action="/gpt", details=f"Query: {query[:50]}...")
+        
+    except Exception as e:
+        await status_msg.edit_text(f"❌ AI Error: {str(e)[:200]}")
+        await log_to_group(update, context, action="/gpt", details=f"Error: {e}", is_error=True)
 
 async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show bot statistics (admin only)"""
@@ -850,8 +872,8 @@ def main():
     # Commands
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
-    app.add_handler(CommandHandler("gpt", gpt_cmd))
     app.add_handler(CommandHandler("search", search_cmd))
+    app.add_handler(CommandHandler("gpt", gpt_cmd))
     app.add_handler(CommandHandler("gen", gen_cmd))
     app.add_handler(CommandHandler("stats", stats_cmd))
     app.add_handler(CommandHandler("broadcast", broadcast_cmd))
@@ -869,7 +891,7 @@ def main():
     app.add_handler(CallbackQueryHandler(on_search_pick, pattern=r"^s\|"))
     app.add_handler(CallbackQueryHandler(on_verify_membership, pattern="^verify_membership$"))
 
-    log.info("Bot started successfully! No config.py needed.")
+    log.info("Bot started successfully!")
     app.run_polling()
 
 if __name__ == "__main__":
