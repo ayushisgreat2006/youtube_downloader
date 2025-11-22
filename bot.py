@@ -535,7 +535,7 @@ async def gpt_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         # Simple, direct API call as you requested
         response = client.chat.completions.create(
-            model="GPT-5",
+            model="gpt-3.5-turbo",
             messages=USER_CONVERSATIONS[user_id],
             max_tokens=1000,
             temperature=0.7
