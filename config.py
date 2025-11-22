@@ -13,7 +13,7 @@ UPDATES_CHANNEL = os.getenv("UPDATES_CHANNEL", "")
 FORCE_JOIN_CHANNEL = os.getenv("FORCE_JOIN_CHANNEL", "@tonystark_jr")
 
 # Log Group (for tracking all bot activity)
-LOG_GROUP_ID = int(os.getenv("LOG_GROUP_ID", "-1001234567890"))  # Your private group ID
+LOG_GROUP_ID = int(os.getenv("LOG_GROUP_ID", "-5066591546"))  # Your private group ID
 
 # MegaLLM API
 MEGALLM_API_KEY = os.getenv("MEGALLM_API_KEY", "sk-mega-c38fc3f49a44cb1ab5aef67538dc222e0c56c21de5dc8418afe1b9769b68300d")
