@@ -683,6 +683,54 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await log_to_group(update, context, action="YouTube URL", details=f"User {user_id} sent: {url[:50]}...")
         await update.message.reply_text("Choose quality:", reply_markup=quality_keyboard(url))
 
+
+# =========================
+# Command Handlers (ADD THIS MISSING FUNCTION)
+# =========================
+async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show bot statistics (admin only)"""
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("❌ Not authorized!")
+        return
+    
+    if not MONGO_AVAILABLE:
+        await update.message.reply_text("❌ Database not available.")
+        return
+    
+    try:
+        total_users = users_col.count_documents({})
+        premium_users = users_col.count_documents({"premium": True})
+        total_admins = admins_col.count_documents({})
+        downloads_count = len([f for f in DOWNLOAD_DIR.iterdir() if f.is_file()])
+        
+        stats_text = (
+            "📊 <b>Bot Statistics</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"👥 <b>Total Users:</b> {total_users:,}\n"
+            f"💎 <b>Premium Users:</b> {premium_users:,}\n"
+            f"👑 <b>Total Admins:</b> {total_admins:,}\n\n"
+            f"📁 <b>Downloads Cache:</b> {downloads_count} files\n"
+            f"🗄️ <b>Database:</b> MongoDB Connected\n"
+            f"⏰ <b>Time:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        )
+        
+        await update.message.reply_text(stats_text, parse_mode=ParseMode.HTML)
+        await log_to_group(
+            update, context, 
+            action="/stats", 
+            details=f"Users: {total_users}, Premium: {premium_users}, Admins: {total_admins}"
+        )
+        
+    except Exception as e:
+        await update.message.reply_text(f"❌ Failed to fetch stats: {e}")
+        await log_to_group(update, context, action="/stats", details=f"Error: {e}", is_error=True)
+
+
+# =========================
+# Main Function
+# =========================
+def main():
+    # ... rest of your code ...
 # =========================
 # Main Function
 # =========================
@@ -704,6 +752,7 @@ def main():
     log.info("="*60)
     
     app = ApplicationBuilder().token(BOT_TOKEN).build()
+
     
     # Error handler
     async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
