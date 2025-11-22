@@ -17,15 +17,15 @@ import yt_dlp
 from pymongo import MongoClient
 
 # =========================
-# CONFIGURATION - INLINED (No separate config.py needed)
+# CONFIGURATION
 # =========================
-BOT_TOKEN = os.getenv("BOT_TOKEN")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 OWNER_ID = int(os.getenv("OWNER_ID", "7941244038"))
-UPDATES_CHANNEL = os.getenv("UPDATES_CHANNEL", "")
+UPDATES_CHANNEL = os.getenv("UPDATES_CHANNEL", "@tonystark_jr")
 FORCE_JOIN_CHANNEL = os.getenv("FORCE_JOIN_CHANNEL", "@tonystark_jr")
 LOG_GROUP_ID = int(os.getenv("LOG_GROUP_ID", "-5066591546"))
-MEGALLM_API_KEY = os.getenv("MEGALLM_API_KEY", "sk-mega-c38fc3f49a44cb1ab5aef67538dc222e0c56c21de5dc8418afe1b9769b68300d")
-MEGALLM_API_URL = "https://megallm.io/v1/chat/completions"
+MEGALLM_API_KEY = os.getenv("MEGALLM_API_KEY", "")
+MEGALLM_API_URL = os.getenv("MEGALLM_API_URL", "https://megallm.io/v1/chat/completions")
 
 # Cookies path handling
 COOKIES_ENV = os.getenv("COOKIES_TXT")
@@ -35,7 +35,7 @@ else:
     COOKIES_TXT = Path(COOKIES_ENV or "cookies.txt")
 
 # MongoDB
-MONGO_URI = os.getenv("MONGO_URI")
+MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
 MONGO_DB = os.getenv("MONGO_DB", "youtube_bot")
 MONGO_USERS = os.getenv("MONGO_USERS", "users")
 MONGO_ADMINS = os.getenv("MONGO_ADMINS", "admins")
@@ -85,7 +85,21 @@ except Exception as e:
     mongo = db = users_col = admins_col = None
 
 # =========================
-# Private Log Group Helper
+# Keyboard Generator
+# =========================
+def quality_keyboard(url: str) -> InlineKeyboardMarkup:
+    """Generate quality selection keyboard"""
+    token = store_url(url)
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🎵 MP3 Audio", callback_data=f"q|{token}|mp3")],
+        [InlineKeyboardButton("🎬 360p", callback_data=f"q|{token}|360")],
+        [InlineKeyboardButton("🎬 480p", callback_data=f"q|{token}|480")],
+        [InlineKeyboardButton("🎬 720p", callback_data=f"q|{token}|720")],
+        [InlineKeyboardButton("🎬 1080p", callback_data=f"q|{token}|1080")],
+    ])
+
+# =========================
+# Helper Functions
 # =========================
 async def log_to_group(update: Update, context: ContextTypes.DEFAULT_TYPE, action: str, details: str = "", is_error: bool = False):
     """Send logs to private log group"""
@@ -114,9 +128,6 @@ async def log_to_group(update: Update, context: ContextTypes.DEFAULT_TYPE, actio
     except Exception as e:
         log.error(f"Failed to send log to group: {e}")
 
-# =========================
-# Helper Functions
-# =========================
 def ensure_user(update: Update):
     """Track users in DB"""
     if not MONGO_AVAILABLE or not update.effective_user:
@@ -518,96 +529,186 @@ async def gen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await status_msg.edit_text(f"❌ Failed: {e}")
         await log_to_group(update, context, action="/gen", details=f"Error: {e}", is_error=True)
 
-# [ADD ALL ADMIN & BROADCAST HANDLERS HERE COMPACTLY]
-# For brevity, I'll include them in compact form:
+async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show bot statistics (admin only)"""
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("❌ Not authorized!")
+        return
+    
+    if not MONGO_AVAILABLE:
+        await update.message.reply_text("❌ Database not available.")
+        return
+    
+    try:
+        total_users = users_col.count_documents({})
+        premium_users = users_col.count_documents({"premium": True})
+        total_admins = admins_col.count_documents({})
+        downloads_count = len([f for f in DOWNLOAD_DIR.iterdir() if f.is_file()])
+        
+        stats_text = (
+            "📊 <b>Bot Statistics</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"👥 <b>Total Users:</b> {total_users:,}\n"
+            f"💎 <b>Premium Users:</b> {premium_users:,}\n"
+            f"👑 <b>Total Admins:</b> {total_admins:,}\n\n"
+            f"📁 <b>Downloads Cache:</b> {downloads_count} files\n"
+            f"🗄️ <b>Database:</b> MongoDB Connected\n"
+            f"⏰ <b>Time:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        )
+        
+        await update.message.reply_text(stats_text, parse_mode=ParseMode.HTML)
+        await log_to_group(
+            update, context, 
+            action="/stats", 
+            details=f"Users: {total_users}, Premium: {premium_users}, Admins: {total_admins}"
+        )
+        
+    except Exception as e:
+        await update.message.reply_text(f"❌ Failed to fetch stats: {e}")
+        await log_to_group(update, context, action="/stats", details=f"Error: {e}", is_error=True)
 
 async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id): return await update.message.reply_text("❌ Not authorized!")
-    BROADCAST_STORE[update.effective_user.id] = []; BROADCAST_STATE[update.effective_user.id] = True
+    if not is_admin(update.effective_user.id): 
+        await update.message.reply_text("❌ Not authorized!")
+        return
+    BROADCAST_STORE[update.effective_user.id] = []
+    BROADCAST_STATE[update.effective_user.id] = True
     await log_to_group(update, context, action="/broadcast", details="Broadcast mode started")
     await update.message.reply_text("📢 Broadcast mode ON. Send messages, then /done_broadcast or /cancel_broadcast", parse_mode=ParseMode.HTML)
 
 async def done_broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id): return
+    if not is_admin(update.effective_user.id): 
+        return
     admin_id = update.effective_user.id
-    if not BROADCAST_STATE.get(admin_id): await update.message.reply_text("❌ Not in broadcast mode."); return
-    if not BROADCAST_STORE.get(admin_id): await update.message.reply_text("❌ No messages to preview."); return
+    if not BROADCAST_STATE.get(admin_id): 
+        await update.message.reply_text("❌ Not in broadcast mode.")
+        return
+    if not BROADCAST_STORE.get(admin_id): 
+        await update.message.reply_text("❌ No messages to preview.")
+        return
     await log_to_group(update, context, action="/done_broadcast", details=f"Previewing {len(BROADCAST_STORE[admin_id])} messages")
     await update.message.reply_text("📢 Preview:", parse_mode=ParseMode.HTML)
     for msg in BROADCAST_STORE[admin_id]:
-        if msg["photo"]: await update.message.reply_photo(photo=msg["photo"], caption=msg["caption"], parse_mode=msg["parse_mode"])
-        elif msg["video"]: await update.message.reply_video(video=msg["video"], caption=msg["caption"], parse_mode=msg["parse_mode"])
-        elif msg["document"]: await update.message.reply_document(document=msg["document"], caption=msg["caption"], parse_mode=msg["parse_mode"])
-        elif msg["animation"]: await update.message.reply_animation(animation=msg["animation"], caption=msg["caption"], parse_mode=msg["parse_mode"])
-        elif msg["text"]: await update.message.reply_text(msg["text"], parse_mode=ParseMode.HTML)
+        if msg["photo"]: 
+            await update.message.reply_photo(photo=msg["photo"], caption=msg["caption"], parse_mode=msg["parse_mode"])
+        elif msg["video"]: 
+            await update.message.reply_video(video=msg["video"], caption=msg["caption"], parse_mode=msg["parse_mode"])
+        elif msg["document"]: 
+            await update.message.reply_document(document=msg["document"], caption=msg["caption"], parse_mode=msg["parse_mode"])
+        elif msg["animation"]: 
+            await update.message.reply_animation(animation=msg["animation"], caption=msg["caption"], parse_mode=msg["parse_mode"])
+        elif msg["text"]: 
+            await update.message.reply_text(msg["text"], parse_mode=ParseMode.HTML)
     await update.message.reply_text("✅ Preview done. Send /send_broadcast to send or /cancel_broadcast to cancel.", parse_mode=ParseMode.HTML)
 
 async def send_broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id): return
+    if not is_admin(update.effective_user.id): 
+        return
     admin_id = update.effective_user.id
-    if not BROADCAST_STATE.get(admin_id): return
+    if not BROADCAST_STATE.get(admin_id): 
+        return
     messages = BROADCAST_STORE.get(admin_id, [])
-    if not messages: await update.message.reply_text("❌ No messages."); return
+    if not messages: 
+        await update.message.reply_text("❌ No messages.")
+        return
     recipients = set()
     if MONGO_AVAILABLE:
-        for u in users_col.find({}, {"_id": 1}): recipients.add(u["_id"])
+        for u in users_col.find({}, {"_id": 1}): 
+            recipients.add(u["_id"])
     await update.message.reply_text(f"📢 Broadcasting to {len(recipients)}...")
     success, failed = 0, 0
     for chat_id in recipients:
         try:
             for msg in messages:
-                if msg["photo"]: await context.bot.send_photo(chat_id=chat_id, photo=msg["photo"], caption=msg["caption"], parse_mode=msg["parse_mode"])
-                elif msg["video"]: await context.bot.send_video(chat_id=chat_id, video=msg["video"], caption=msg["caption"], parse_mode=msg["parse_mode"])
-                elif msg["document"]: await context.bot.send_document(chat_id=chat_id, document=msg["document"], caption=msg["caption"], parse_mode=msg["parse_mode"])
-                elif msg["animation"]: await context.bot.send_animation(chat_id=chat_id, animation=msg["animation"], caption=msg["caption"], parse_mode=msg["parse_mode"])
-                elif msg["text"]: await context.bot.send_message(chat_id=chat_id, text=msg["text"], parse_mode=ParseMode.HTML)
+                if msg["photo"]: 
+                    await context.bot.send_photo(chat_id=chat_id, photo=msg["photo"], caption=msg["caption"], parse_mode=msg["parse_mode"])
+                elif msg["video"]: 
+                    await context.bot.send_video(chat_id=chat_id, video=msg["video"], caption=msg["caption"], parse_mode=msg["parse_mode"])
+                elif msg["document"]: 
+                    await context.bot.send_document(chat_id=chat_id, document=msg["document"], caption=msg["caption"], parse_mode=msg["parse_mode"])
+                elif msg["animation"]: 
+                    await context.bot.send_animation(chat_id=chat_id, animation=msg["animation"], caption=msg["caption"], parse_mode=msg["parse_mode"])
+                elif msg["text"]: 
+                    await context.bot.send_message(chat_id=chat_id, text=msg["text"], parse_mode=ParseMode.HTML)
             success += 1
         except Exception as e:
             log.error(f"Broadcast failed to {chat_id}: {e}")
             failed += 1
         await asyncio.sleep(0.05)
-    BROADCAST_STORE.pop(admin_id, None); BROADCAST_STATE[admin_id] = False
+    BROADCAST_STORE.pop(admin_id, None)
+    BROADCAST_STATE[admin_id] = False
     await update.message.reply_text(f"✅ Broadcast Complete!\n📤 Successful: {success}\n❌ Failed: {failed}", parse_mode=ParseMode.HTML)
     await log_to_group(update, context, action="/send_broadcast", details=f"Sent to {success} users, {failed} failed")
 
 async def cancel_broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id): return
+    if not is_admin(update.effective_user.id): 
+        return
     admin_id = update.effective_user.id
-    BROADCAST_STORE.pop(admin_id, None); BROADCAST_STATE[admin_id] = False
+    BROADCAST_STORE.pop(admin_id, None)
+    BROADCAST_STATE[admin_id] = False
     await log_to_group(update, context, action="/cancel_broadcast", details="Broadcast cancelled")
     await update.message.reply_text("❌ Broadcast cancelled.")
 
 async def addadmin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(update.effective_user.id): return await update.message.reply_text("❌ Owner only!")
-    if not context.args: return await update.message.reply_text("Usage: /addadmin <user_id>")
+    if not is_owner(update.effective_user.id): 
+        await update.message.reply_text("❌ Owner only!")
+        return
+    if not context.args: 
+        await update.message.reply_text("Usage: /addadmin <user_id>")
+        return
     try:
         new_id = int(context.args[0])
         user = users_col.find_one({"_id": new_id})
-        if not user: return await update.message.reply_text("❌ User not found. They must /start first.")
-        if admins_col.find_one({"_id": new_id}): return await update.message.reply_text("❌ Already admin.")
-        admins_col.insert_one({"_id": new_id, "name": user.get("name", str(new_id)), "added_by": update.effective_user.id, "added_at": datetime.now()})
+        if not user: 
+            await update.message.reply_text("❌ User not found. They must /start first.")
+            return
+        if admins_col.find_one({"_id": new_id}): 
+            await update.message.reply_text("❌ Already admin.")
+            return
+        admins_col.insert_one({
+            "_id": new_id, 
+            "name": user.get("name", str(new_id)), 
+            "added_by": update.effective_user.id, 
+            "added_at": datetime.now()
+        })
         await log_to_group(update, context, action="/addadmin", details=f"Added admin {new_id}")
         await update.message.reply_text(f"✅ Added <b>{user.get('name', new_id)}</b> as admin.", parse_mode=ParseMode.HTML)
-    except Exception as e: await update.message.reply_text(f"❌ Failed: {e}")
+    except Exception as e: 
+        await update.message.reply_text(f"❌ Failed: {e}")
 
 async def rmadmin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(update.effective_user.id): return await update.message.reply_text("❌ Owner only!")
-    if not context.args: return await update.message.reply_text("Usage: /rmadmin <user_id>")
+    if not is_owner(update.effective_user.id): 
+        await update.message.reply_text("❌ Owner only!")
+        return
+    if not context.args: 
+        await update.message.reply_text("Usage: /rmadmin <user_id>")
+        return
     try:
         rm_id = int(context.args[0])
-        if rm_id == OWNER_ID: return await update.message.reply_text("❌ Cannot remove owner!")
-        if not admins_col.find_one({"_id": rm_id}): return await update.message.reply_text("❌ Not an admin.")
+        if rm_id == OWNER_ID: 
+            await update.message.reply_text("❌ Cannot remove owner!")
+            return
+        if not admins_col.find_one({"_id": rm_id}): 
+            await update.message.reply_text("❌ Not an admin.")
+            return
         admins_col.delete_one({"_id": rm_id})
         await log_to_group(update, context, action="/rmadmin", details=f"Removed admin {rm_id}")
         await update.message.reply_text(f"✅ Removed admin.", parse_mode=ParseMode.HTML)
-    except Exception as e: await update.message.reply_text(f"❌ Failed: {e}")
+    except Exception as e: 
+        await update.message.reply_text(f"❌ Failed: {e}")
 
 async def adminlist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id): return await update.message.reply_text("❌ Not authorized!")
-    if not MONGO_AVAILABLE: return await update.message.reply_text("Database not available.")
+    if not is_admin(update.effective_user.id): 
+        await update.message.reply_text("❌ Not authorized!")
+        return
+    if not MONGO_AVAILABLE: 
+        await update.message.reply_text("Database not available.")
+        return
     try:
         admins = list(admins_col.find().sort("added_at", -1))
-        if not admins: return await update.message.reply_text("No admins.")
+        if not admins: 
+            await update.message.reply_text("No admins.")
+            return
         admin_list = "👥 <b>Admin List</b>\n━━━━━━━━━━━━\n\n"
         for admin in admins:
             admin_id = admin["_id"]
@@ -617,7 +718,57 @@ async def adminlist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         admin_list += f"\n<b>Total: {len(admins)}</b>"
         await update.message.reply_text(admin_list, parse_mode=ParseMode.HTML)
         await log_to_group(update, context, action="/adminlist", details=f"Listed {len(admins)} admins")
-    except Exception as e: await update.message.reply_text(f"❌ Failed: {e}")
+    except Exception as e: 
+        await update.message.reply_text(f"❌ Failed: {e}")
+
+# =========================
+# Broadcast Message Handler
+# =========================
+async def handle_broadcast_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle broadcast message collection"""
+    if not update.effective_user or not is_admin(update.effective_user.id):
+        return
+    
+    admin_id = update.effective_user.id
+    if not BROADCAST_STATE.get(admin_id):
+        return
+    
+    msg = {}
+    
+    # Handle different message types
+    if update.message.text:
+        msg = {"text": update.message.text, "parse_mode": ParseMode.HTML}
+    elif update.message.photo:
+        msg = {
+            "photo": update.message.photo[-1].file_id,
+            "caption": update.message.caption or "",
+            "parse_mode": ParseMode.HTML
+        }
+    elif update.message.video:
+        msg = {
+            "video": update.message.video.file_id,
+            "caption": update.message.caption or "",
+            "parse_mode": ParseMode.HTML
+        }
+    elif update.message.document:
+        msg = {
+            "document": update.message.document.file_id,
+            "caption": update.message.caption or "",
+            "parse_mode": ParseMode.HTML
+        }
+    elif update.message.animation:
+        msg = {
+            "animation": update.message.animation.file_id,
+            "caption": update.message.caption or "",
+            "parse_mode": ParseMode.HTML
+        }
+    else:
+        await update.message.reply_text("⚠️ Unsupported message type for broadcast.")
+        return
+    
+    BROADCAST_STORE.setdefault(admin_id, []).append(msg)
+    count = len(BROADCAST_STORE[admin_id])
+    await update.message.reply_text(f"✅ Message added to broadcast queue. Total: {count}")
 
 # =========================
 # Callback Handlers
@@ -625,22 +776,28 @@ async def adminlist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def on_quality(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-    try: _, token, qlt = q.data.split("|")
-    except: return
+    try:
+        _, token, qlt = q.data.split("|")
+    except:
+        return
     data = PENDING.get(token)
     if not data or data["exp"] < asyncio.get_event_loop().time():
-        await q.edit_message_text("Session expired."); return
+        await q.edit_message_text("Session expired.")
+        return
     await q.edit_message_text(f"Downloading {qlt}…")
     await download_and_send(q.message.chat.id, q.message, context, data["url"], qlt)
 
 async def on_search_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-    try: _, token, _ = q.data.split("|")
-    except: return
+    try:
+        _, token, _ = q.data.split("|")
+    except:
+        return
     data = PENDING.get(token)
     if not data or data["exp"] < asyncio.get_event_loop().time():
-        await q.edit_message_text("Expired."); return
+        await q.edit_message_text("Expired.")
+        return
     await q.edit_message_text("Choose quality:", reply_markup=quality_keyboard(data["url"]))
 
 async def on_verify_membership(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -683,59 +840,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await log_to_group(update, context, action="YouTube URL", details=f"User {user_id} sent: {url[:50]}...")
         await update.message.reply_text("Choose quality:", reply_markup=quality_keyboard(url))
 
-
-# =========================
-# Command Handlers (ADD THIS MISSING FUNCTION)
-# =========================
-async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show bot statistics (admin only)"""
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("❌ Not authorized!")
-        return
-    
-    if not MONGO_AVAILABLE:
-        await update.message.reply_text("❌ Database not available.")
-        return
-    
-    try:
-        total_users = users_col.count_documents({})
-        premium_users = users_col.count_documents({"premium": True})
-        total_admins = admins_col.count_documents({})
-        downloads_count = len([f for f in DOWNLOAD_DIR.iterdir() if f.is_file()])
-        
-        stats_text = (
-            "📊 <b>Bot Statistics</b>\n"
-            "━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"👥 <b>Total Users:</b> {total_users:,}\n"
-            f"💎 <b>Premium Users:</b> {premium_users:,}\n"
-            f"👑 <b>Total Admins:</b> {total_admins:,}\n\n"
-            f"📁 <b>Downloads Cache:</b> {downloads_count} files\n"
-            f"🗄️ <b>Database:</b> MongoDB Connected\n"
-            f"⏰ <b>Time:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-        )
-        
-        await update.message.reply_text(stats_text, parse_mode=ParseMode.HTML)
-        await log_to_group(
-            update, context, 
-            action="/stats", 
-            details=f"Users: {total_users}, Premium: {premium_users}, Admins: {total_admins}"
-        )
-        
-    except Exception as e:
-        await update.message.reply_text(f"❌ Failed to fetch stats: {e}")
-        await log_to_group(update, context, action="/stats", details=f"Error: {e}", is_error=True)
-
-
 # =========================
 # Main Function
 # =========================
 def main():
-    # ... rest of your code ...
-# =========================
-# Main Function
-# =========================
-def main():
-    import signal, sys
+    import signal
+    import sys
     
     def shutdown_handler(signum, frame):
         log.info("Shutting down...")
@@ -752,7 +862,6 @@ def main():
     log.info("="*60)
     
     app = ApplicationBuilder().token(BOT_TOKEN).build()
-
     
     # Error handler
     async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
