@@ -2,5 +2,5 @@ python-telegram-bot==20.7
 yt-dlp
 pymongo
 aiohttp
-openai
+groq
 python-dotenv
