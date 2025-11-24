@@ -931,8 +931,121 @@ async def gen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await status_msg.edit_text(f"❌ Failed: {e}")
         await log_to_group(update, context, action="/gen", details=f"Error: {e}", is_error=True)
 
-async def gpt_cmd
+# Replace your existing gpt_cmd function with this:
 
+async def gpt_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """AI Chat command - accessible to ALL users with credit limits"""
+    
+    # DEBUG LOGGING - Remove after testing
+    log.info(f"🔍 GPT_CMD STARTED | User: {update.effective_user.id if update.effective_user else 'NONE'}")
+    
+    # Ensure user exists in database
+    ensure_user(update)
+    
+    # Check membership (with error handling)
+    try:
+        if not await ensure_membership(update, context):
+            log.info(f"❌ GPT_CMD BLOCKED: Membership check failed for {update.effective_user.id}")
+            return
+    except Exception as e:
+        log.error(f"💥 GPT_CMD Membership check crashed: {e}", exc_info=True)
+        await update.message.reply_text("❌ Error checking membership. Please try again.")
+        return
+    
+    # Validate query
+    query = " ".join(context.args)
+    if not query:
+        await update.message.reply_text("Usage: /gpt <your question>")
+        return
+    
+    # Check AI client
+    if not groq_client:
+        await update.message.reply_text("❌ AI not configured. Contact admin.", parse_mode=ParseMode.HTML)
+        return
+    
+    user_id = update.effective_user.id
+    
+    # CREDIT CHECK - MAIN FIX
+    try:
+        credits, used, is_whitelisted = await get_user_credits(user_id)
+        remaining = credits - used
+        
+        # DEBUG LOGGING
+        log.info(f"💳 CREDIT_CHECK | User: {user_id} | Credits: {credits} | Used: {used} | Remaining: {remaining}")
+        
+    except Exception as e:
+        log.error(f"💥 CREDIT_CHECK FAILED for {user_id}: {e}", exc_info=True)
+        # Fallback to base credits if check fails
+        credits, used, is_whitelisted = BASE_CREDITS, 0, False
+        remaining = credits
+    
+    # Check if user has credits left
+    if remaining <= 0:
+        no_credits_text = (
+            f"❌ <b>No Credits Remaining!</b>\n\n"
+            f"📊 Your daily limit: {credits}\n"
+            f"✅ Used: {used}\n\n"
+            f"<b>Get more credits:</b>\n"
+            f"• /refer - Generate referral code (+{REFERRER_BONUS} per friend)\n"
+            f"• /claim - Claim someone's code (+{CLAIMER_BONUS})\n"
+            f"• Contact {PREMIUM_BOT_USERNAME} for premium access\n\n"
+            f"Use /credits to check your balance"
+        )
+        await update.message.reply_text(no_credits_text, parse_mode=ParseMode.HTML)
+        await log_to_group(update, context, action="/gpt", details=f"User {user_id} out of credits (used {used}/{credits})")
+        return
+    
+    # Processing message
+    status_msg = await update.message.reply_text(f"🤖 Processing... (Credits left: {remaining-1})")
+    
+    # Initialize conversation
+    if user_id not in USER_CONVERSATIONS:
+        USER_CONVERSATIONS[user_id] = [
+            {"role": "system", "content": "You are a helpful assistant. Be concise and clear."}
+        ]
+    
+    USER_CONVERSATIONS[user_id].append({"role": "user", "content": query})
+    
+    try:
+        # Call Groq API
+        response = groq_client.chat.completions.create(
+            model=GROQ_MODEL,
+            messages=USER_CONVERSATIONS[user_id],
+            max_tokens=1000,
+            temperature=0.7
+        )
+        
+        answer = response.choices[0].message.content
+        USER_CONVERSATIONS[user_id].append({"role": "assistant", "content": answer})
+        
+        # Limit conversation history
+        if len(USER_CONVERSATIONS[user_id]) > 10:
+            USER_CONVERSATIONS[user_id] = [USER_CONVERSATIONS[user_id][0]] + USER_CONVERSATIONS[user_id][-9:]
+        
+        # Truncate if too long
+        if len(answer) > 4000:
+            answer = answer[:4000] + "\n\n... (truncated)"
+        
+        # Send response
+        await status_msg.edit_text(
+            f"💬 <b>Query:</b> <code>{query}</code>\n\n"
+            f"<b>Answer:</b>\n{answer}",
+            parse_mode=ParseMode.HTML
+        )
+        
+        # Consume credit
+        credit_success = await consume_credit(user_id)
+        log.info(f"✅ GPT_CMD SUCCESS | User: {user_id} | Credit consumed: {credit_success}")
+        
+        # Log to group
+        await log_to_group(update, context, action="/gpt", 
+                         details=f"User {user_id}: {query[:50]}... | Remaining: {remaining-1}")
+        
+    except Exception as e:
+        log.error(f"💥 GPT_CMD AI ERROR for {user_id}: {e}", exc_info=True)
+        await status_msg.edit_text(f"❌ AI Error: {str(e)[:200]}")
+        await log_to_group(update, context, action="/gpt", details=f"Error: {e}", is_error=True)
+        USER_CONVERSATIONS[user_id] = [{"role": "system", "content": "You are a helpful assistant."}]
 # =========================
 # Broadcast Functions (FIXED)
 # =========================
