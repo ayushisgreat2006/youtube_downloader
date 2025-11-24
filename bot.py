@@ -520,19 +520,26 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await log_to_group(update, context, action="/start", details="User started bot")
     
+    # Check cookies status
+    cookies_path = Path(COOKIES_FILE)
+    cookies_working = cookies_path.exists() and cookies_path.stat().st_size > 0
+    
     start_text = (
         "<b>🎧 Welcome to SpotifyX Musix Bot 🎧</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
         "<b>🔥 Features:</b>\n"
-        "• Search or send link to download YouTube 🔍\n"
+        "• Download MP3 music 🎧\n"
+        "• Download Videos (360p-1080p) 🎬\n"
+        "• Search YouTube 🔍\n"
         "• Generate AI images 🎨\n"
         "• AI Chat with Groq 💬\n"
         "• Premium: Up to 450MB files 💳\n\n"
         "<b>💳 Credits:</b> 20 queries/day\n"
-        "<b>🎁 Refer:</b> /refer to earn more\n"
-        "<b>GET PREMIUM</b> @ayushxchat_robot\n\n"
-        "<b>📌 Use /help for commands</b>\n"
-        "<b> Made with <3 by @mahadev_ki_iccha\n"
+        "<b> OR CONTACT @ayushxchat_robot FOR PREMIUM/n"
+        "<b>🎁 Refer:</b> /refer to earn more\n\n"
+        f"<b>📌 Cookies Status:</b> {'✅ Working' if cookies_working else '❌ Not configured'}\n"
+        f"<b>📌 Use /help for commands</b>\n\n"
+        "<b>⚠️ YouTube Notice:</b> If search fails, cookies may need refresh. Use /testcookies"
     )
     await update.message.reply_text(start_text, parse_mode=ParseMode.HTML)
 
@@ -540,6 +547,9 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ensure_user(update)
     
     ai_status = "✅" if groq_client else "❌"
+    
+    cookies_path = Path(COOKIES_FILE)
+    cookies_working = cookies_path.exists() and cookies_path.stat().st_size > 0
     
     help_text = (
         "<b>✨ SpotifyX Musix Bot — Commands ✨</b>\n"
@@ -553,20 +563,21 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "<code>/refer</code> — Generate referral code\n"
         "<code>/claim &lt;code&gt;</code> — Claim referral code\n"
         "<code>/redeem &lt;code&gt;</code> — Redeem admin code\n"
-        "<code>/credits</code> — Check your credits\n"
-        "<code>/testcookies</code> — Test YouTube cookies (Admin)\n\n"
+        "<code>/credits</code> — Check your credits\n\n"
         "<b>Admin Commands:</b>\n"
         "<code>/stats</code> — View statistics\n"
         "<code>/broadcast</code> — Broadcast message\n"
         "<code>/adminlist</code> — List admins\n"
         "<code>/gen_redeem &lt;value&gt; &lt;code&gt;</code> — Generate redeem code\n"
-        "<code>/whitelist_ai &lt;id&gt; &lt;value&gt;</code> — Whitelist user\n\n"
+        "<code>/whitelist_ai &lt;id&gt; &lt;value&gt;</code> — Whitelist user\n"
+        "<code>/testcookies</code> — Test YouTube cookies\n\n"
         "<b>Owner Commands:</b>\n"
         "<code>/addadmin &lt;id&gt;</code> — Add admin\n"
         "<code>/rmadmin &lt;id&gt;</code> — Remove admin\n\n"
         f"<b>Updates:</b> {UPDATES_CHANNEL}\n"
         f"<b>Support:</b> {PREMIUM_BOT_USERNAME}\n\n"
-        f"<b>AI Status:</b> {ai_status} {'Configured' if groq_client else 'Not Set'}"
+        f"<b>AI Status:</b> {ai_status} {'Configured' if groq_client else 'Not Set'}\n"
+        f"<b>Cookies Status:</b> {'✅ Working' if cookies_working else '❌ Not configured'}"
     )
     await update.message.reply_text(help_text, parse_mode=ParseMode.HTML)
 
@@ -885,6 +896,8 @@ async def search_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await log_to_group(update, context, action="/search", details=f"Query: {query}")
     status_msg = await update.message.reply_text(f"Searching '<b>{query}</b>'...", parse_mode=ParseMode.HTML)
 
+    # FIXED: Add cookies to search options
+    cookies_path = Path(COOKIES_FILE)
     ydl_opts = {
         "quiet": True,
         "no_warnings": True,
@@ -892,12 +905,35 @@ async def search_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "default_search": "ytsearch5",
         "extract_flat": False,
     }
+    
+    # Add cookies to search if available
+    if cookies_path.exists() and cookies_path.stat().st_size > 0:
+        ydl_opts["cookiefile"] = str(cookies_path)
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(query, download=False)
     except Exception as e:
-        await status_msg.edit_text(f"⚠️ Search failed: {e}")
+        error_str = str(e)
+        # ENHANCED: Better error messages for YouTube restrictions
+        if "Sign in to confirm" in error_str:
+            await status_msg.edit_text(
+                "❌ <b>YouTube Bot Detection</b>\n\n"
+                "YouTube is requiring sign-in to search. This means:\n"
+                "• Your cookies are missing or expired\n"
+                "• The cookies file format is wrong (must be Netscape)\n"
+                "• YouTube flagged the session\n\n"
+                "<b>Solution:</b>\n"
+                "1. Export fresh cookies from YouTube\n"
+                "2. Use browser extension 'Get cookies.txt LOCALLY'\n"
+                "3. Make sure you're logged in to YouTube\n"
+                "4. Save as <code>cookies.txt</code> in bot folder\n"
+                "5. Run /testcookies to verify\n\n"
+                "<b>Alternative:</b> Send direct YouTube URLs instead of searching",
+                parse_mode=ParseMode.HTML
+            )
+        else:
+            await status_msg.edit_text(f"⚠️ Search failed: {e}")
         await log_to_group(update, context, action="/search", details=f"Error: {e}", is_error=True)
         return
 
@@ -1064,7 +1100,7 @@ async def gpt_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         USER_CONVERSATIONS[user_id] = [{"role": "system", "content": "You are a helpful assistant."}]
 
 # =========================
-# NEW: Test Cookies Command
+# NEW: Enhanced Test Cookies Command
 # =========================
 async def test_cookies_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Test YouTube cookies functionality - Admin only"""
@@ -1100,7 +1136,15 @@ async def test_cookies_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     status_msg = await update.message.reply_text("🔍 Testing YouTube cookies...")
     
     try:
-        # Test with a short video
+        # Test 1: Check if cookies file is valid format
+        with open(cookies_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+            if '# Netscape HTTP Cookie File' not in content:
+                raise ValueError("Not a Netscape format cookies file")
+            if '.youtube.com' not in content and '.google.com' not in content:
+                raise ValueError("No YouTube/Google cookies found")
+        
+        # Test 2: Try to extract info from a video (this tests authentication)
         test_url = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"  # Rickroll (short video)
         
         ydl_opts = {
@@ -1113,28 +1157,52 @@ async def test_cookies_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(test_url, download=False)
             
-            # Check if cookies are working
+            # Check for authentication indicators
             is_logged_in = False
+            has_pauth = False
             if info:
-                # Check for premium indicators or age-gate bypass
-                is_logged_in = info.get('playable_in_embed') is not None or \
-                              'requested_formats' in info or \
-                              info.get('is_live') is not None
-            
+                # Check for presence of敏感 cookies
+                cookies_valid = True
+                # Check if we can access video details that require auth
+                if info.get('duration') is not None or info.get('uploader') is not None:
+                    is_logged_in = True
+                
+                # Also check cookie content for SAPISID/APISID (required for API calls)
+                if 'SAPISID' in content or '__Secure-3PAPISID' in content:
+                    has_pauth = True
+        
         result_text = (
             f"✅ <b>Cookies Test Results</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n\n"
             f"📁 File: <code>{cookies_path.absolute()}</code>\n"
             f"📏 Size: {cookies_path.stat().st_size} bytes\n"
-            f"👤 Logged in: {'✅ Yes' if is_logged_in else '⚠️ Unknown'}\n"
-            f"🎬 Video access: ✅ Success\n\n"
-            f"<b>Status:</b> Cookies are loaded and working!"
+            f"🍪 Format: ✅ Netscape\n"
+            f"🔑 YouTube Cookies: {'✅ Found' if '.youtube.com' in content else '❌ Missing'}\n"
+            f"🔐 Auth Cookies: {'✅ Found' if has_pauth else '⚠️ Partial'}\n"
+            f"🎬 Video Access: {'✅ Success' if is_logged_in else '⚠️ Limited'}\n\n"
+            f"<b>Status:</b> {'✅ Ready for use' if is_logged_in else '⚠️ May need refresh'}"
         )
         
         await status_msg.edit_text(result_text, parse_mode=ParseMode.HTML)
         
         await log_to_group(update, context, action="/testcookies", 
-                         details=f"Cookies test passed. File size: {cookies_path.stat().st_size} bytes")
+                         details=f"Cookies test passed. Auth: {is_logged_in}, PAuth: {has_pauth}")
+        
+    except ValueError as ve:
+        error_text = (
+            f"❌ <b>Cookies Format Error</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"📁 File: <code>{cookies_path.absolute()}</code>\n"
+            f"❌ Error: {str(ve)}\n\n"
+            f"<b>Solution:</b>\n"
+            f"Export cookies in Netscape format:\n"
+            f"1. Install 'Get cookies.txt LOCALLY' extension\n"
+            f"2. Go to YouTube and ensure you're logged in\n"
+            f"3. Click extension → Export → Netscape format\n"
+            f"4. Save as <code>{COOKIES_FILE}</code>"
+        )
+        await status_msg.edit_text(error_text, parse_mode=ParseMode.HTML)
+        await log_to_group(update, context, action="/testcookies", details=f"Format error: {ve}", is_error=True)
         
     except Exception as e:
         error_text = (
@@ -1143,15 +1211,15 @@ async def test_cookies_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"📁 File: <code>{cookies_path.absolute()}</code>\n"
             f"❌ Error: {str(e)[:200]}\n\n"
             f"<b>Possible issues:</b>\n"
-            f"• Cookies expired (re-export)\n"
+            f"• Cookies expired (export again)\n"
             f"• Wrong format (must be Netscape)\n"
             f"• File permissions\n"
-            f"• YouTube account issue"
+            f"• YouTube account flagged\n\n"
+            f"<b>Tip:</b> Log out and back into YouTube, then re-export cookies"
         )
         
         await status_msg.edit_text(error_text, parse_mode=ParseMode.HTML)
-        await log_to_group(update, context, action="/testcookies", 
-                         details=f"Cookies test failed: {str(e)[:100]}", is_error=True)
+        await log_to_group(update, context, action="/testcookies", details=f"Test failed: {str(e)[:100]}", is_error=True)
 
 # =========================
 # Broadcast Functions (FIXED)
@@ -1388,7 +1456,7 @@ async def rmadmin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update.effective_user.id): 
         await update.message.reply_text("❌ Owner only!")
         return
-    if not context.args: 
+    if not context_args: 
         await update.message.reply_text("Usage: /rmadmin <user_id>")
         return
     try:
@@ -1549,7 +1617,7 @@ def main():
     
     # Startup logging with cookies info
     cookies_path = Path(COOKIES_FILE)
-    cookies_status = "✅ Found" if cookies_path.exists() and cookies_path.stat().st_size > 0 else "❌ Not configured"
+    cookies_working = cookies_path.exists() and cookies_path.stat().st_size > 0
     
     log.info("="*60)
     log.info("🔍 BOT STARTUP")
@@ -1557,7 +1625,7 @@ def main():
     log.info(f"Force Join: {FORCE_JOIN_CHANNEL}")
     log.info(f"Log Group: {LOG_GROUP_ID}")
     log.info(f"AI API Key: {'✅ Set' if groq_client else '❌ Not Set'}")
-    log.info(f"Cookies File: {cookies_status} ({cookies_path.absolute()})")
+    log.info(f"Cookies File: {'✅ Found' if cookies_working else '❌ Not configured'} ({cookies_path.absolute()})")
     log.info("="*60)
     
     app = ApplicationBuilder().token(BOT_TOKEN).connect_timeout(60).read_timeout(60).write_timeout(60).build()
