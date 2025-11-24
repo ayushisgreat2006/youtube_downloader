@@ -1,6 +1,6 @@
-python-telegram-bot==20.7
+python-telegram-bot==20.8
 yt-dlp
 pymongo
 aiohttp
+aiofiles
 groq
-python-dotenv
