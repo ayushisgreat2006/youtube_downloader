@@ -5,6 +5,7 @@ import logging
 from datetime import datetime, timedelta
 import secrets
 import aiohttp
+import aiofiles  # FIXED: Moved to top
 from pathlib import Path
 from typing import Dict, List, Optional
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
@@ -28,12 +29,7 @@ LOG_GROUP_ID = int(os.getenv("LOG_GROUP_ID", "-5066591546"))
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 
-# COOKIES_ENV = os.getenv("COOKIES_TXT")
-# if COOKIES_ENV and COOKIES_ENV.startswith('/'):
-#     COOKIES_TXT = Path(COOKIES_ENV)
-# else:
-#     COOKIES_TXT = Path(COOKIES_ENV or "cookies.txt")
-
+# MongoDB
 MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
 MONGO_DB = os.getenv("MONGO_DB", "youtube_bot")
 MONGO_USERS = os.getenv("MONGO_USERS", "users")
@@ -47,7 +43,7 @@ REFERRER_BONUS = 20
 CLAIMER_BONUS = 15
 PREMIUM_BOT_USERNAME = "@ayushxchat_robot"
 
-# File size limits (unchanged)
+# File size limits
 DOWNLOAD_DIR = Path("downloads")
 MAX_FREE_SIZE = 50 * 1024 * 1024
 PREMIUM_SIZE = 450 * 1024 * 1024
@@ -101,11 +97,11 @@ try:
     MONGO_AVAILABLE = True
     log.info("✅ MongoDB connected")
     
-    # Create indexes
-    users_col.create_index("_id", unique=True)
+    # FIXED: Remove unique index on _id (already unique by default)
+    # Create only necessary custom indexes
     users_col.create_index("referral_code", unique=True, sparse=True)
     redeem_col.create_index("code", unique=True)
-    whitelist_col.create_index("_id", unique=True)
+    whitelist_col.create_index("_id")  # No unique=True needed
     
     # Add owner as admin if collection empty
     if admins_col.count_documents({}) == 0:
@@ -192,20 +188,18 @@ async def consume_credit(user_id: int) -> bool:
     return True
 
 async def add_credits(user_id: int, amount: int, is_referral: bool = False) -> bool:
-    """Add credits to user. For referrals, add to both referrer and claimer"""
+    """Add credits to user"""
     if not MONGO_AVAILABLE:
         return False
     
     try:
         if is_referral:
-            # For referrer: add to total credits
             users_col.update_one(
                 {"_id": user_id},
                 {"$inc": {"credits": amount}},
                 upsert=True
             )
         else:
-            # For redeem: add to total credits
             users_col.update_one(
                 {"_id": user_id},
                 {"$inc": {"credits": amount}},
@@ -546,7 +540,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "<code>/rmadmin &lt;id&gt;</code> — Remove admin\n\n"
         f"<b>Updates:</b> {UPDATES_CHANNEL}\n"
         f"<b>Support:</b> {PREMIUM_BOT_USERNAME}\n\n"
-        f"<b>AI Status:</b> {api_status} {'Configured' if groq_client else 'Not Set'}"
+        f"<b>AI Status:</b> {ai_status} {'Configured' if groq_client else 'Not Set'}"
     )
     await update.message.reply_text(help_text, parse_mode=ParseMode.HTML)
 
@@ -1395,7 +1389,6 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
 def main():
     import signal
     import sys
-    import aiofiles  # Import here for file operations
     
     def shutdown_handler(signum, frame):
         log.info("Shutting down...")
