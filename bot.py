@@ -509,15 +509,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "<b>🎧 Welcome to SpotifyX Musix Bot 🎧</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
         "<b>🔥 Features:</b>\n"
-        "• Download MP3 music 🎧\n"
-        "• Download Videos (360p-1080p) 🎬\n"
-        "• Search YouTube 🔍\n"
+        "• Search or send link to download YouTube 🔍\n"
         "• Generate AI images 🎨\n"
         "• AI Chat with Groq 💬\n"
         "• Premium: Up to 450MB files 💳\n\n"
         "<b>💳 Credits:</b> 20 queries/day\n"
-        "<b>🎁 Refer:</b> /refer to earn more\n\n"
+        "<b>🎁 Refer:</b> /refer to earn more\n"
+        "<b>GET PREMIUM</b> @ayushxchat_robot\n\n"
         "<b>📌 Use /help for commands</b>\n"
+        "<b> Made with <3 by @mahadev_ki_iccha\n"
     )
     await update.message.reply_text(start_text, parse_mode=ParseMode.HTML)
 
