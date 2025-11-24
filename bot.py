@@ -535,7 +535,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• AI Chat with Groq 💬\n"
         "• Premium: Up to 450MB files 💳\n\n"
         "<b>💳 Credits:</b> 20 queries/day\n"
-        "<b> OR CONTACT @ayushxchat_robot FOR PREMIUM/n"
+        "<b> OR CONTACT @ayushxchat_robot FOR PREMIUM</b> /n"
         "<b>🎁 Refer:</b> /refer to earn more\n\n"
         f"<b>📌 Cookies Status:</b> {'✅ Working' if cookies_working else '❌ Not configured'}\n"
         f"<b>📌 Use /help for commands</b>\n\n"
