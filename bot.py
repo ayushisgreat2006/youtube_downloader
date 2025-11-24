@@ -102,7 +102,8 @@ try:
     redeem_col.create_index("code", unique=True)
     
     # Add owner as admin if collection empty
-    if admins_col.count_documents({}) == 0:
+    # FIXED: Check admins_col is not None first
+    if admins_col is not None and admins_col.count_documents({}) == 0:
         admins_col.insert_one({
             "_id": OWNER_ID, "name": "Owner",
             "added_by": OWNER_ID, "added_at": datetime.now()
@@ -131,7 +132,8 @@ async def get_user_credits(user_id: int) -> tuple[int, int, bool]:
     today = get_today_str()
     
     # Check whitelist first
-    whitelist_entry = whitelist_col.find_one({"_id": user_id}) if whitelist_col else None
+    # FIXED: Check whitelist_col is not None
+    whitelist_entry = whitelist_col.find_one({"_id": user_id}) if whitelist_col is not None else None
     if whitelist_entry:
         limit = whitelist_entry.get("daily_limit", BASE_CREDITS)
         last_date = whitelist_entry.get("last_usage_date", today)
@@ -206,7 +208,7 @@ async def add_credits(user_id: int, amount: int, is_referral: bool = False) -> b
 # =========================
 def ensure_user(update: Update):
     """Track user in database"""
-    if not MONGO_AVAILABLE or not update.effective_user:
+    if not MONGO_AVAILABLE or update.effective_user is None:  # FIXED: check for None
         return
     
     try:
@@ -217,13 +219,13 @@ def ensure_user(update: Update):
                 "$set": {
                     "name": u.full_name or u.username or str(u.id),
                     "username": u.username,
-                    "first_seen": datetime.now(),
                 },
                 "$setOnInsert": {
                     "credits": BASE_CREDITS,
                     "daily_usage": 0,
                     "last_usage_date": get_today_str(),
-                    "referrals_made": 0
+                    "referrals_made": 0,
+                    "first_seen": datetime.now(),
                 }
             },
             upsert=True
@@ -238,7 +240,7 @@ def is_admin(user_id: int) -> bool:
     """FIXED: Check if user is admin without truth value testing"""
     if is_owner(user_id):
         return True
-    if not MONGO_AVAILABLE or not admins_col:
+    if not MONGO_AVAILABLE or admins_col is None:  # FIXED: check for None
         return False
     try:
         # FIXED: Use 'is not None' instead of bool()
@@ -249,7 +251,7 @@ def is_admin(user_id: int) -> bool:
 
 def is_premium(user_id: int) -> bool:
     """FIXED: Check if user has premium without truth value testing"""
-    if not MONGO_AVAILABLE or not users_col:
+    if not MONGO_AVAILABLE or users_col is None:  # FIXED: check for None
         return False
     try:
         user = users_col.find_one({"_id": user_id}, {"premium": 1})
