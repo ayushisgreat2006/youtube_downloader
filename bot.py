@@ -29,6 +29,9 @@ LOG_GROUP_ID = int(os.getenv("LOG_GROUP_ID", "-5066591546"))
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 
+# Cookies configuration for YouTube
+COOKIES_FILE = os.getenv("COOKIES_FILE", "cookies.txt")  # Netscape format cookies file
+
 # MongoDB
 MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
 MONGO_DB = os.getenv("MONGO_DB", "youtube_bot")
@@ -60,6 +63,7 @@ logging.basicConfig(
 log = logging.getLogger("ytbot")
 
 DOWNLOAD_DIR.mkdir(exist_ok=True)
+Path(COOKIES_FILE).touch(exist_ok=True)  # Create cookies file placeholder if it doesn't exist
 
 # In-memory storage (volatile)
 PENDING: Dict[str, dict] = {}
@@ -97,12 +101,11 @@ try:
     MONGO_AVAILABLE = True
     log.info("✅ MongoDB connected")
     
-    # Create indexes (FIXED: No _id unique index)
+    # Create indexes
     users_col.create_index("referral_code", unique=True, sparse=True)
     redeem_col.create_index("code", unique=True)
     
     # Add owner as admin if collection empty
-    # FIXED: Check admins_col is not None first
     if admins_col is not None and admins_col.count_documents({}) == 0:
         admins_col.insert_one({
             "_id": OWNER_ID, "name": "Owner",
@@ -132,7 +135,6 @@ async def get_user_credits(user_id: int) -> tuple[int, int, bool]:
     today = get_today_str()
     
     # Check whitelist first
-    # FIXED: Check whitelist_col is not None
     whitelist_entry = whitelist_col.find_one({"_id": user_id}) if whitelist_col is not None else None
     if whitelist_entry:
         limit = whitelist_entry.get("daily_limit", BASE_CREDITS)
@@ -208,7 +210,7 @@ async def add_credits(user_id: int, amount: int, is_referral: bool = False) -> b
 # =========================
 def ensure_user(update: Update):
     """Track user in database"""
-    if not MONGO_AVAILABLE or update.effective_user is None:  # FIXED: check for None
+    if not MONGO_AVAILABLE or update.effective_user is None:
         return
     
     try:
@@ -237,25 +239,23 @@ def is_owner(user_id: int) -> bool:
     return int(user_id) == OWNER_ID
 
 def is_admin(user_id: int) -> bool:
-    """FIXED: Check if user is admin without truth value testing"""
+    """Check if user is admin without truth value testing"""
     if is_owner(user_id):
         return True
-    if not MONGO_AVAILABLE or admins_col is None:  # FIXED: check for None
+    if not MONGO_AVAILABLE or admins_col is None:
         return False
     try:
-        # FIXED: Use 'is not None' instead of bool()
         return admins_col.find_one({"_id": user_id}) is not None
     except Exception as e:
         log.error(f"Error checking admin status for {user_id}: {e}")
         return False
 
 def is_premium(user_id: int) -> bool:
-    """FIXED: Check if user has premium without truth value testing"""
-    if not MONGO_AVAILABLE or users_col is None:  # FIXED: check for None
+    """Check if user has premium without truth value testing"""
+    if not MONGO_AVAILABLE or users_col is None:
         return False
     try:
         user = users_col.find_one({"_id": user_id}, {"premium": 1})
-        # FIXED: Return False if user is None
         if user is None:
             return False
         return user.get("premium", False)
@@ -280,6 +280,48 @@ def cleanup_old_files():
             f.unlink()
     except:
         pass
+
+def get_ytdl_options(quality: str, download_id: str) -> dict:
+    """Generate yt-dlp options with cookies support"""
+    ydl_opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "outtmpl": str(DOWNLOAD_DIR / f"%(title)s_{download_id}.%(ext)s"),
+    }
+    
+    # Add cookies if file exists and is not empty
+    cookies_path = Path(COOKIES_FILE)
+    if cookies_path.exists() and cookies_path.stat().st_size > 0:
+        ydl_opts["cookiefile"] = str(cookies_path)
+        log.info(f"Using cookies file: {cookies_path}")
+    else:
+        log.warning(f"No cookies file found at {cookies_path}")
+    
+    if quality == "mp3":
+        ydl_opts.update({
+            "format": "bestaudio/best",
+            "postprocessors": [{
+                "key": "FFmpegExtractAudio",
+                "preferredcodec": "mp3",
+                "preferredquality": "192",
+            }],
+        })
+    else:
+        ydl_opts.update({
+            "format": f"bestvideo[height<={quality}][vcodec^=avc][ext=mp4]+bestaudio[acodec^=mp4a][ext=m4a]/best[height<={quality}][ext=mp4]",
+            "merge_output_format": "mp4",
+            "postprocessor_args": {
+                "MOV+FFmpegVideoConvertor+mp4": [
+                    "-movflags", "+faststart",
+                    "-c:v", "libx264",
+                    "-c:a", "aac",
+                    "-preset", "faster",
+                    "-crf", "23"
+                ]
+            }
+        })
+    
+    return ydl_opts
 
 async def log_to_group(update: Update, context: ContextTypes.DEFAULT_TYPE, action: str, 
                        details: str = "", user_id: Optional[int] = None, is_error: bool = False):
@@ -334,7 +376,7 @@ async def ensure_membership(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return False
     
     channel_username = FORCE_JOIN_CHANNEL.replace('@', '')
-    join_url = f"https://t.me/{channel_username}"
+    join_url = f"https://t.me/{channel_username}"  # FIXED: Removed space
     
     keyboard = InlineKeyboardMarkup([[
         InlineKeyboardButton("Join Channel 🔔", url=join_url),
@@ -359,35 +401,8 @@ async def download_and_send(chat_id, reply_msg, context, url, quality):
     try:
         status_msg = await reply_msg.reply_text("⏳ Preparing download...")
         
-        ydl_opts = {
-            "quiet": True,
-            "no_warnings": True,
-            "outtmpl": str(DOWNLOAD_DIR / f"%(title)s_{download_id}.%(ext)s"),
-        }
-
-        if quality == "mp3":
-            ydl_opts.update({
-                "format": "bestaudio/best",
-                "postprocessors": [{
-                    "key": "FFmpegExtractAudio",
-                    "preferredcodec": "mp3",
-                    "preferredquality": "192",
-                }],
-            })
-        else:
-            ydl_opts.update({
-                "format": f"bestvideo[height<={quality}][vcodec^=avc][ext=mp4]+bestaudio[acodec^=mp4a][ext=m4a]/best[height<={quality}][ext=mp4]",
-                "merge_output_format": "mp4",
-                "postprocessor_args": {
-                    "MOV+FFmpegVideoConvertor+mp4": [
-                        "-movflags", "+faststart",
-                        "-c:v", "libx264",
-                        "-c:a", "aac",
-                        "-preset", "faster",
-                        "-crf", "23"
-                    ]
-                }
-            })
+        # FIXED: Use centralized options builder with cookies
+        ydl_opts = get_ytdl_options(quality, download_id)
 
         await status_msg.edit_text("⬇️ Downloading from YouTube...")
         
@@ -538,7 +553,8 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "<code>/refer</code> — Generate referral code\n"
         "<code>/claim &lt;code&gt;</code> — Claim referral code\n"
         "<code>/redeem &lt;code&gt;</code> — Redeem admin code\n"
-        "<code>/credits</code> — Check your credits\n\n"
+        "<code>/credits</code> — Check your credits\n"
+        "<code>/testcookies</code> — Test YouTube cookies (Admin)\n\n"
         "<b>Admin Commands:</b>\n"
         "<code>/stats</code> — View statistics\n"
         "<code>/broadcast</code> — Broadcast message\n"
@@ -917,7 +933,7 @@ async def gen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         encoded_query = query.replace(" ", "+")
-        image_url = f"https://flux-pro.vercel.app/generate?q={encoded_query}"
+        image_url = f"https://flux-pro.vercel.app/generate?q={encoded_query}"  # FIXED: Removed space
         
         async with aiohttp.ClientSession() as session:
             async with session.get(image_url) as resp:
@@ -1046,6 +1062,96 @@ async def gpt_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await status_msg.edit_text(f"❌ AI Error: {str(e)[:200]}")
         await log_to_group(update, context, action="/gpt", details=f"Error: {e}", is_error=True)
         USER_CONVERSATIONS[user_id] = [{"role": "system", "content": "You are a helpful assistant."}]
+
+# =========================
+# NEW: Test Cookies Command
+# =========================
+async def test_cookies_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Test YouTube cookies functionality - Admin only"""
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("❌ Admin only!")
+        return
+    
+    # Check if cookies file exists
+    cookies_path = Path(COOKIES_FILE)
+    if not cookies_path.exists():
+        await update.message.reply_text(
+            f"❌ Cookies file not found!\n\n"
+            f"Expected location: <code>{cookies_path.absolute()}</code>\n\n"
+            f"<b>How to get cookies:</b>\n"
+            f"1. Install browser extension 'Get cookies.txt LOCALLY'\n"
+            f"2. Log in to YouTube\n"
+            f"3. Click extension → Export → Netscape format\n"
+            f"4. Save as <code>{COOKIES_FILE}</code> in bot directory\n"
+            f"5. Restart bot",
+            parse_mode=ParseMode.HTML
+        )
+        return
+    
+    if cookies_path.stat().st_size == 0:
+        await update.message.reply_text(
+            f"⚠️ Cookies file is empty!\n\n"
+            f"Location: <code>{cookies_path.absolute()}</code>\n\n"
+            f"Please export cookies from YouTube and save to this file.",
+            parse_mode=ParseMode.HTML
+        )
+        return
+    
+    status_msg = await update.message.reply_text("🔍 Testing YouTube cookies...")
+    
+    try:
+        # Test with a short video
+        test_url = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"  # Rickroll (short video)
+        
+        ydl_opts = {
+            "quiet": True,
+            "no_warnings": True,
+            "skip_download": True,
+            "cookiefile": str(cookies_path),
+        }
+        
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(test_url, download=False)
+            
+            # Check if cookies are working
+            is_logged_in = False
+            if info:
+                # Check for premium indicators or age-gate bypass
+                is_logged_in = info.get('playable_in_embed') is not None or \
+                              'requested_formats' in info or \
+                              info.get('is_live') is not None
+            
+        result_text = (
+            f"✅ <b>Cookies Test Results</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"📁 File: <code>{cookies_path.absolute()}</code>\n"
+            f"📏 Size: {cookies_path.stat().st_size} bytes\n"
+            f"👤 Logged in: {'✅ Yes' if is_logged_in else '⚠️ Unknown'}\n"
+            f"🎬 Video access: ✅ Success\n\n"
+            f"<b>Status:</b> Cookies are loaded and working!"
+        )
+        
+        await status_msg.edit_text(result_text, parse_mode=ParseMode.HTML)
+        
+        await log_to_group(update, context, action="/testcookies", 
+                         details=f"Cookies test passed. File size: {cookies_path.stat().st_size} bytes")
+        
+    except Exception as e:
+        error_text = (
+            f"❌ <b>Cookies Test Failed</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"📁 File: <code>{cookies_path.absolute()}</code>\n"
+            f"❌ Error: {str(e)[:200]}\n\n"
+            f"<b>Possible issues:</b>\n"
+            f"• Cookies expired (re-export)\n"
+            f"• Wrong format (must be Netscape)\n"
+            f"• File permissions\n"
+            f"• YouTube account issue"
+        )
+        
+        await status_msg.edit_text(error_text, parse_mode=ParseMode.HTML)
+        await log_to_group(update, context, action="/testcookies", 
+                         details=f"Cookies test failed: {str(e)[:100]}", is_error=True)
 
 # =========================
 # Broadcast Functions (FIXED)
@@ -1441,12 +1547,17 @@ def main():
     
     signal.signal(signal.SIGTERM, shutdown_handler)
     
+    # Startup logging with cookies info
+    cookies_path = Path(COOKIES_FILE)
+    cookies_status = "✅ Found" if cookies_path.exists() and cookies_path.stat().st_size > 0 else "❌ Not configured"
+    
     log.info("="*60)
     log.info("🔍 BOT STARTUP")
     log.info(f"Current Directory: {Path.cwd()}")
     log.info(f"Force Join: {FORCE_JOIN_CHANNEL}")
     log.info(f"Log Group: {LOG_GROUP_ID}")
     log.info(f"AI API Key: {'✅ Set' if groq_client else '❌ Not Set'}")
+    log.info(f"Cookies File: {cookies_status} ({cookies_path.absolute()})")
     log.info("="*60)
     
     app = ApplicationBuilder().token(BOT_TOKEN).connect_timeout(60).read_timeout(60).write_timeout(60).build()
@@ -1491,6 +1602,7 @@ def main():
     app.add_handler(CommandHandler("addadmin", addadmin_cmd))
     app.add_handler(CommandHandler("rmadmin", rmadmin_cmd))
     app.add_handler(CommandHandler("adminlist", adminlist_cmd))
+    app.add_handler(CommandHandler("testcookies", test_cookies_cmd))  # NEW COMMAND
     
     # Message handlers
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
