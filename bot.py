@@ -12,7 +12,7 @@ from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.constants import ParseMode
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, MessageHandler,
-    CallbackQueryHandler, ContextTypes, filters
+    CallbackQueryHandler, ContextTypes, filters, ChatMemberHandler
 )
 import yt_dlp
 from pymongo import MongoClient
@@ -391,6 +391,53 @@ async def ensure_membership(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     )
     return False
 
+async def fetch_lyrics(song_title: str) -> Optional[str]:
+    """Fetch lyrics for a song title using Lyrist API"""
+    try:
+        # Clean up the title - remove common YouTube suffixes and metadata
+        clean_title = re.sub(r'\(official.*?\)|\[official.*?\]|\(audio\)|\[audio\]|\(lyric.*?\)|\[lyric.*?\]|\(video.*?\)|\[video.*?\]|\(hd\)|\[hd\]|\(4k\)|\[4k\]|\(feat\..*?\)|\[feat\..*?\]', '', song_title, flags=re.IGNORECASE)
+        clean_title = re.sub(r'\s+', ' ', clean_title).strip()
+        
+        # Try to extract artist and title
+        artist = ""
+        title = clean_title
+        
+        # Split by common separators
+        separators = [' - ', ' – ', ' — ', ' | ', ' :: ', ': ', ' // ', ' ~ ']
+        for sep in separators:
+            if sep in clean_title:
+                parts = clean_title.split(sep, 1)
+                if len(parts) == 2:
+                    artist = parts[0].strip()
+                    title = parts[1].strip()
+                    break
+        
+        # Use Lyrist API
+        if artist and title:
+            api_url = f"https://lyrist.vercel.app/api/{artist}/{title}"
+        else:
+            api_url = f"https://lyrist.vercel.app/api/{title}"
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.get(api_url) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    lyrics = data.get("lyrics")
+                    if lyrics and lyrics.strip():
+                        return lyrics
+                else:
+                    # Fallback to alternative API
+                    if artist and title:
+                        alternative_url = f"https://api.lyrics.ovh/v1/{artist}/{title}"
+                        async with session.get(alternative_url) as alt_resp:
+                            if alt_resp.status == 200:
+                                alt_data = await alt_resp.json()
+                                return alt_data.get("lyrics")
+    except Exception as e:
+        log.error(f"Failed to fetch lyrics for '{song_title}': {e}")
+    
+    return None
+
 # =========================
 # Download Function with Logging
 # =========================
@@ -480,6 +527,16 @@ async def download_and_send(chat_id, reply_msg, context, url, quality):
                 )
             
             await status_msg.delete()
+            
+            # 🎵 NEW: Add lyrics button for MP3 downloads
+            if quality == "mp3":
+                lyrics_button = InlineKeyboardButton("📝 Get Lyrics", callback_data=f"lyrics|{title}")
+                keyboard = InlineKeyboardMarkup([[lyrics_button]])
+                await reply_msg.reply_text(
+                    "🎵 Download complete! Click below to get lyrics:",
+                    reply_markup=keyboard
+                )
+            
             await log_to_group(update=None, context=context, action="Download Success", 
                              details=f"User {user_id}: {title[:50]}")
             
@@ -532,7 +589,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• Download Videos (360p-1080p) 🎬\n"
         "• Search YouTube 🔍\n"
         "• Generate AI images 🎨\n"
+        "• Generate AI videos 🎬\n"
         "• AI Chat with Groq 💬\n"
+        "• Get song lyrics 📝\n"
         "• Premium: Up to 450MB files 💳\n\n"
         "<b>💳 Credits:</b> 20 queries/day\n"
         "<b> OR CONTACT @ayushxchat_robot</b> FOR PREMIUM/n"
@@ -558,7 +617,9 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "<code>/start</code> — Start bot\n"
         "<code>/help</code> — Show help\n"
         "<code>/search &lt;name&gt;</code> — Search YouTube\n"
+        "<code>/lyrics &lt;song&gt;</code> — Get song lyrics 📝\n"
         "<code>/gen &lt;prompt&gt;</code> — Generate AI image\n"
+        "<code>/vdogen &lt;prompt&gt;</code> — Generate AI video 🎬\n"
         "<code>/gpt &lt;query&gt;</code> — Chat with AI (20/day)\n"
         "<code>/refer</code> — Generate referral code\n"
         "<code>/claim &lt;code&gt;</code> — Claim referral code\n"
@@ -600,7 +661,7 @@ async def credits_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🎁 Remaining: {remaining}\n\n"
         f"<b>Want more?</b>\n"
         f"• /refer - Earn {REFERRER_BONUS} credits\n"
-        f"• /claim - Claim referral\n"
+        f"• /claim - Claim someone's code\n"
         f"• Contact {PREMIUM_BOT_USERNAME} for premium"
     )
     
@@ -706,7 +767,7 @@ async def claim_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await log_to_group(update, context, action="/claim", details=f"Error: {e}", is_error=True)
 
 async def gen_redeem_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Generate redeem code (Admin/Owner only)"""
+    """Generate redeem code (Admin/Owner only) - NOW SINGLE-USE"""
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("❌ Admin only!")
         return
@@ -723,19 +784,21 @@ async def gen_redeem_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         value = int(context.args[0])
         code_name = context.args[1].strip().upper()
         
+        # NEW: Set max_uses to 1 for single-use codes
         redeem_col.insert_one({
             "code": code_name,
             "value": value,
             "created_by": update.effective_user.id,
             "created_at": datetime.now(),
             "used_by": [],
-            "max_uses": None  # Unlimited by default
+            "max_uses": 1  # 🔒 SINGLE USE ONLY
         })
         
         await update.message.reply_text(
-            f"✅ Redeem code created!\n\n"
+            f"✅ Single-use redeem code created!\n\n"
             f"<b>Code:</b> <code>{code_name}</code>\n"
-            f"<b>Value:</b> {value} credits\n\n"
+            f"<b>Value:</b> {value} credits\n"
+            f"<b>Uses:</b> 1 time only\n\n"
             f"Users can claim with: /redeem {code_name}",
             parse_mode=ParseMode.HTML
         )
@@ -747,7 +810,7 @@ async def gen_redeem_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Failed: {e}")
 
 async def redeem_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Redeem a code for credits"""
+    """Redeem a code for credits - NOW ENFORCES SINGLE-USE"""
     ensure_user(update)
     
     if not context.args:
@@ -767,6 +830,13 @@ async def redeem_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ Invalid redeem code!")
             return
         
+        # 🔒 NEW: Check if code has reached max uses
+        max_uses = code_entry.get("max_uses")
+        current_uses = len(code_entry.get("used_by", []))
+        if max_uses is not None and current_uses >= max_uses:
+            await update.message.reply_text("❌ This code has already been redeemed by someone else!")
+            return
+        
         # Check if already used by this user
         if user_id in code_entry.get("used_by", []):
             await update.message.reply_text("❌ You already used this code!")
@@ -782,9 +852,13 @@ async def redeem_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             {"$push": {"used_by": user_id}}
         )
         
+        # Show remaining uses if any
+        remaining_uses = max_uses - (current_uses + 1) if max_uses is not None else "Unlimited"
+        uses_text = f"\n🔁 Uses remaining: {remaining_uses}" if max_uses is not None else ""
+        
         await update.message.reply_text(
             f"🎉 <b>Redeemed Successfully!</b>\n\n"
-            f"✅ You earned +{value} credits\n\n"
+            f"✅ You earned +{value} credits{uses_text}\n\n"
             f"Use /credits to check balance",
             parse_mode=ParseMode.HTML
         )
@@ -844,6 +918,143 @@ async def whitelist_ai_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"❌ Failed: {e}")
         await log_to_group(update, context, action="/whitelist_ai", details=f"Error: {e}", is_error=True)
+
+async def lyrics_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Get lyrics for a song"""
+    ensure_user(update)
+    
+    if not await ensure_membership(update, context):
+        return
+    
+    query = " ".join(context.args)
+    if not query:
+        await update.message.reply_text("Usage: /lyrics <song name>\nExample: /lyrics Ed Sheeran Shape of You")
+        return
+    
+    await log_to_group(update, context, action="/lyrics", details=f"Query: {query}")
+    
+    status_msg = await update.message.reply_text(f"📝 Searching lyrics for '<b>{query}</b>'...", parse_mode=ParseMode.HTML)
+    
+    lyrics = await fetch_lyrics(query)
+    
+    if lyrics:
+        if len(lyrics) > 3800:
+            lyrics = lyrics[:3800] + "\n\n... (lyrics truncated due to message limit)"
+        
+        await status_msg.edit_text(
+            f"🎵 <b>Lyrics for:</b> <code>{query}</code>\n\n"
+            f"<pre>{lyrics}</pre>",
+            parse_mode=ParseMode.HTML
+        )
+    else:
+        await status_msg.edit_text(
+            f"❌ Lyrics not found for '<code>{query}</code>'\n\n"
+            f"Tips:\n"
+            f"• Include artist name for better results\n"
+            f"• Check spelling\n"
+            f"• Song might not be in database",
+            parse_mode=ParseMode.HTML
+        )
+
+async def vdogen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Generate video using AI - consumes 1 credit"""
+    ensure_user(update)
+    
+    if not await ensure_membership(update, context):
+        return
+    
+    query = " ".join(context.args)
+    if not query:
+        await update.message.reply_text("Usage: /vdogen <description>\nExample: /vdogen A cute girl dancing")
+        return
+    
+    # Check credits
+    credits, used, is_whitelisted = await get_user_credits(update.effective_user.id)
+    remaining = credits - used
+    if remaining <= 0:
+        no_credits_text = (
+            f"❌ <b>No Credits Remaining!</b>\n\n"
+            f"📊 Your daily limit: {credits}\n"
+            f"✅ Used: {used}\n\n"
+            f"<b>Get more credits:</b>\n"
+            f"• /refer - Generate referral code (+{REFERRER_BONUS} per friend)\n"
+            f"• /claim - Claim someone's code (+{CLAIMER_BONUS})\n"
+            f"• Contact {PREMIUM_BOT_USERNAME} for premium access\n\n"
+            f"Use /credits to check your balance"
+        )
+        await update.message.reply_text(no_credits_text, parse_mode=ParseMode.HTML)
+        return
+    
+    await log_to_group(update, context, action="/vdogen", details=f"Prompt: {query}")
+    
+    status_msg = await update.message.reply_text(f"🎬 Generating video: <b>{query}</b>\n⏳ This may take 2-5 minutes...", parse_mode=ParseMode.HTML)
+    
+    try:
+        # Make API request
+        encoded_query = query.replace(" ", "+")
+        api_url = f"https://osintapi.store/sora/v1/?prompt={encoded_query}"
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.get(api_url) as resp:
+                if resp.status != 200:
+                    await status_msg.edit_text(f"❌ API Error: {resp.status}")
+                    await log_to_group(update, context, action="/vdogen", details=f"API error: {resp.status}", is_error=True)
+                    return
+                
+                data = await resp.json()
+                
+                if not data.get("success"):
+                    await status_msg.edit_text("❌ Video generation failed. Try a different prompt.")
+                    await log_to_group(update, context, action="/vdogen", details="API returned success=false", is_error=True)
+                    return
+                
+                video_url = data.get("url")
+                if not video_url:
+                    await status_msg.edit_text("❌ No video URL in response.")
+                    await log_to_group(update, context, action="/vdogen", details="No URL in response", is_error=True)
+                    return
+        
+        # Download the video
+        await status_msg.edit_text("⬇️ Downloading generated video...")
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.get(video_url) as resp:
+                if resp.status != 200:
+                    await status_msg.edit_text(f"❌ Download failed: {resp.status}")
+                    await log_to_group(update, context, action="/vdogen", details=f"Download error: {resp.status}", is_error=True)
+                    return
+                
+                video_data = await resp.read()
+                video_path = DOWNLOAD_DIR / f"vdo_{update.effective_user.id}_{secrets.token_urlsafe(8)}.mp4"
+                async with aiofiles.open(video_path, "wb") as f:
+                    await f.write(video_data)
+        
+        # Send video
+        caption = f"🎬 <b>{query}</b>\n\nGenerated by @spotifyxmusixbot"
+        await status_msg.edit_text("⬆️ Uploading to Telegram...")
+        
+        await update.message.reply_video(
+            video=video_path,
+            caption=caption,
+            filename=f"{query}.mp4",
+            parse_mode=ParseMode.HTML,
+            connect_timeout=60,
+            read_timeout=60,
+            write_timeout=60
+        )
+        
+        # Consume credit
+        credit_success = await consume_credit(update.effective_user.id)
+        
+        await status_msg.delete()
+        video_path.unlink(missing_ok=True)
+        
+        await log_to_group(update, context, action="/vdogen", 
+                         details=f"User {update.effective_user.id}: {query[:50]}... | Credit: {credit_success}")
+        
+    except Exception as e:
+        await status_msg.edit_text(f"❌ Failed: {str(e)[:200]}")
+        await log_to_group(update, context, action="/vdogen", details=f"Error: {e}", is_error=True)
 
 # =========================
 # Fixed Command Handlers
@@ -1078,10 +1289,11 @@ async def gpt_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if len(answer) > 4000:
             answer = answer[:4000] + "\n\n... (truncated)"
         
-        # Send response
+        # ✅ MODIFIED: Added ai attribution
         await status_msg.edit_text(
             f"💬 <b>Query:</b> <code>{query}</code>\n\n"
-            f"<b>Answer:</b>\n{answer}",
+            f"<b>Answer:</b>\n{answer}\n\n"
+            f"<i>ai by @spotifyxmusixbot</i>",
             parse_mode=ParseMode.HTML
         )
         
@@ -1161,7 +1373,7 @@ async def test_cookies_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             is_logged_in = False
             has_pauth = False
             if info:
-                # Check for presence of敏感 cookies
+                # Check for presence of sensitive cookies
                 cookies_valid = True
                 # Check if we can access video details that require auth
                 if info.get('duration') is not None or info.get('uploader') is not None:
@@ -1423,6 +1635,30 @@ async def cancel_broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
     await log_to_group(update, context, action="/cancel_broadcast", details="Broadcast cancelled")
 
 # =========================
+# NEW: Track Bot Addition to Groups
+# =========================
+async def track_bot_addition(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Track when bot is added to a new group for broadcast"""
+    if not MONGO_AVAILABLE:
+        return
+        
+    chat = update.effective_chat
+    if chat.type in ["group", "supergroup"]:
+        # Only add if bot is actually a member (not left/kicked)
+        my_member = update.my_chat_member
+        if my_member.new_chat_member.status in ["member", "administrator"]:
+            db["broadcast_chats"].update_one(
+                {"_id": chat.id},
+                {"$set": {
+                    "title": chat.title,
+                    "type": chat.type,
+                    "added_at": datetime.now()
+                }},
+                upsert=True
+            )
+            log.info(f"Bot added to group: {chat.title} ({chat.id})")
+
+# =========================
 # Admin Commands
 # =========================
 async def addadmin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1456,7 +1692,7 @@ async def rmadmin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update.effective_user.id): 
         await update.message.reply_text("❌ Owner only!")
         return
-    if not context_args: 
+    if not context.args: 
         await update.message.reply_text("Usage: /rmadmin <user_id>")
         return
     try:
@@ -1498,6 +1734,39 @@ async def adminlist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Failed: {e}")
 
 # =========================
+# NEW: My Chat Member Handler (Track Bot Addition)
+# =========================
+async def my_chat_member_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Track when bot is added to or removed from groups"""
+    if not MONGO_AVAILABLE:
+        return
+        
+    chat = update.effective_chat
+    my_member = update.my_chat_member
+    
+    # Only track groups
+    if chat.type not in ["group", "supergroup"]:
+        return
+    
+    # Bot was added to group
+    if my_member.new_chat_member.status in ["member", "administrator"]:
+        db["broadcast_chats"].update_one(
+            {"_id": chat.id},
+            {"$set": {
+                "title": chat.title,
+                "type": chat.type,
+                "added_at": datetime.now()
+            }},
+            upsert=True
+        )
+        log.info(f"✅ Bot added to group: {chat.title} ({chat.id})")
+        
+    # Bot was removed from group
+    elif my_member.new_chat_member.status in ["left", "kicked"]:
+        db["broadcast_chats"].delete_one({"_id": chat.id})
+        log.info(f"❌ Bot removed from group: {chat.title} ({chat.id})")
+
+# =========================
 # Callback Handlers
 # =========================
 async def on_quality(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1526,6 +1795,41 @@ async def on_search_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text("Expired.")
         return
     await q.edit_message_text("Choose quality:", reply_markup=quality_keyboard(data["url"]))
+
+async def on_lyrics_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle lyrics button clicks"""
+    q = update.callback_query
+    await q.answer()
+    
+    try:
+        _, song_title = q.data.split("|", 1)
+    except:
+        await q.edit_message_text("❌ Invalid request")
+        return
+    
+    # Edit message to show loading
+    status_msg = await q.edit_message_text("📝 Searching for lyrics...")
+    
+    # Fetch lyrics
+    lyrics = await fetch_lyrics(song_title)
+    
+    if lyrics:
+        if len(lyrics) > 3800:  # Leave room for header
+            lyrics = lyrics[:3800] + "\n\n... (lyrics truncated due to message limit)"
+        
+        await status_msg.edit_text(
+            f"🎵 <b>Lyrics for:</b> <code>{song_title}</code>\n\n"
+            f"<pre>{lyrics}</pre>",
+            parse_mode=ParseMode.HTML
+        )
+    else:
+        await status_msg.edit_text(
+            f"❌ Lyrics not found for '<code>{song_title}</code>'\n\n"
+            f"• Song might be too new\n"
+            f"• Title might be misspelled\n"
+            f"• Try manual search: /lyrics artist song",
+            parse_mode=ParseMode.HTML
+        )
 
 async def on_verify_membership(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -1662,6 +1966,7 @@ def main():
     app.add_handler(CommandHandler("search", search_cmd))
     app.add_handler(CommandHandler("gpt", gpt_cmd))
     app.add_handler(CommandHandler("gen", gen_cmd))
+    app.add_handler(CommandHandler("vdogen", vdogen_cmd))  # NEW COMMAND
     app.add_handler(CommandHandler("stats", stats_cmd))
     app.add_handler(CommandHandler("broadcast", broadcast_cmd))
     app.add_handler(CommandHandler("done_broadcast", done_broadcast_cmd))
@@ -1670,7 +1975,8 @@ def main():
     app.add_handler(CommandHandler("addadmin", addadmin_cmd))
     app.add_handler(CommandHandler("rmadmin", rmadmin_cmd))
     app.add_handler(CommandHandler("adminlist", adminlist_cmd))
-    app.add_handler(CommandHandler("testcookies", test_cookies_cmd))  # NEW COMMAND
+    app.add_handler(CommandHandler("testcookies", test_cookies_cmd))
+    app.add_handler(CommandHandler("lyrics", lyrics_cmd))
     
     # Message handlers
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
@@ -1679,9 +1985,14 @@ def main():
     # Callback handlers
     app.add_handler(CallbackQueryHandler(on_quality, pattern=r"^q\|"))
     app.add_handler(CallbackQueryHandler(on_search_pick, pattern=r"^s\|"))
-    app.add_handler(CallbackQueryHandler(on_verify_membership, pattern="^verify_membership$"))
-
-    log.info("Bot started successfully!")
+        app.add_handler(CallbackQueryHandler(on_lyrics_request, pattern=r"^lyrics\|"))
+    app.add_handler(CallbackQueryHandler(on_verify_membership, pattern=r"^verify_membership$"))
+    
+    # Chat member handler
+    app.add_handler(ChatMemberHandler(my_chat_member_handler, ChatMemberHandler.MY_CHAT_MEMBER))
+    
+    # Start the bot
+    log.info("🚀 Bot is starting...")
     app.run_polling()
 
 if __name__ == "__main__":
