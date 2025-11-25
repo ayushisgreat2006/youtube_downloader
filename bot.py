@@ -1985,7 +1985,7 @@ def main():
     # Callback handlers
     app.add_handler(CallbackQueryHandler(on_quality, pattern=r"^q\|"))
     app.add_handler(CallbackQueryHandler(on_search_pick, pattern=r"^s\|"))
-        app.add_handler(CallbackQueryHandler(on_lyrics_request, pattern=r"^lyrics\|"))
+    app.add_handler(CallbackQueryHandler(on_lyrics_request, pattern=r"^lyrics\|"))
     app.add_handler(CallbackQueryHandler(on_verify_membership, pattern=r"^verify_membership$"))
     
     # Chat member handler
