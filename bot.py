@@ -55,10 +55,10 @@ YOUTUBE_REGEX = re.compile(r"(https?://)?(www\.)?(youtube\.com|youtu\.be)/[\w\-?
 
 # Proxy rotation for video generation (prevents IP blocking)
 PROXY_LIST = [
-    "http://74.119.194.225:2094",
-    "http://5.57.33.243:80",
-    "http://54.74.104.194:45318",
-    "http://133.18.234.13:80",
+    "http://142.111.48.253:7030",
+    "http://31.59.20.176:6754",
+    "http://198.23.239.134:6540",
+    "http://142.111.67.146:5611",
     "http://32.223.6.94:80",
     "http://149.129.226.9:8000",
 ]
