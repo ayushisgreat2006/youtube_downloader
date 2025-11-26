@@ -1245,7 +1245,7 @@ async def search_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await status_msg.edit_text("Choose a video:", reply_markup=InlineKeyboardMarkup(buttons))
 
 async def gen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Generate AI image - direct connection, fixed error handling"""
+    """Generate AI image - dead simple, no bullshit"""
     ensure_user(update)
     
     if not await ensure_membership(update, context):
@@ -1258,114 +1258,50 @@ async def gen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     user_id = update.effective_user.id
     
-    # Check combined media generation limit
+    # Check limit
     today = get_today_str()
-    user_data = users_col.find_one({"_id": user_id}, {
-        "media_gen_today": 1, 
-        "media_gen_date": 1, 
-        "media_gen_limit": 1
-    })
+    user_data = users_col.find_one({"_id": user_id}, {"media_gen_today": 1, "media_gen_date": 1})
+    used_today = user_data.get("media_gen_today", 0) if user_data and user_data.get("media_gen_date") == today else 0
     
-    media_gen_today = user_data.get("media_gen_today", 0) if user_data and user_data.get("media_gen_date") == today else 0
-    media_gen_limit = user_data.get("media_gen_limit", BASE_MEDIA_GEN_LIMIT) if user_data else BASE_MEDIA_GEN_LIMIT
-    
-    if media_gen_today >= media_gen_limit:
-        limit_msg = (
-            f"❌ <b>Daily Media Limit Reached</b>\n\n"
-            f"You can generate <b>{media_gen_limit} media</b> (images+videos) per day.\n\n"
-            f"✅ Used today: {media_gen_today}/{media_gen_limit}\n\n"
-            f"💡 <b>Get more:</b>\n"
-            f"• Use /redeem to increase limit\n"
-            f"• Contact {PREMIUM_BOT_USERNAME} for premium\n\n"
-            f"🔄 Resets at midnight UTC"
-        )
-        await update.message.reply_text(limit_msg, parse_mode=ParseMode.HTML)
+    if used_today >= BASE_MEDIA_GEN_LIMIT:
+        await update.message.reply_text(f"❌ Daily limit: {used_today}/{BASE_MEDIA_GEN_LIMIT}")
         return
     
-    await log_to_group(update, context, action="/gen", details=f"Prompt: {query} | User: {user_id}")
-    
-    status_msg = await update.message.reply_text(f"🎨 Generating image: <b>{query}</b>...", parse_mode=ParseMode.HTML)
+    # Generate image
+    status = await update.message.reply_text(f"🎨 Generating: <b>{query}</b>...", parse_mode=ParseMode.HTML)
     
     try:
-        # Direct API call (no proxy)
-        encoded_query = query.replace(" ", "+")
-        api_url = f"https://flux-pro.vercel.app/generate?q={encoded_query}"
+        encoded = query.replace(" ", "+")
+        url = f"https://flux-pro.vercel.app/generate?q={encoded}"
         
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60)) as session:
-            async with session.get(api_url) as resp:
-                # Log response status and first 100 chars
-                raw_response = await resp.text()
-                log.info(f"📡 img API Response | Status: {resp.status} | Body: {raw_response[:100]}...")
-                
+            async with session.get(url) as resp:
                 if resp.status != 200:
-                    error_msg = f"API Error: {resp.status}"
-                    await log_to_group(update, context, action="/gen", 
-                                     details=f"{error_msg} | User: {user_id} | Query: {query}", 
-                                     is_error=True)
-                    await status_msg.edit_text(
-                        f"❌ Failed (Error {resp.status}). Try again.",
-                        parse_mode=ParseMode.HTML
-                    )
+                    await status.edit_text(f"❌ API Error: {resp.status}")
                     return
                 
-                # Verify it's actually image data
-                content_type = resp.headers.get('content-type', '')
-                if 'image' not in content_type:
-                    log.error(f"Invalid content-type: {content_type}")
-                    await log_to_group(update, context, action="/gen", 
-                                     details=f"Not an image! Type: {content_type} | User: {user_id}", 
-                                     is_error=True)
-                    await status_msg.edit_text("❌ Invalid response from API.")
-                    return
-                
-                # Read image data
-                image_data = await resp.read()
-                
-                if len(image_data) == 0:
-                    await log_to_group(update, context, action="/gen", 
-                                     details=f"Empty image data | User: {user_id}", 
-                                     is_error=True)
-                    await status_msg.edit_text("❌ No image data received.")
-                    return
+                # Just save the damn image
+                data = await resp.read()
+                path = DOWNLOAD_DIR / f"gen_{user_id}.png"
+                async with aiofiles.open(path, "wb") as f:
+                    await f.write(data)
         
-        # Log success to log group
-        await log_to_group(update, context, action="/gen", 
-                         details=f"✅ Image Success | User: {user_id}")
-        
-        # Save and send image
-        image_path = DOWNLOAD_DIR / f"gen_{user_id}_{secrets.token_urlsafe(8)}.png"
-        async with aiofiles.open(image_path, "wb") as f:
-            await f.write(image_data)
-        
-        # Watermark in caption
+        # Send with watermark
         caption = f"🖼️ <b>{query}</b>\n\n<i>Generated by @spotifyxmusixbot</i>"
-        await status_msg.edit_text("⬆️ Uploading...")
+        await update.message.reply_photo(photo=path, caption=caption, parse_mode=ParseMode.HTML)
         
-        await update.message.reply_photo(
-            photo=image_path,
-            caption=caption,
-            parse_mode=ParseMode.HTML
-        )
-        
-        # Update media counter
+        # Update counter
         users_col.update_one(
             {"_id": user_id},
-            {"$set": {
-                "media_gen_date": today,
-                "media_gen_today": media_gen_today + 1
-            }},
+            {"$set": {"media_gen_date": today, "media_gen_today": used_today + 1}},
             upsert=True
         )
         
-        await status_msg.delete()
-        image_path.unlink(missing_ok=True)
+        await status.delete()
+        path.unlink()
         
     except Exception as e:
-        error_str = str(e)
-        await log_to_group(update, context, action="/gen", 
-                         details=f"Exception: {error_str} | User {user_id}", 
-                         is_error=True)
-        await status_msg.edit_text(f"❌ Error: {str(e)[:100]}")
+        await status.edit_text(f"❌ Failed: {str(e)[:100]}")
 
 async def gpt_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """AI Chat command - accessible to ALL users with credit limits"""
