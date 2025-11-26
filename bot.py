@@ -5,6 +5,7 @@ import logging
 from datetime import datetime, timedelta
 import secrets
 import aiohttp
+import random
 import aiofiles
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -51,6 +52,17 @@ DOWNLOAD_DIR = Path("downloads")
 MAX_FREE_SIZE = 50 * 1024 * 1024
 PREMIUM_SIZE = 450 * 1024 * 1024
 YOUTUBE_REGEX = re.compile(r"(https?://)?(www\.)?(youtube\.com|youtu\.be)/[\w\-?&=/%]+", re.I)
+
+# Proxy rotation for video generation (prevents IP blocking)
+PROXY_LIST = [
+    "http://74.119.194.225:2094",
+    "http://5.57.33.243:80",
+    "http://54.74.104.194:45318",
+    "http://133.18.234.13:80",
+    "http://32.223.6.94:80",
+    "http://149.129.226.9:8000",
+]
+PROXY_ROTATE_ON_FAILURE = True  # Try next proxy on failure
 
 # =========================
 # Logging & Storage
@@ -957,7 +969,7 @@ async def lyrics_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 async def vdogen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Generate video using AI - consumes 1 credit"""
+    """Generate video using AI - with proxy rotation to bypass IP limits"""
     ensure_user(update)
     
     if not await ensure_membership(update, context):
@@ -990,62 +1002,62 @@ async def vdogen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     status_msg = await update.message.reply_text(f"🎬 Generating video: <b>{query}</b>\n⏳ This may take 2-5 minutes...", parse_mode=ParseMode.HTML)
     
     try:
-        # Make API request - FIXED: Removed space in URL
+        # Prepare proxy list (if empty, tries direct connection)
+        proxies_to_try = PROXY_LIST.copy() if PROXY_LIST else [None]
+        if PROXY_ROTATE_ON_FAILURE and proxies_to_try:
+            random.shuffle(proxies_to_try)  # Randomize order
+        
         encoded_query = query.replace(" ", "+")
         api_url = f"https://osintapi.store/sora/v1/?prompt={encoded_query}"
         
-        async with aiohttp.ClientSession() as session:
-            async with session.get(api_url) as resp:
-                # Log full response for debugging
-                raw_response = await resp.text()
-                log.info(f"📡 vdogen API Response | Status: {resp.status} | Body: {raw_response}")
-                
-                if resp.status != 200:
-                    await status_msg.edit_text(f"❌ API Error: {resp.status}")
-                    await log_to_group(update, context, action="/vdogen", 
-                                     details=f"API error: {resp.status} | Body: {raw_response}", 
-                                     is_error=True)
-                    return
-                
-                data = await resp.json()
-                
-                # Log the parsed data
-                log.info(f"📊 vdogen Parsed Data: {data}")
-                
-                if not data.get("success"):
-                    # Get error message from API if available
-                    error_msg = data.get("error", "Unknown error")
-                    error_details = data.get("details", "No details")
-                    
-                    # Check if it's a rate limit error
-                    if "rate" in error_msg.lower() or "limit" in error_msg.lower():
-                        user_error_text = (
-                            "❌ <b>Rate Limit Reached</b>\n\n"
-                            "The video generation service is temporarily unavailable.\n"
-                            "Please try again in a few hours.\n\n"
-                            "Alternative: Use /gen to generate AI images instead."
-                        )
-                    else:
-                        user_error_text = (
-                            f"❌ Video generation failed\n\n"
-                            f"Error: {error_msg}\n"
-                            f"Details: {error_details}\n\n"
-                            f"Try a different prompt or shorter description."
-                        )
-                    
-                    await status_msg.edit_text(user_error_text, parse_mode=ParseMode.HTML)
-                    await log_to_group(update, context, action="/vdogen", 
-                                     details=f"API success=false | Error: {error_msg} | Details: {error_details}", 
-                                     is_error=True)
-                    return
-                
-                video_url = data.get("url")
-                if not video_url:
-                    await status_msg.edit_text("❌ No video URL in response.")
-                    await log_to_group(update, context, action="/vdogen", 
-                                     details=f"No URL in response. Full data: {data}", 
-                                     is_error=True)
-                    return
+        video_url = None
+        last_error = None
+        
+        # Try each proxy until one works
+        for i, proxy in enumerate(proxies_to_try):
+            proxy_str = f"proxy {i+1}" if proxy else "direct"
+            await status_msg.edit_text(f"🎬 Attempting connection ({i+1}/{len(proxies_to_try)})...")
+            
+            try:
+                async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=120)) as session:
+                    async with session.get(api_url, proxy=proxy) as resp:
+                        # Log full response for debugging
+                        raw_response = await resp.text()
+                        log.info(f"📡 vdogen API {proxy_str} | Status: {resp.status} | Body: {raw_response}")
+                        
+                        if resp.status != 200:
+                            last_error = f"Status {resp.status}"
+                            continue
+                        
+                        data = await resp.json()
+                        log.info(f"📊 vdogen Data {proxy_str}: {data}")
+                        
+                        if data.get("success") and data.get("url"):
+                            video_url = data.get("url")
+                            await log_to_group(update, context, action="/vdogen", 
+                                             details=f"Success via {proxy_str}")
+                            break
+                        else:
+                            error_msg = data.get("error", "Unknown error")
+                            last_error = f"API error: {error_msg}"
+                            await log_to_group(update, context, action="/vdogen", 
+                                             details=f"Failed {proxy_str} | Error: {error_msg}", 
+                                             is_error=True)
+                            
+            except Exception as proxy_error:
+                last_error = str(proxy_error)
+                log.error(f"Proxy attempt failed {proxy_str}: {proxy_error}")
+                continue
+        
+        if not video_url:
+            await status_msg.edit_text(
+                f"❌ <b>All Connections Failed</b>\n\n"
+                f"Last error: {last_error}\n\n"
+                f"💡 <b>Service is experiencing high demand.</b>\n"
+                f"Please try again later or use /gen for AI images.",
+                parse_mode=ParseMode.HTML
+            )
+            return
         
         # Download the video
         await status_msg.edit_text("⬇️ Downloading generated video...")
@@ -1054,9 +1066,6 @@ async def vdogen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             async with session.get(video_url) as resp:
                 if resp.status != 200:
                     await status_msg.edit_text(f"❌ Download failed: {resp.status}")
-                    await log_to_group(update, context, action="/vdogen", 
-                                     details=f"Download error: {resp.status}", 
-                                     is_error=True)
                     return
                 
                 video_data = await resp.read()
@@ -1079,26 +1088,22 @@ async def vdogen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         
         # Consume credit
-        credit_success = await consume_credit(update.effective_user.id)
+        await consume_credit(update.effective_user.id)
         
         await status_msg.delete()
         video_path.unlink(missing_ok=True)
         
-        await log_to_group(update, context, action="/vdogen", 
-                         details=f"User {update.effective_user.id}: {query[:50]}... | Credit: {credit_success}")
-        
     except Exception as e:
         error_str = str(e)
-        # Check if it's a connection/timeout error
-        if "timeout" in error_str.lower() or "connect" in error_str.lower():
-            user_error = "❌ Connection timeout. The video service might be slow. Please try again."
+        if "timeout" in error_str.lower():
+            user_error = "❌ Connection timeout. Service is slow. Please try again."
         else:
             user_error = f"❌ Failed: {error_str[:200]}"
             
         await status_msg.edit_text(user_error)
-        await log_to_group(update, context, action="/vdogen", 
-                         details=f"Error: {error_str}", 
-                         is_error=True)
+        await log_to_group(update, context, action="/vdogen", details=f"Error: {error_str}", is_error=True)
+
+
 # =========================
 # Fixed Command Handlers
 # =========================
