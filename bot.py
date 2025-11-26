@@ -990,28 +990,61 @@ async def vdogen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     status_msg = await update.message.reply_text(f"🎬 Generating video: <b>{query}</b>\n⏳ This may take 2-5 minutes...", parse_mode=ParseMode.HTML)
     
     try:
-        # Make API request
+        # Make API request - FIXED: Removed space in URL
         encoded_query = query.replace(" ", "+")
         api_url = f"https://osintapi.store/sora/v1/?prompt={encoded_query}"
         
         async with aiohttp.ClientSession() as session:
             async with session.get(api_url) as resp:
+                # Log full response for debugging
+                raw_response = await resp.text()
+                log.info(f"📡 vdogen API Response | Status: {resp.status} | Body: {raw_response}")
+                
                 if resp.status != 200:
                     await status_msg.edit_text(f"❌ API Error: {resp.status}")
-                    await log_to_group(update, context, action="/vdogen", details=f"API error: {resp.status}", is_error=True)
+                    await log_to_group(update, context, action="/vdogen", 
+                                     details=f"API error: {resp.status} | Body: {raw_response}", 
+                                     is_error=True)
                     return
                 
                 data = await resp.json()
                 
+                # Log the parsed data
+                log.info(f"📊 vdogen Parsed Data: {data}")
+                
                 if not data.get("success"):
-                    await status_msg.edit_text("❌ Video generation failed. Try a different prompt.")
-                    await log_to_group(update, context, action="/vdogen", details="API returned success=false", is_error=True)
+                    # Get error message from API if available
+                    error_msg = data.get("error", "Unknown error")
+                    error_details = data.get("details", "No details")
+                    
+                    # Check if it's a rate limit error
+                    if "rate" in error_msg.lower() or "limit" in error_msg.lower():
+                        user_error_text = (
+                            "❌ <b>Rate Limit Reached</b>\n\n"
+                            "The video generation service is temporarily unavailable.\n"
+                            "Please try again in a few hours.\n\n"
+                            "Alternative: Use /gen to generate AI images instead."
+                        )
+                    else:
+                        user_error_text = (
+                            f"❌ Video generation failed\n\n"
+                            f"Error: {error_msg}\n"
+                            f"Details: {error_details}\n\n"
+                            f"Try a different prompt or shorter description."
+                        )
+                    
+                    await status_msg.edit_text(user_error_text, parse_mode=ParseMode.HTML)
+                    await log_to_group(update, context, action="/vdogen", 
+                                     details=f"API success=false | Error: {error_msg} | Details: {error_details}", 
+                                     is_error=True)
                     return
                 
                 video_url = data.get("url")
                 if not video_url:
                     await status_msg.edit_text("❌ No video URL in response.")
-                    await log_to_group(update, context, action="/vdogen", details="No URL in response", is_error=True)
+                    await log_to_group(update, context, action="/vdogen", 
+                                     details=f"No URL in response. Full data: {data}", 
+                                     is_error=True)
                     return
         
         # Download the video
@@ -1021,7 +1054,9 @@ async def vdogen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             async with session.get(video_url) as resp:
                 if resp.status != 200:
                     await status_msg.edit_text(f"❌ Download failed: {resp.status}")
-                    await log_to_group(update, context, action="/vdogen", details=f"Download error: {resp.status}", is_error=True)
+                    await log_to_group(update, context, action="/vdogen", 
+                                     details=f"Download error: {resp.status}", 
+                                     is_error=True)
                     return
                 
                 video_data = await resp.read()
@@ -1053,9 +1088,17 @@ async def vdogen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                          details=f"User {update.effective_user.id}: {query[:50]}... | Credit: {credit_success}")
         
     except Exception as e:
-        await status_msg.edit_text(f"❌ Failed: {str(e)[:200]}")
-        await log_to_group(update, context, action="/vdogen", details=f"Error: {e}", is_error=True)
-
+        error_str = str(e)
+        # Check if it's a connection/timeout error
+        if "timeout" in error_str.lower() or "connect" in error_str.lower():
+            user_error = "❌ Connection timeout. The video service might be slow. Please try again."
+        else:
+            user_error = f"❌ Failed: {error_str[:200]}"
+            
+        await status_msg.edit_text(user_error)
+        await log_to_group(update, context, action="/vdogen", 
+                         details=f"Error: {error_str}", 
+                         is_error=True)
 # =========================
 # Fixed Command Handlers
 # =========================
