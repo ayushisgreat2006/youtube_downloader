@@ -22,6 +22,9 @@ from groq import Groq
 # =========================
 # CONFIGURATION
 # =========================
+# =========================
+# CONFIGURATION
+# =========================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 OWNER_ID = int(os.getenv("OWNER_ID", "7941244038"))
 UPDATES_CHANNEL = os.getenv("UPDATES_CHANNEL", "@tonystark_jr")
@@ -53,18 +56,12 @@ MAX_FREE_SIZE = 50 * 1024 * 1024
 PREMIUM_SIZE = 450 * 1024 * 1024
 YOUTUBE_REGEX = re.compile(r"(https?://)?(www\.)?(youtube\.com|youtu\.be)/[\w\-?&=/%]+", re.I)
 
-# Proxy rotation for video generation (prevents IP blocking)
-PROXY_LIST = [
-    "http://142.111.48.253:7030",
-    "http://31.59.20.176:6754",
-    "http://198.23.239.134:6540",
-    "http://142.111.67.146:5611",
-    "http://32.223.6.94:80",
-    "http://149.129.226.9:8000",
-]
-PROXY_ROTATE_ON_FAILURE = True  # Try next proxy on failure
-VIDEO_GEN_DAILY_LIMIT = 2  # Max 2 videos per day per user
-
+# Combined Media Generation Limits (images + videos share the same pool)
+BASE_MEDIA_GEN_LIMIT = 10      # Default 10 media items per day per user
+PROXY_LIST = []                # Not used - direct connection only (API has 100/min limit)
+PROXY_ROTATE_ON_FAILURE = False
+VIDEO_MAX_ATTEMPTS = 1         # Direct IP only
+IMAGE_MAX_ATTEMPTS = 1         # Direct IP only
 
 # =========================
 # Logging & Storage
@@ -824,15 +821,11 @@ async def gen_redeem_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Failed: {e}")
 
 async def redeem_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Redeem a code for credits - NOW ENFORCES SINGLE-USE"""
+    """Redeem admin code - adds to media generation limit"""
     ensure_user(update)
     
     if not context.args:
         await update.message.reply_text("Usage: /redeem <code_name>")
-        return
-    
-    if not MONGO_AVAILABLE:
-        await update.message.reply_text("❌ Database not available.")
         return
     
     code_name = context.args[0].strip().upper()
@@ -844,21 +837,21 @@ async def redeem_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ Invalid redeem code!")
             return
         
-        # 🔒 NEW: Check if code has reached max uses
-        max_uses = code_entry.get("max_uses")
-        current_uses = len(code_entry.get("used_by", []))
-        if max_uses is not None and current_uses >= max_uses:
-            await update.message.reply_text("❌ This code has already been redeemed by someone else!")
-            return
-        
         # Check if already used by this user
         if user_id in code_entry.get("used_by", []):
             await update.message.reply_text("❌ You already used this code!")
             return
         
-        # Apply credits
+        # Apply to media generation limit (not AI credits)
         value = code_entry["value"]
-        await add_credits(user_id, value)
+        user_data = users_col.find_one({"_id": user_id}, {"media_gen_limit": 1})
+        current_limit = user_data.get("media_gen_limit", BASE_MEDIA_GEN_LIMIT) if user_data else BASE_MEDIA_GEN_LIMIT
+        
+        users_col.update_one(
+            {"_id": user_id},
+            {"$set": {"media_gen_limit": current_limit + value}},
+            upsert=True
+        )
         
         # Mark as used
         redeem_col.update_one(
@@ -866,53 +859,43 @@ async def redeem_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             {"$push": {"used_by": user_id}}
         )
         
-        # Show remaining uses if any
-        remaining_uses = max_uses - (current_uses + 1) if max_uses is not None else "Unlimited"
-        uses_text = f"\n🔁 Uses remaining: {remaining_uses}" if max_uses is not None else ""
-        
         await update.message.reply_text(
             f"🎉 <b>Redeemed Successfully!</b>\n\n"
-            f"✅ You earned +{value} credits{uses_text}\n\n"
-            f"Use /credits to check balance",
+            f"✅ Your media generation limit increased by <b>{value}</b>\n"
+            f"📊 New limit: {current_limit + value} per day\n\n"
+            f"Use /vdogen or /gen to generate media!",
             parse_mode=ParseMode.HTML
         )
         
         await log_to_group(update, context, action="/redeem", 
-                         details=f"User {user_id} redeemed {code_name} for {value} credits")
+                         details=f"User {user_id} redeemed {code_name} for {value} media credits")
         
     except Exception as e:
         await update.message.reply_text(f"❌ Failed: {e}")
         await log_to_group(update, context, action="/redeem", details=f"Error: {e}", is_error=True)
 
 async def whitelist_ai_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Whitelist a user with custom credit limit (Admin/Owner only)"""
+    """Whitelist user with custom media generation limit"""
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("❌ Admin only!")
         return
     
     if not context.args or len(context.args) < 2:
-        await update.message.reply_text("Usage: /whitelist_ai <user_id> <daily_limit>")
-        return
-    
-    if not MONGO_AVAILABLE:
-        await update.message.reply_text("❌ Database not available.")
+        await update.message.reply_text("Usage: /whitelist_ai <user_id> <limit>")
         return
     
     try:
         target_id = int(context.args[0])
         limit = int(context.args[1])
         
-        whitelist_col.update_one(
+        # Set custom media generation limit for user
+        users_col.update_one(
             {"_id": target_id},
-            {
-                "$set": {
-                    "daily_limit": limit,
-                    "set_by": update.effective_user.id,
-                    "set_at": datetime.now(),
-                    "last_usage_date": get_today_str(),
-                    "daily_usage": 0
-                }
-            },
+            {"$set": {
+                "media_gen_limit": limit,
+                "media_gen_date": get_today_str(),
+                "media_gen_today": 0  # Reset counter
+            }},
             upsert=True
         )
         
@@ -922,12 +905,12 @@ async def whitelist_ai_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"✅ <b>User Whitelisted</b>\n\n"
             f"👤 User: <code>{target_id}</code> ({name})\n"
-            f"📊 Daily Limit: {limit} credits",
+            f"📊 Media Limit: {limit} per day",
             parse_mode=ParseMode.HTML
         )
         
         await log_to_group(update, context, action="/whitelist_ai", 
-                         details=f"User {target_id} whitelisted with limit {limit}")
+                         details=f"Set media limit to {limit} for user {target_id}")
         
     except Exception as e:
         await update.message.reply_text(f"❌ Failed: {e}")
@@ -971,7 +954,7 @@ async def lyrics_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 async def vdogen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Generate video using AI - 2 per day limit, tries direct IP first"""
+    """Generate video using AI - consumes 1 media credit"""
     ensure_user(update)
     
     if not await ensure_membership(update, context):
@@ -984,133 +967,110 @@ async def vdogen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     user_id = update.effective_user.id
     
-    # Check credit limits (separate video daily limit)
-    credits, used, is_whitelisted = await get_user_credits(user_id)
-    remaining = credits - used
-    
-    # Check video-specific daily limit
+    # Check combined media generation limit
     today = get_today_str()
-    user = users_col.find_one({"_id": user_id}, {"vdogen_today": 1, "vdogen_date": 1})
-    vdogen_today = user.get("vdogen_today", 0) if user and user.get("vdogen_date") == today else 0
+    user_data = users_col.find_one({"_id": user_id}, {
+        "media_gen_today": 1, 
+        "media_gen_date": 1, 
+        "media_gen_limit": 1
+    })
     
-    if vdogen_today >= VIDEO_GEN_DAILY_LIMIT:
+    media_gen_today = user_data.get("media_gen_today", 0) if user_data and user_data.get("media_gen_date") == today else 0
+    media_gen_limit = user_data.get("media_gen_limit", BASE_MEDIA_GEN_LIMIT) if user_data else BASE_MEDIA_GEN_LIMIT
+    
+    if media_gen_today >= media_gen_limit:
         limit_msg = (
-            f"❌ <b>Daily Video Limit Reached</b>\n\n"
-            f"You can generate only <b>{VIDEO_GEN_DAILY_LIMIT} videos per day</b>.\n\n"
-            f"✅ Used today: {vdogen_today}/{VIDEO_GEN_DAILY_LIMIT}\n\n"
-            f"💡 <b>Try these instead:</b>\n"
-            f"• Use /gen for unlimited AI images\n"
-            f"• Contact {PREMIUM_BOT_USERNAME} for more access\n\n"
+            f"❌ <b>Daily Media Limit Reached</b>\n\n"
+            f"You can generate <b>{media_gen_limit} media</b> (images+videos) per day.\n\n"
+            f"✅ Used today: {media_gen_today}/{media_gen_limit}\n\n"
+            f"💡 <b>Get more:</b>\n"
+            f"• Use /redeem to increase limit\n"
+            f"• Contact {PREMIUM_BOT_USERNAME} for premium\n\n"
             f"🔄 Resets at midnight UTC"
         )
         await update.message.reply_text(limit_msg, parse_mode=ParseMode.HTML)
         return
     
-    if remaining <= 0:
-        no_credits_text = (
-            f"❌ <b>No Credits Remaining!</b>\n\n"
-            f"📊 Your daily limit: {credits}\n"
-            f"✅ Used: {used}\n\n"
-            f"<b>Contact {PREMIUM_BOT_USERNAME} for premium access</b>\n\n"
-            f"Use /credits to check balance or /gen for AI images."
-        )
-        await update.message.reply_text(no_credits_text, parse_mode=ParseMode.HTML)
-        return
+    # Check credits (for non-whitelisted users)
+    if not is_admin(user_id):
+        credits, used, is_whitelisted = await get_user_credits(user_id)
+        remaining = credits - used
+        if remaining <= 0 and not is_whitelisted:
+            no_credits_text = (
+                f"❌ <b>No Credits Remaining!</b>\n\n"
+                f"📊 Your daily limit: {credits}\n"
+                f"✅ Used: {used}\n\n"
+                f"💡 <b>Get more credits:</b>\n"
+                f"• /refer - Generate referral code (+{REFERRER_BONUS} per friend)\n"
+                f"• /claim - Claim someone's code (+{CLAIMER_BONUS})\n"
+                f"• Contact {PREMIUM_BOT_USERNAME} for premium access\n\n"
+                f"📊 Media limit: {media_gen_limit} per day"
+            )
+            await update.message.reply_text(no_credits_text, parse_mode=ParseMode.HTML)
+            return
     
     await log_to_group(update, context, action="/vdogen", details=f"Prompt: {query} | User: {user_id}")
     
     status_msg = await update.message.reply_text(f"🎬 Generating video: <b>{query}</b>\n⏳ This may take 2-5 minutes...", parse_mode=ParseMode.HTML)
     
     try:
-        # Try direct connection FIRST, then fall back to proxies
-        proxies_to_try = [None] + (PROXY_LIST.copy() if PROXY_LIST else [])
-        if PROXY_ROTATE_ON_FAILURE and len(proxies_to_try) > 1:
-            random.shuffle(proxies_to_try[1:])  # Randomize proxies only, keep direct first
-        
+        # Direct API call (no proxy)
         encoded_query = query.replace(" ", "+")
         api_url = f"https://osintapi.store/sora/v1/?prompt={encoded_query}"
         
-        video_url = None
-        last_error = None
-        attempts_used = 0
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=120)) as session:
+            async with session.get(api_url) as resp:
+                raw_response = await resp.text()
+                log.info(f"📡 vdogen API Response | Status: {resp.status} | Body: {raw_response}")
+                
+                if resp.status != 200:
+                    error_msg = f"API Error: {resp.status}"
+                    await log_to_group(update, context, action="/vdogen", 
+                                     details=f"{error_msg} | User: {user_id} | Query: {query}", 
+                                     is_error=True)
+                    await status_msg.edit_text(
+                        "❌ <b>Video Generation Temporarily Unavailable</b>\n\n"
+                        "Due to very high demand, our video tool is currently down.\n\n"
+                        "💡 <b>Try these instead:</b>\n"
+                        "• Use /gen for AI image generation\n"
+                        "• Try again in a few minutes\n"
+                        "• Contact @ayushxchat_robot for premium access\n\n"
+                        "🙏 We apologize for the inconvenience!",
+                        parse_mode=ParseMode.HTML
+                    )
+                    return
+                
+                data = await resp.json()
+                log.info(f"📊 vdogen Data: {data}")
+                
+                if not data.get("success"):
+                    error_msg = data.get("error", "Unknown error")
+                    await log_to_group(update, context, action="/vdogen", 
+                                     details=f"API success=false | Error: {error_msg} | User: {user_id} | Query: {query}", 
+                                     is_error=True)
+                    await status_msg.edit_text(
+                        "❌ <b>Video Generation Temporarily Unavailable</b>\n\n"
+                        "Due to very high demand, our video tool is currently down.\n\n"
+                        "💡 <b>Try these instead:</b>\n"
+                        "• Use /gen for AI image generation\n"
+                        "• Try again in a few minutes\n"
+                        "• Contact @ayushxchat_robot for premium access\n\n"
+                        "🙏 We apologize for the inconvenience!",
+                        parse_mode=ParseMode.HTML
+                    )
+                    return
+                
+                video_url = data.get("url")
+                if not video_url:
+                    await log_to_group(update, context, action="/vdogen", 
+                                     details=f"No URL in response | User: {user_id} | Query: {query}", 
+                                     is_error=True)
+                    await status_msg.edit_text("❌ No video URL in response.")
+                    return
         
-        # Try each proxy until one works
-        for i, proxy in enumerate(proxies_to_try):
-            is_direct = proxy is None
-            proxy_str = "direct IP" if is_direct else f"proxy {i}"
-            await status_msg.edit_text(f"🎬 Attempting connection via {proxy_str} ({i+1}/{len(proxies_to_try)})...")
-            
-            try:
-                async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=120)) as session:
-                    async with session.get(api_url, proxy=proxy) as resp:
-                        # Log full response for debugging
-                        raw_response = await resp.text()
-                        log.info(f"📡 vdogen API {proxy_str} | Status: {resp.status} | Body: {raw_response}")
-                        attempts_used += 1
-                        
-                        if resp.status != 200:
-                            last_error = f"Status {resp.status} via {proxy_str}"
-                            continue
-                        
-                        data = await resp.json()
-                        log.info(f"📊 vdogen Data {proxy_str}: {data}")
-                        
-                        if data.get("success") and data.get("url"):
-                            video_url = data.get("url")
-                            await log_to_group(update, context, action="/vdogen", 
-                                             details=f"Success via {proxy_str}")
-                            break
-                        else:
-                            error_msg = data.get("error", "Unknown error")
-                            last_error = f"API error via {proxy_str}: {error_msg}"
-                            await log_to_group(update, context, action="/vdogen", 
-                                             details=f"Failed {proxy_str} | Error: {error_msg}", 
-                                             is_error=True)
-                            
-            except Exception as proxy_error:
-                last_error = f"{proxy_str}: {str(proxy_error)}"
-                log.error(f"Proxy attempt failed {proxy_str}: {proxy_error}")
-                continue
-        
-        if not video_url:
-            # Send detailed error to LOG GROUP only
-            detailed_error = (
-                f"❌ <b>Video Generation Failed</b>\n\n"
-                f"👤 User: {update.effective_user.id}\n"
-                f"📱 Username: @{update.effective_user.username or 'N/A'}\n"
-                f"📝 Query: {query}\n"
-                f"🔧 Attempts: {attempts_used}\n"
-                f"❌ Last Error: {last_error}\n"
-                f"⏰ Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-            )
-            
-            # Log the full technical details
-            await log_to_group(update, context, action="/vdogen", 
-                             details=detailed_error, 
-                             is_error=True)
-            
-            # Show simple message to USER only
-            user_error = (
-                "❌ <b>Video Generation Temporarily Unavailable</b>\n\n"
-                "Due to very high demand, our video tool is currently down.\n\n"
-                "💡 <b>Try these instead:</b>\n"
-                "• Use /gen for AI image generation\n"
-                "• Try again in a few hours\n"
-                "• Contact @ayushxchat_robot for premium access\n\n"
-                "🙏 We apologize for the inconvenience!"
-            )
-            await status_msg.edit_text(user_error, parse_mode=ParseMode.HTML)
-            return
-        
-        # Increment video generation counter
-        users_col.update_one(
-            {"_id": user_id},
-            {"$set": {
-                "vdogen_date": today,
-                "vdogen_today": vdogen_today + 1
-            }},
-            upsert=True
-        )
+        # Log success
+        await log_to_group(update, context, action="/vdogen", 
+                         details=f"✅ Video Generation Success | User: {user_id}")
         
         # Download the video
         await status_msg.edit_text("⬇️ Downloading generated video...")
@@ -1118,10 +1078,10 @@ async def vdogen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         async with aiohttp.ClientSession() as session:
             async with session.get(video_url) as resp:
                 if resp.status != 200:
-                    await status_msg.edit_text(f"❌ Download failed: {resp.status}")
                     await log_to_group(update, context, action="/vdogen", 
-                                     details=f"Download error: {resp.status}", 
+                                     details=f"Download error: {resp.status} | User: {user_id}", 
                                      is_error=True)
+                    await status_msg.edit_text(f"❌ Download failed: {resp.status}")
                     return
                 
                 video_data = await resp.read()
@@ -1143,28 +1103,38 @@ async def vdogen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             write_timeout=60
         )
         
-        # Consume credit
-        await consume_credit(user_id)
+        # Update media generation counter
+        users_col.update_one(
+            {"_id": user_id},
+            {"$set": {
+                "media_gen_date": today,
+                "media_gen_today": media_gen_today + 1
+            }},
+            upsert=True
+        )
+        
+        # Consume credit (for non-admins)
+        if not is_admin(user_id):
+            await consume_credit(user_id)
         
         await status_msg.delete()
         video_path.unlink(missing_ok=True)
         
-        await log_to_group(update, context, action="/vdogen", 
-                         details=f"Success | User {user_id} | Credit consumed")
-        
     except Exception as e:
         error_str = str(e)
-        if "timeout" in error_str.lower():
-            user_error = "❌ Connection timeout. Service is slow. Please try again."
-        else:
-            user_error = f"❌ Failed: Please try again later"
-            
-        await status_msg.edit_text(user_error)
-        
-        # Log full error details
         await log_to_group(update, context, action="/vdogen", 
                          details=f"Exception: {error_str} | User {user_id} | Query: {query}", 
                          is_error=True)
+        await status_msg.edit_text(
+            "❌ <b>Video Generation Temporarily Unavailable</b>\n\n"
+            "Due to very high demand, our video tool is currently down.\n\n"
+            "💡 <b>Try these instead:</b>\n"
+            "• Use /gen for AI image generation\n"
+            "• Try again in a few minutes\n"
+            "• Contact @ayushxchat_robot for premium access\n\n"
+            "🙏 We apologize for the inconvenience!",
+            parse_mode=ParseMode.HTML
+        )
 
 
 # =========================
@@ -1275,6 +1245,7 @@ async def search_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await status_msg.edit_text("Choose a video:", reply_markup=InlineKeyboardMarkup(buttons))
 
 async def gen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Generate AI image - consumes 1 media credit"""
     ensure_user(update)
     
     if not await ensure_membership(update, context):
@@ -1285,36 +1256,135 @@ async def gen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Usage: /gen <description>")
         return
     
-    await log_to_group(update, context, action="/gen", details=f"Prompt: {query}")
-
-    status_msg = await update.message.reply_text("🎨 Generating image...")
-
+    user_id = update.effective_user.id
+    
+    # Check combined media generation limit
+    today = get_today_str()
+    user_data = users_col.find_one({"_id": user_id}, {
+        "media_gen_today": 1, 
+        "media_gen_date": 1, 
+        "media_gen_limit": 1
+    })
+    
+    media_gen_today = user_data.get("media_gen_today", 0) if user_data and user_data.get("media_gen_date") == today else 0
+    media_gen_limit = user_data.get("media_gen_limit", BASE_MEDIA_GEN_LIMIT) if user_data else BASE_MEDIA_GEN_LIMIT
+    
+    if media_gen_today >= media_gen_limit:
+        limit_msg = (
+            f"❌ <b>Daily Media Limit Reached</b>\n\n"
+            f"You can generate <b>{media_gen_limit} media</b> (images+videos) per day.\n\n"
+            f"✅ Used today: {media_gen_today}/{media_gen_limit}\n\n"
+            f"💡 <b>Get more:</b>\n"
+            f"• Use /redeem to increase limit\n"
+            f"• Contact {PREMIUM_BOT_USERNAME} for premium\n\n"
+            f"🔄 Resets at midnight UTC"
+        )
+        await update.message.reply_text(limit_msg, parse_mode=ParseMode.HTML)
+        return
+    
+    # Check credits (for non-whitelisted users)
+    if not is_admin(user_id):
+        credits, used, is_whitelisted = await get_user_credits(user_id)
+        remaining = credits - used
+        if remaining <= 0 and not is_whitelisted:
+            no_credits_text = (
+                f"❌ <b>No Credits Remaining!</b>\n\n"
+                f"📊 Your daily limit: {credits}\n"
+                f"✅ Used: {used}\n\n"
+                f"<b>Contact {PREMIUM_BOT_USERNAME} for premium access</b>\n\n"
+                f"Use /credits to check balance."
+            )
+            await update.message.reply_text(no_credits_text, parse_mode=ParseMode.HTML)
+            return
+    
+    await log_to_group(update, context, action="/gen", details=f"Prompt: {query} | User: {user_id}")
+    
+    status_msg = await update.message.reply_text(f"🎨 Generating image: <b>{query}</b>...", parse_mode=ParseMode.HTML)
+    
     try:
+        # Direct API call (no proxy)
         encoded_query = query.replace(" ", "+")
-        image_url = f"https://flux-pro.vercel.app/generate?q={encoded_query}"  # FIXED: Removed space
+        api_url = f"https://flux-pro.vercel.app/generate?q={encoded_query}"
         
-        async with aiohttp.ClientSession() as session:
-            async with session.get(image_url) as resp:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60)) as session:
+            async with session.get(api_url) as resp:
+                raw_response = await resp.text()
+                log.info(f"📡 img API Response | Status: {resp.status} | Body: {raw_response}")
+                
                 if resp.status != 200:
-                    await status_msg.edit_text(f"❌ Generation failed (Error {resp.status})")
-                    await log_to_group(update, context, action="/gen", details=f"Error: {resp.status}", is_error=True)
+                    error_msg = f"API Error: {resp.status}"
+                    await log_to_group(update, context, action="/gen", 
+                                     details=f"{error_msg} | User: {user_id} | Query: {query}", 
+                                     is_error=True)
+                    await status_msg.edit_text(
+                        "❌ <b>Image Generation Temporarily Unavailable</b>\n\n"
+                        "Due to very high demand, our image tool is currently down.\n\n"
+                        "💡 <b>Try these instead:</b>\n"
+                        f"• Wait a few minutes and try again\n"
+                        f"• Contact {PREMIUM_BOT_USERNAME} for premium access\n\n"
+                        "🙏 We apologize for the inconvenience!",
+                        parse_mode=ParseMode.HTML
+                    )
                     return
                 
                 image_data = await resp.read()
-                image_path = DOWNLOAD_DIR / f"gen_{update.effective_user.id}_{secrets.token_urlsafe(8)}.png"
-                async with aiofiles.open(image_path, "wb") as f:
-                    await f.write(image_data)
-
+                
+                if len(image_data) == 0:
+                    await log_to_group(update, context, action="/gen", 
+                                     details=f"No image data received | User: {user_id} | Query: {query}", 
+                                     is_error=True)
+                    await status_msg.edit_text("❌ No image data received.")
+                    return
+        
+        # Log success
+        await log_to_group(update, context, action="/gen", 
+                         details=f"✅ Image Generation Success | User: {user_id}")
+        
+        # Save and send image
+        image_path = DOWNLOAD_DIR / f"gen_{user_id}_{secrets.token_urlsafe(8)}.png"
+        async with aiofiles.open(image_path, "wb") as f:
+            await f.write(image_data)
+        
         caption = f"🖼️ <b>{query}</b>\n\nGenerated by @spotifyxmusixbot"
-        await update.message.reply_photo(photo=image_path, caption=caption, parse_mode=ParseMode.HTML)
+        await status_msg.edit_text("⬆️ Uploading to Telegram...")
+        
+        await update.message.reply_photo(
+            photo=image_path,
+            caption=caption,
+            parse_mode=ParseMode.HTML
+        )
+        
+        # Update media generation counter
+        users_col.update_one(
+            {"_id": user_id},
+            {"$set": {
+                "media_gen_date": today,
+                "media_gen_today": media_gen_today + 1
+            }},
+            upsert=True
+        )
+        
+        # Consume credit (for non-admins)
+        if not is_admin(user_id):
+            await consume_credit(user_id)
+        
         await status_msg.delete()
         image_path.unlink(missing_ok=True)
         
-        await log_to_group(update, context, action="/gen", details="Image generated successfully")
-        
     except Exception as e:
-        await status_msg.edit_text(f"❌ Failed: {e}")
-        await log_to_group(update, context, action="/gen", details=f"Error: {e}", is_error=True)
+        error_str = str(e)
+        await log_to_group(update, context, action="/gen", 
+                         details=f"Exception: {error_str} | User {user_id} | Query: {query}", 
+                         is_error=True)
+        await status_msg.edit_text(
+            "❌ <b>Image Generation Temporarily Unavailable</b>\n\n"
+            "Due to very high demand, our image tool is currently down.\n\n"
+            "💡 <b>Try these instead:</b>\n"
+            f"• Wait a few minutes and try again\n"
+            f"• Contact {PREMIUM_BOT_USERNAME} for premium access\n\n"
+            "🙏 We apologize for the inconvenience!",
+            parse_mode=ParseMode.HTML
+        )
 
 async def gpt_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """AI Chat command - accessible to ALL users with credit limits"""
