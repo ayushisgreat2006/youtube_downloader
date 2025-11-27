@@ -407,6 +407,8 @@ async def fetch_lyrics(song_title: str) -> Optional[str]:
     try:
         # Clean up the title - remove common YouTube suffixes and metadata
         clean_title = re.sub(r'\(official.*?\)|\[official.*?\]|\(audio\)|\[audio\]|\(lyric.*?\)|\[lyric.*?\]|\(video.*?\)|\[video.*?\]|\(hd\)|\[hd\]|\(4k\)|\[4k\]|\(feat\..*?\)|\[feat\..*?\]', '', song_title, flags=re.IGNORECASE)
+        # NEW: Replace common separators to improve search
+        clean_title = re.sub(r'[–—|-]', ' ', clean_title)
         clean_title = re.sub(r'\s+', ' ', clean_title).strip()
         api_url = f"https://api.maher-zubair.tech/lyrics?q={clean_title}"
 
