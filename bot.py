@@ -10,6 +10,9 @@ import aiofiles
 import aiohttp
 import json
 import re
+import asyncio
+from collections import deque
+from typing import Dict, Any
 from pathlib import Path
 from typing import Dict, List, Optional
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
@@ -81,6 +84,13 @@ geminigen.ai	FALSE	/	FALSE	0	video-model	veo-3-fast
 geminigen.ai	FALSE	/	FALSE	0	video-duration	8
 .geminigen.ai	TRUE	/	TRUE	1779741772	cf_clearance	6azc623mvyLqCfSRQZvLt3JCLs_lqXVIlYCUOAE3770-1764189771-1.2.1.1-dTH3sePAT0USkZbzKNjwE1dzzgJ5V6p7iuW6TMuQ_6sYmZsxVpJREHoDuolv9gfwvOKlURyCynaKbUOLS0aHsZj1pe72wdtYZUAOqkQ1sIFrBREfEoJh.s763UkmcFZdXlNdWOLaTmeo4TSFgyKkCVmxPUfWtNYlrxXsYG18B.HmBYgT.9EkTVduLdVeD7QqCClAlvuYU7JXp7TYBih8XtAEsMv78zBirZLxrEkyvvI
 """)
+
+# Video generation queue and semaphore
+video_generation_queue = deque()
+active_generations = 0
+MAX_CONCURRENT_GENERATIONS = 2  # Allow 2 videos at once
+generation_semaphore = asyncio.Semaphore(MAX_CONCURRENT_GENERATIONS)
+user_active_tasks: Dict[int, asyncio.Task] = {}
 
 # =========================
 # Logging & Storage
@@ -977,7 +987,8 @@ class GeminiGenAPI:
         }
     
     async def generate_video(self, prompt: str) -> str:
-        """Submit generation request - returns UUID for polling"""
+        """Submit generation request - returns UUID"""
+        # Use a new session for each request to avoid blocking
         async with aiohttp.ClientSession(cookies=self.cookies, headers=self.headers) as session:
             endpoint = f"{self.base_url}/api/video-gen/veo"
             
@@ -1101,7 +1112,7 @@ class GeminiGenAPI:
                 
                 return await resp.read()
 async def vdogen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Generate AI video using GeminiGen - consumes 1 media credit + 1 AI credit"""
+    """Generate AI video - handles multiple users concurrently with queue"""
     ensure_user(update)
     
     if not await ensure_membership(update, context):
@@ -1113,6 +1124,16 @@ async def vdogen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     user_id = update.effective_user.id
+    
+    # Check if user already has an active generation
+    if user_id in user_active_tasks and not user_active_tasks[user_id].done():
+        await update.message.reply_text(
+            "⏳ <b>You already have a video generating!</b>\n\n"
+            "Please wait for your current request to complete before starting a new one.\n\n"
+            "Use /credits to check your status.",
+            parse_mode=ParseMode.HTML
+        )
+        return
     
     # Check combined media generation limit
     today = get_today_str()
@@ -1156,105 +1177,176 @@ async def vdogen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(no_credits_text, parse_mode=ParseMode.HTML)
             return
     
-    await log_to_group(update, context, action="/vdogen", details=f"Prompt: {query} | User: {user_id}")
+    # Acknowledge immediately
+    status_msg = await update.message.reply_text(
+        f"🎬 <b>Video Request Received!</b>\n\n"
+        f"📝 Prompt: <code>{query[:60]}...</code>\n\n"
+        f"⏳ <i>Processing... (Queue position: {len(video_generation_queue) + 1})</i>",
+        parse_mode=ParseMode.HTML
+    )
     
-    status_msg = await update.message.reply_text(f"🎬 Generating video: <b>{query}</b>\n⏳ This may take 2-5 minutes...", parse_mode=ParseMode.HTML)
+    await log_to_group(update, context, action="/vdogen", details=f"Prompt: {query} | User: {user_id} | Queued")
     
-    try:
-        # Initialize API client
-        api = GeminiGenAPI(parse_netscape_cookies(COOKIE_FILE_CONTENT), BEARER_TOKEN)
+    # Add to queue
+    queue_item = {
+        "user_id": user_id,
+        "query": query,
+        "status_msg": status_msg,
+        "update": update,
+        "context": context,
+        "media_gen_today": media_gen_today,
+        "media_gen_limit": media_gen_limit,
+        "today": today
+    }
+    
+    video_generation_queue.append(queue_item)
+    
+    # Start queue processor if not running
+    asyncio.create_task(process_video_queue())
+    
+    log.info(f"✅ Added to queue. Current queue size: {len(video_generation_queue)}")
+
+async def process_video_queue():
+    """Background worker that processes video generation queue"""
+    global active_generations
+    
+    # Check if we can start a new generation
+    if active_generations >= MAX_CONCURRENT_GENERATIONS:
+        log.info(f"⏳ Max concurrent generations reached ({MAX_CONCURRENT_GENERATIONS}). Waiting...")
+        return
+    
+    if not video_generation_queue:
+        return
+    
+    async with generation_semaphore:
+        active_generations += 1
+        queue_item = video_generation_queue.popleft()
         
-        # Step 1: Submit generation
-        await status_msg.edit_text(f"📝 <b>Submitting:</b> <code>{query[:60]}...</code>\n⏳ Please wait...", parse_mode=ParseMode.HTML)
-        job_id = await api.generate_video(query)
+        user_id = queue_item["user_id"]
+        query = queue_item["query"]
+        status_msg = queue_item["status_msg"]
+        update = queue_item["update"]
+        context = queue_item["context"]
+        media_gen_today = queue_item["media_gen_today"]
+        media_gen_limit = queue_item["media_gen_limit"]
+        today = queue_item["today"]
         
-        # Step 2: Poll for completion
-        await status_msg.edit_text("⏳ <b>Generating video...</b>\nThis usually takes 30-90 seconds", parse_mode=ParseMode.HTML)
-        video_url = await api.poll_for_video(job_id, timeout=300)
+        # Track active task for this user
+        task = asyncio.current_task()
+        user_active_tasks[user_id] = task
         
-        # Step 3: Download video
-        await status_msg.edit_text("⬇️ <b>Downloading generated video...</b>", parse_mode=ParseMode.HTML)
-        video_bytes = await api.download_video(video_url)
+        try:
+            log.info(f"🎬 Starting generation for user {user_id}")
+            
+            # Update status
+            await status_msg.edit_text(
+                f"📝 <b>Processing:</b> <code>{query[:60]}...</code>\n"
+                f"⏳ Generation in progress...",
+                parse_mode=ParseMode.HTML
+            )
+            
+            # Initialize API client
+            api = GeminiGenAPI(parse_netscape_cookies(COOKIE_FILE_CONTENT), BEARER_TOKEN)
+            
+            # Step 1: Submit generation
+            await status_msg.edit_text(
+                f"🚀 <b>Submitting to AI...</b>\n"
+                f"⏳ This takes 30-90 seconds",
+                parse_mode=ParseMode.HTML
+            )
+            job_id = await api.generate_video(query)
+            
+            # Step 2: Poll for completion
+            await status_msg.edit_text(
+                f"⏳ <b>Generating video...</b>\n"
+                f"🆔 Job: <code>{job_id[:8]}...</code>",
+                parse_mode=ParseMode.HTML
+            )
+            video_url = await api.poll_for_video(job_id, timeout=300)
+            
+            # Step 3: Download video
+            await status_msg.edit_text("⬇️ <b>Downloading video...</b>", parse_mode=ParseMode.HTML)
+            video_bytes = await api.download_video(video_url)
+            
+            # Step 4: Upload to Telegram
+            await status_msg.edit_text("⬆️ <b>Uploading to Telegram...</b>", parse_mode=ParseMode.HTML)
+            
+            # Save to file temporarily
+            video_path = DOWNLOAD_DIR / f"vdo_{user_id}_{secrets.token_urlsafe(8)}.mp4"
+            async with aiofiles.open(video_path, "wb") as f:
+                await f.write(video_bytes)
+            
+            # Send video with caption
+            caption = (
+                f"🎬 <b>{query}</b>\n\n"
+                f"✨ Generated by @spotifyxmusixbot\n"
+                f"🔖 Job: <code>{job_id[:8]}...</code>"
+            )
+            
+            await update.message.reply_video(
+                video=video_path,
+                caption=caption,
+                filename=f"{query}.mp4",
+                parse_mode=ParseMode.HTML,
+                width=1280,
+                height=720,
+                duration=8,
+                supports_streaming=True,
+                connect_timeout=60,
+                read_timeout=60,
+                write_timeout=60
+            )
+            
+            # Update media generation counter
+            users_col.update_one(
+                {"_id": user_id},
+                {"$set": {
+                    "media_gen_date": today,
+                    "media_gen_today": media_gen_today + 1
+                }},
+                upsert=True
+            )
+            
+            # Consume credit (for non-admins)
+            if not is_admin(user_id):
+                await consume_credit(user_id)
+                log.info(f"✅ Credit consumed for user {user_id}")
+            
+            await status_msg.delete()
+            video_path.unlink(missing_ok=True)
+            
+            log.info(f"✅ SUCCESS! Video sent for user {user_id}")
+            
+        except Exception as e:
+            error_str = str(e)
+            log.error(f"vdogen failed for user {user_id}: {e}", exc_info=True)
+            
+            try:
+                await status_msg.edit_text(
+                    "❌ <b>Video Generation Error</b>\n\n"
+                    "Our AI video service is temporarily unavailable.\n\n"
+                    "💡 <b>Try:</b>\n"
+                    "• /gen for AI images\n"
+                    "• Try again in a few minutes\n"
+                    "• Contact @ayushxchat_robot for support\n\n"
+                    f"<i>Error: {error_str[:100]}</i>",
+                    parse_mode=ParseMode.HTML
+                )
+            except:
+                pass  # Message might be deleted
+            
+            await log_to_group(update, context, action="/vdogen", 
+                             details=f"Error: {error_str[:150]} | User: {user_id}", is_error=True)
         
-        # Step 4: Upload to Telegram
-        await status_msg.edit_text("⬆️ <b>Uploading to Telegram...</b>", parse_mode=ParseMode.HTML)
-        
-        # Save to file temporarily
-        video_path = DOWNLOAD_DIR / f"vdo_{user_id}_{secrets.token_urlsafe(8)}.mp4"
-        async with aiofiles.open(video_path, "wb") as f:
-            await f.write(video_bytes)
-        
-        # Send video with caption
-        caption = (
-            f"🎬 <b>{query}</b>\n\n"
-            f"✨ Generated by @spotifyxmusixbot\n"
-            f"🔖 Job: <code>{job_id[:8]}...</code>"
-        )
-        
-        await update.message.reply_video(
-            video=video_path,
-            caption=caption,
-            filename=f"{query}.mp4",
-            parse_mode=ParseMode.HTML,
-            width=1280,
-            height=720,
-            duration=8,
-            supports_streaming=True,
-            connect_timeout=60,
-            read_timeout=60,
-            write_timeout=60
-        )
-        
-        # Update media generation counter
-        users_col.update_one(
-            {"_id": user_id},
-            {"$set": {
-                "media_gen_date": today,
-                "media_gen_today": media_gen_today + 1
-            }},
-            upsert=True
-        )
-        
-        # Consume credit (for non-admins)
-        if not is_admin(user_id):
-            await consume_credit(user_id)
-            log.info(f"✅ Credit consumed for user {user_id}")
-        
-        await status_msg.delete()
-        video_path.unlink(missing_ok=True)
-        
-        await log_to_group(update, context, action="/vdogen", details=f"✅ Success! User: {user_id}")
-        
-    except TimeoutError:
-        await status_msg.edit_text(
-            "❌ <b>Timeout Error</b>\n\n"
-            "Video generation took too long (5 minutes).\n\n"
-            "💡 <b>Try:</b>\n"
-            "• Shorter prompts\n"
-            "• Simpler descriptions\n"
-            "• Try again later",
-            parse_mode=ParseMode.HTML
-        )
-        await log_to_group(update, context, action="/vdogen", 
-                         details=f"Timeout for user {user_id}", is_error=True)
-        
-    except Exception as e:
-        error_str = str(e)
-        log.error(f"vdogen failed for user {user_id}: {e}", exc_info=True)
-        
-        await status_msg.edit_text(
-            "❌ <b>Video Generation Error</b>\n\n"
-            "Our AI video service is temporarily unavailable.\n\n"
-            "💡 <b>Try:</b>\n"
-            "• /gen for AI images\n"
-            "• Try again in a few minutes\n"
-            "• Contact @ayushxchat_robot for support\n\n"
-            f"<i>Error: {error_str[:100]}</i>",
-            parse_mode=ParseMode.HTML
-        )
-        
-        await log_to_group(update, context, action="/vdogen", 
-                         details=f"Error: {error_str[:150]} | User: {user_id}", is_error=True)
+        finally:
+            # Cleanup
+            active_generations -= 1
+            if user_id in user_active_tasks:
+                del user_active_tasks[user_id]
+            
+            # Process next queue item
+            if video_generation_queue:
+                asyncio.create_task(process_video_queue())
 
 
 # =========================
