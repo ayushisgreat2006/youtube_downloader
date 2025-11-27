@@ -7,6 +7,9 @@ import secrets
 import aiohttp
 import random
 import aiofiles
+import aiohttp
+import json
+import re
 from pathlib import Path
 from typing import Dict, List, Optional
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
@@ -62,6 +65,22 @@ PROXY_LIST = []                # Not used - direct connection only (API has 100/
 PROXY_ROTATE_ON_FAILURE = False
 VIDEO_MAX_ATTEMPTS = 1         # Direct IP only
 IMAGE_MAX_ATTEMPTS = 1         # Direct IP only
+
+#config of vdo gen
+# GeminiGen AI Video Configuration
+BEARER_TOKEN = os.getenv("BEARER_TOKEN", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJleHAiOjE3NjQyNzYzODQsInN1YiI6ImY5MTlhYjEyLWNiMDgtMTFmMC05YWEyLWVlNDdlYmE0N2M1ZCJ9.52w3KUMagtxiUqqXhFR1XnxwrOr5Jac-G9mZUW5I7y4")
+COOKIE_FILE_CONTENT = os.getenv("COOKIE_FILE_CONTENT", """# Netscape HTTP Cookie File
+geminigen.ai	FALSE	/	FALSE	1779779317	ext_name	ojplmecpdpgccookcobabopnaifgidhf
+geminigen.ai	FALSE	/	FALSE	1779741622	i18n_redirected	en
+geminigen.ai	FALSE	/	FALSE	0	video-aspect-ratio	16%3A9
+geminigen.ai	FALSE	/	FALSE	0	video-resolution	720p
+geminigen.ai	FALSE	/	FALSE	0	video-gen-model	%7B%22label%22%3A%22Veo%203.1%20Fast%22%2C%22value%22%3A%22veo-3-fast%22%7D
+geminigen.ai	FALSE	/	FALSE	0	video-gen-duration	8
+geminigen.ai	FALSE	/	FALSE	0	video-gen-enhance-prompt	true
+geminigen.ai	FALSE	/	FALSE	0	video-model	veo-3-fast
+geminigen.ai	FALSE	/	FALSE	0	video-duration	8
+.geminigen.ai	TRUE	/	TRUE	1779741772	cf_clearance	6azc623mvyLqCfSRQZvLt3JCLs_lqXVIlYCUOAE3770-1764189771-1.2.1.1-dTH3sePAT0USkZbzKNjwE1dzzgJ5V6p7iuW6TMuQ_6sYmZsxVpJREHoDuolv9gfwvOKlURyCynaKbUOLS0aHsZj1pe72wdtYZUAOqkQ1sIFrBREfEoJh.s763UkmcFZdXlNdWOLaTmeo4TSFgyKkCVmxPUfWtNYlrxXsYG18B.HmBYgT.9EkTVduLdVeD7QqCClAlvuYU7JXp7TYBih8XtAEsMv78zBirZLxrEkyvvI
+""")
 
 # =========================
 # Logging & Storage
@@ -926,9 +945,163 @@ async def lyrics_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"• Song might not be in database",
             parse_mode=ParseMode.HTML
         )
+# vdogen starts here
+# Cookie Parser (add near other helper functions)
+def parse_netscape_cookies(content: str) -> dict:
+    """Convert Netscape cookie file to aiohttp-compatible dict"""
+    cookies = {}
+    for line in content.splitlines():
+        line = line.strip()
+        if line and not line.startswith('#') and '\t' in line:
+            try:
+                parts = line.split('\t', 6)
+                if len(parts) >= 7:
+                    name, value = parts[5], parts[6]
+                    cookies[name] = value
+            except Exception:
+                continue
+    return cookies
 
+# GeminiGen API Client (add near other helper classes)
+class GeminiGenAPI:
+    def __init__(self, cookies: dict, bearer_token: str):
+        self.cookies = cookies
+        self.bearer_token = bearer_token
+        self.base_url = "https://api.geminigen.ai"
+        self.headers = {
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36",
+            "Accept": "application/json, text/plain, */*",
+            "Origin": "https://geminigen.ai",
+            "Referer": "https://geminigen.ai/",
+            "Authorization": f"Bearer {self.bearer_token}",
+        }
+    
+    async def generate_video(self, prompt: str) -> str:
+        """Submit generation request - returns UUID for polling"""
+        async with aiohttp.ClientSession(cookies=self.cookies, headers=self.headers) as session:
+            endpoint = f"{self.base_url}/api/video-gen/veo"
+            
+            form = aiohttp.FormData()
+            form.add_field('prompt', prompt)
+            form.add_field('model', 'veo-3-fast')
+            form.add_field('duration', '8')
+            form.add_field('resolution', '720p')
+            form.add_field('aspect_ratio', '16:9')
+            form.add_field('enhance_prompt', 'true')
+            
+            log.info(f"🚀 POST {endpoint}")
+            
+            async with session.post(endpoint, data=form) as resp:
+                if resp.status not in (200, 202):
+                    text = await resp.text()
+                    raise Exception(f"Generation failed: HTTP {resp.status}\nResponse: {text[:500]}")
+                
+                result = await resp.json()
+                log.info(f"✅ Generation response: {json.dumps(result, indent=2)}")
+                
+                job_id = result.get("uuid") or result.get("id")
+                if not job_id:
+                    raise Exception(f"No job_id found: {result}")
+                
+                log.info(f"🆔 Job UUID: {job_id}")
+                return job_id
+    
+    async def poll_for_video(self, job_id: str, timeout: int = 300) -> str:
+        """Poll history endpoint with smart URL detection"""
+        async with aiohttp.ClientSession(cookies=self.cookies, headers=self.headers) as session:
+            start = datetime.now()
+            endpoint = f"{self.base_url}/api/history/{job_id}"
+            
+            while True:
+                elapsed = (datetime.now() - start).total_seconds()
+                if elapsed > timeout:
+                    raise TimeoutError(f"Timeout after {timeout}s")
+                
+                log.info(f"⏳ Polling {endpoint} ({elapsed:.1f}s)")
+                
+                async with session.get(endpoint) as resp:
+                    if resp.status != 200:
+                        text = await resp.text()
+                        log.warning(f"Poll failed: HTTP {resp.status} - {text[:200]}")
+                        await asyncio.sleep(3)
+                        continue
+                    
+                    result = await resp.json()
+                    log.debug(f"📄 Full response: {json.dumps(result, indent=2)}")
+                    
+                    # SMART URL DETECTION
+                    video_url = None
+                    
+                    # 1. Check nested generated_video array
+                    if "generated_video" in result and isinstance(result["generated_video"], list):
+                        for video_item in result["generated_video"]:
+                            if isinstance(video_item, dict):
+                                possible_fields = ['video_url', 'file_download_url', 'download_url', 'url', 'sora_post_url']
+                                for field in possible_fields:
+                                    if field in video_item and video_item[field]:
+                                        video_url = video_item[field]
+                                        log.info(f"✅ Found video URL in generated_video[0]['{field}']: {video_url[:80]}...")
+                                        break
+                                if video_url:
+                                    break
+                    
+                    # 2. Check top-level fields
+                    if not video_url:
+                        top_fields = ['video_url', 'download_url', 'url', 'media_url', 'output_url']
+                        for field in top_fields:
+                            if field in result and result[field]:
+                                video_url = result[field]
+                                log.info(f"✅ Found video URL in top-level '{field}': {video_url[:80]}...")
+                                break
+                    
+                    # 3. Deep scan entire JSON for any MP4 URL
+                    if not video_url:
+                        result_str = json.dumps(result)
+                        mp4_matches = re.findall(r'https?://[^\s"]+\.mp4(?:\?[^\s"]*)?', result_str)
+                        if mp4_matches:
+                            video_url = mp4_matches[0]
+                            log.info(f"✅ Extracted MP4 URL from JSON scan: {video_url[:80]}...")
+                    
+                    if video_url:
+                        return video_url
+                    
+                    # SMART FAILURE DETECTION
+                    status = result.get("status", "")
+                    progress = result.get("status_percentage", 0)
+                    queue = result.get("queue_position", 0)
+                    
+                    # Only fail if there's a REAL error
+                    error_message = result.get("error_message")
+                    if error_message and str(error_message).strip() and str(error_message).lower() not in ['null', 'none', '']:
+                        raise Exception(f"Server error: {error_message}")
+                    
+                    if status in [0, "failed", "error"]:
+                        raise Exception(f"Generation failed with status: {status}")
+                    
+                    # Still processing
+                    if status in [1, "processing", "queued"] or progress < 100:
+                        log.info(f"⏳ Processing... Progress: {progress}%, Queue: {queue}")
+                        await asyncio.sleep(3)
+                        continue
+                    
+                    log.warning(f"Unknown state (no URL yet): status={status}, progress={progress}")
+                
+                await asyncio.sleep(3)
+    
+    async def download_video(self, url: str) -> bytes:
+        """Download video from Cloudflare R2"""
+        async with aiohttp.ClientSession() as session:
+            log.info(f"📥 Downloading from {url[:80]}...")
+            async with session.get(url) as resp:
+                if resp.status != 200:
+                    raise Exception(f"Download failed: HTTP {resp.status}")
+                
+                size = int(resp.headers.get('content-length', 0))
+                log.info(f"Download size: {size / 1024 / 1024:.2f} MB")
+                
+                return await resp.read()
 async def vdogen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Generate video using AI - consumes 1 media credit"""
+    """Generate AI video using GeminiGen - consumes 1 media credit + 1 AI credit"""
     ensure_user(update)
     
     if not await ensure_membership(update, context):
@@ -965,7 +1138,7 @@ async def vdogen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(limit_msg, parse_mode=ParseMode.HTML)
         return
     
-    # Check credits (for non-whitelisted users)
+    # Check AI credits (for non-whitelisted users)
     if not is_admin(user_id):
         credits, used, is_whitelisted = await get_user_credits(user_id)
         remaining = credits - used
@@ -974,7 +1147,7 @@ async def vdogen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"❌ <b>No Credits Remaining!</b>\n\n"
                 f"📊 Your daily limit: {credits}\n"
                 f"✅ Used: {used}\n\n"
-                f"💡 <b>Get more credits:</b>\n"
+                f"<b>Get more credits:</b>\n"
                 f"• /refer - Generate referral code (+{REFERRER_BONUS} per friend)\n"
                 f"• /claim - Claim someone's code (+{CLAIMER_BONUS})\n"
                 f"• Contact {PREMIUM_BOT_USERNAME} for premium access\n\n"
@@ -988,90 +1161,45 @@ async def vdogen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     status_msg = await update.message.reply_text(f"🎬 Generating video: <b>{query}</b>\n⏳ This may take 2-5 minutes...", parse_mode=ParseMode.HTML)
     
     try:
-        # Direct API call (no proxy)
-        encoded_query = query.replace(" ", "+")
-        api_url = f"https://osintapi.store/sora/v1/?prompt={encoded_query}"
+        # Initialize API client
+        api = GeminiGenAPI(parse_netscape_cookies(COOKIE_FILE_CONTENT), BEARER_TOKEN)
         
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=120)) as session:
-            async with session.get(api_url) as resp:
-                raw_response = await resp.text()
-                log.info(f"📡 vdogen API Response | Status: {resp.status} | Body: {raw_response}")
-                
-                if resp.status != 200:
-                    error_msg = f"API Error: {resp.status}"
-                    await log_to_group(update, context, action="/vdogen", 
-                                     details=f"{error_msg} | User: {user_id} | Query: {query}", 
-                                     is_error=True)
-                    await status_msg.edit_text(
-                        "❌ <b>Video Generation Temporarily Unavailable</b>\n\n"
-                        "Due to very high demand, our video tool is currently down.\n\n"
-                        "💡 <b>Try these instead:</b>\n"
-                        "• Use /gen for AI image generation\n"
-                        "• Try again in a few minutes\n"
-                        "• Contact @ayushxchat_robot for premium access\n\n"
-                        "🙏 We apologize for the inconvenience!",
-                        parse_mode=ParseMode.HTML
-                    )
-                    return
-                
-                data = await resp.json()
-                log.info(f"📊 vdogen Data: {data}")
-                
-                if not data.get("success"):
-                    error_msg = data.get("error", "Unknown error")
-                    await log_to_group(update, context, action="/vdogen", 
-                                     details=f"API success=false | Error: {error_msg} | User: {user_id} | Query: {query}", 
-                                     is_error=True)
-                    await status_msg.edit_text(
-                        "❌ <b>Video Generation Temporarily Unavailable</b>\n\n"
-                        "Due to very high demand, our video tool is currently down.\n\n"
-                        "💡 <b>Try these instead:</b>\n"
-                        "• Use /gen for AI image generation\n"
-                        "• Try again in a few minutes\n"
-                        "• Contact @ayushxchat_robot for premium access\n\n"
-                        "🙏 We apologize for the inconvenience!",
-                        parse_mode=ParseMode.HTML
-                    )
-                    return
-                
-                video_url = data.get("url")
-                if not video_url:
-                    await log_to_group(update, context, action="/vdogen", 
-                                     details=f"No URL in response | User: {user_id} | Query: {query}", 
-                                     is_error=True)
-                    await status_msg.edit_text("❌ No video URL in response.")
-                    return
+        # Step 1: Submit generation
+        await status_msg.edit_text(f"📝 <b>Submitting:</b> <code>{query[:60]}...</code>\n⏳ Please wait...", parse_mode=ParseMode.HTML)
+        job_id = await api.generate_video(query)
         
-        # Log success
-        await log_to_group(update, context, action="/vdogen", 
-                         details=f"✅ Video Generation Success | User: {user_id}")
+        # Step 2: Poll for completion
+        await status_msg.edit_text("⏳ <b>Generating video...</b>\nThis usually takes 30-90 seconds", parse_mode=ParseMode.HTML)
+        video_url = await api.poll_for_video(job_id, timeout=300)
         
-        # Download the video
-        await status_msg.edit_text("⬇️ Downloading generated video...")
+        # Step 3: Download video
+        await status_msg.edit_text("⬇️ <b>Downloading generated video...</b>", parse_mode=ParseMode.HTML)
+        video_bytes = await api.download_video(video_url)
         
-        async with aiohttp.ClientSession() as session:
-            async with session.get(video_url) as resp:
-                if resp.status != 200:
-                    await log_to_group(update, context, action="/vdogen", 
-                                     details=f"Download error: {resp.status} | User: {user_id}", 
-                                     is_error=True)
-                    await status_msg.edit_text(f"❌ Download failed: {resp.status}")
-                    return
-                
-                video_data = await resp.read()
-                video_path = DOWNLOAD_DIR / f"vdo_{user_id}_{secrets.token_urlsafe(8)}.mp4"
-                async with aiofiles.open(video_path, "wb") as f:
-                    await f.write(video_data)
+        # Step 4: Upload to Telegram
+        await status_msg.edit_text("⬆️ <b>Uploading to Telegram...</b>", parse_mode=ParseMode.HTML)
         
-        # Send video
-        caption = f"🎬 <b>{query}</b>\n\nGenerated by @spotifyxmusixbot"
-        await status_msg.edit_text("⬆️ Uploading to Telegram...")
+        # Save to file temporarily
+        video_path = DOWNLOAD_DIR / f"vdo_{user_id}_{secrets.token_urlsafe(8)}.mp4"
+        async with aiofiles.open(video_path, "wb") as f:
+            await f.write(video_bytes)
+        
+        # Send video with caption
+        caption = (
+            f"🎬 <b>{query}</b>\n\n"
+            f"✨ Generated by @spotifyxmusixbot\n"
+            f"🔖 Job: <code>{job_id[:8]}...</code>"
+        )
         
         await update.message.reply_video(
             video=video_path,
             caption=caption,
             filename=f"{query}.mp4",
             parse_mode=ParseMode.HTML,
+            width=1280,
+            height=720,
+            duration=8,
+            supports_streaming=True,
             connect_timeout=60,
             read_timeout=60,
             write_timeout=60
@@ -1090,25 +1218,43 @@ async def vdogen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Consume credit (for non-admins)
         if not is_admin(user_id):
             await consume_credit(user_id)
+            log.info(f"✅ Credit consumed for user {user_id}")
         
         await status_msg.delete()
         video_path.unlink(missing_ok=True)
         
-    except Exception as e:
-        error_str = str(e)
-        await log_to_group(update, context, action="/vdogen", 
-                         details=f"Exception: {error_str} | User {user_id} | Query: {query}", 
-                         is_error=True)
+        await log_to_group(update, context, action="/vdogen", details=f"✅ Success! User: {user_id}")
+        
+    except TimeoutError:
         await status_msg.edit_text(
-            "❌ <b>Video Generation Temporarily Unavailable</b>\n\n"
-            "Due to very high demand, our video tool is currently down.\n\n"
-            "💡 <b>Try these instead:</b>\n"
-            "• Use /gen for AI image generation\n"
-            "• Try again in a few minutes\n"
-            "• Contact @ayushxchat_robot for premium access\n\n"
-            "🙏 We apologize for the inconvenience!",
+            "❌ <b>Timeout Error</b>\n\n"
+            "Video generation took too long (5 minutes).\n\n"
+            "💡 <b>Try:</b>\n"
+            "• Shorter prompts\n"
+            "• Simpler descriptions\n"
+            "• Try again later",
             parse_mode=ParseMode.HTML
         )
+        await log_to_group(update, context, action="/vdogen", 
+                         details=f"Timeout for user {user_id}", is_error=True)
+        
+    except Exception as e:
+        error_str = str(e)
+        log.error(f"vdogen failed for user {user_id}: {e}", exc_info=True)
+        
+        await status_msg.edit_text(
+            "❌ <b>Video Generation Error</b>\n\n"
+            "Our AI video service is temporarily unavailable.\n\n"
+            "💡 <b>Try:</b>\n"
+            "• /gen for AI images\n"
+            "• Try again in a few minutes\n"
+            "• Contact @ayushxchat_robot for support\n\n"
+            f"<i>Error: {error_str[:100]}</i>",
+            parse_mode=ParseMode.HTML
+        )
+        
+        await log_to_group(update, context, action="/vdogen", 
+                         details=f"Error: {error_str[:150]} | User: {user_id}", is_error=True)
 
 
 # =========================
