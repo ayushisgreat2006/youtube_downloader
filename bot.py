@@ -403,50 +403,24 @@ async def ensure_membership(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     return False
 
 async def fetch_lyrics(song_title: str) -> Optional[str]:
-    """Fetch lyrics for a song title using Lyrist API"""
+    """Fetch lyrics for a song title using an external API"""
     try:
         # Clean up the title - remove common YouTube suffixes and metadata
         clean_title = re.sub(r'\(official.*?\)|\[official.*?\]|\(audio\)|\[audio\]|\(lyric.*?\)|\[lyric.*?\]|\(video.*?\)|\[video.*?\]|\(hd\)|\[hd\]|\(4k\)|\[4k\]|\(feat\..*?\)|\[feat\..*?\]', '', song_title, flags=re.IGNORECASE)
+        # NEW: Replace common separators to improve search
+        clean_title = re.sub(r'[–—|-]', ' ', clean_title)
         clean_title = re.sub(r'\s+', ' ', clean_title).strip()
-        
-        # Try to extract artist and title
-        artist = ""
-        title = clean_title
-        
-        # Split by common separators
-        separators = [' - ', ' – ', ' — ', ' | ', ' :: ', ': ', ' // ', ' ~ ']
-        for sep in separators:
-            if sep in clean_title:
-                parts = clean_title.split(sep, 1)
-                if len(parts) == 2:
-                    artist = parts[0].strip()
-                    title = parts[1].strip()
-                    break
-        
-        # Use Lyrist API
-        if artist and title:
-            api_url = f"https://lyrist.vercel.app/api/{artist}/{title}"
-        else:
-            api_url = f"https://lyrist.vercel.app/api/{title}"
-        
+        api_url = f"https://api.maher-zubair.tech/lyrics?q={clean_title}"
+
         async with aiohttp.ClientSession() as session:
             async with session.get(api_url) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    lyrics = data.get("lyrics")
-                    if lyrics and lyrics.strip():
-                        return lyrics
-                else:
-                    # Fallback to alternative API
-                    if artist and title:
-                        alternative_url = f"https://api.lyrics.ovh/v1/{artist}/{title}"
-                        async with session.get(alternative_url) as alt_resp:
-                            if alt_resp.status == 200:
-                                alt_data = await alt_resp.json()
-                                return alt_data.get("lyrics")
+                    if data.get("status") == 200 and data.get("result"):
+                        return data["result"]
     except Exception as e:
         log.error(f"Failed to fetch lyrics for '{song_title}': {e}")
-    
+
     return None
 
 # =========================
