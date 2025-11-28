@@ -899,6 +899,19 @@ async def credits_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     response = await update.message.reply_text(credits_text, parse_mode=ParseMode.HTML)
     await forward_interaction_to_log(update, context, response)
 
+
+
+async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    ensure_user(update)
+    if not is_admin(update.effective_user.id):
+        response = await update.message.reply_text("❌ Admin only!")
+        await forward_interaction_to_log(update, context, response)
+        return
+    
+    # Basic stats placeholder
+    await update.message.reply_text("📊 Statistics feature - Implementation pending")
+
+
 async def refer_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Generate referral code"""
     ensure_user(update)
