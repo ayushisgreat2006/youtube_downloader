@@ -27,6 +27,9 @@ from groq import Groq
 # =========================
 # CONFIGURATION
 # =========================
+# =========================
+# CONFIGURATION
+# =========================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 OWNER_ID = int(os.getenv("OWNER_ID", "7941244038"))
 UPDATES_CHANNEL = os.getenv("UPDATES_CHANNEL", "@tonystark_jr")
@@ -36,7 +39,7 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 
 # Cookies configuration for YouTube
-COOKIES_FILE = os.getenv("COOKIES_FILE", "cookies.txt")
+COOKIES_FILE = os.getenv("COOKIES_FILE", "cookies.txt")  # Netscape format cookies file
 
 # MongoDB
 MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
@@ -45,19 +48,12 @@ MONGO_USERS = os.getenv("MONGO_USERS", "users")
 MONGO_ADMINS = os.getenv("MONGO_ADMINS", "admins")
 MONGO_REDEEM = os.getenv("MONGO_REDEEM", "redeem_codes")
 MONGO_WHITELIST = os.getenv("MONGO_WHITELIST", "whitelist")
-MONGO_VIDEO_REDEEM = os.getenv("MONGO_VIDEO_REDEEM", "video_redeem_codes")
 
 # Credit System Constants
 BASE_CREDITS = 20
 REFERRER_BONUS = 20
 CLAIMER_BONUS = 15
-VIDEO_REFERRER_BONUS = 2
-VIDEO_CLAIMER_BONUS = 1
 PREMIUM_BOT_USERNAME = "@ayushxchat_robot"
-
-# NEW: Video Credit System Constants
-VIDEO_BASE_CREDITS = 2
-VIDEO_ADMIN_CREDITS = 10000
 
 # File size limits
 DOWNLOAD_DIR = Path("downloads")
@@ -65,16 +61,33 @@ MAX_FREE_SIZE = 50 * 1024 * 1024
 PREMIUM_SIZE = 450 * 1024 * 1024
 YOUTUBE_REGEX = re.compile(r"(https?://)?(www\.)?(youtube\.com|youtu\.be)/[\w\-?&=/%]+", re.I)
 
-# Media Generation Limits (for images only)
-BASE_MEDIA_GEN_LIMIT = 10
-PROXY_LIST = []
+# Combined Media Generation Limits (images + videos share the same pool)
+BASE_MEDIA_GEN_LIMIT = 10      # Default 10 media items per day per user
+PROXY_LIST = []                # Not used - direct connection only (API has 100/min limit)
 PROXY_ROTATE_ON_FAILURE = False
-IMAGE_MAX_ATTEMPTS = 1
+VIDEO_MAX_ATTEMPTS = 1         # Direct IP only
+IMAGE_MAX_ATTEMPTS = 1         # Direct IP only
+
+#config of vdo gen
+# GeminiGen AI Video Configuration
+BEARER_TOKEN = os.getenv("BEARER_TOKEN", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJleHAiOjE3NjQzOTEyNDYsInN1YiI6ImY5MTlhYjEyLWNiMDgtMTFmMC05YWEyLWVlNDdlYmE0N2M1ZCJ9.Fc-S3UZISOlG4EuD8nip2q3tbESy0kb2IIvNFachA-8")
+COOKIE_FILE_CONTENT = os.getenv("COOKIE_FILE_CONTENT", """# Netscape HTTP Cookie File
+geminigen.ai	FALSE	/	FALSE	1779779317	ext_name	ojplmecpdpgccookcobabopnaifgidhf
+geminigen.ai	FALSE	/	FALSE	1779741622	i18n_redirected	en
+geminigen.ai	FALSE	/	FALSE	0	video-aspect-ratio	16%3A9
+geminigen.ai	FALSE	/	FALSE	0	video-resolution	720p
+geminigen.ai	FALSE	/	FALSE	0	video-gen-model	%7B%22label%22%3A%22Veo%203.1%20Fast%22%2C%22value%22%3A%22veo-3-fast%22%7D
+geminigen.ai	FALSE	/	FALSE	0	video-gen-duration	8
+geminigen.ai	FALSE	/	FALSE	0	video-gen-enhance-prompt	true
+geminigen.ai	FALSE	/	FALSE	0	video-model	veo-3-fast
+geminigen.ai	FALSE	/	FALSE	0	video-duration	8
+.geminigen.ai	TRUE	/	TRUE	1779741772	cf_clearance	6azc623mvyLqCfSRQZvLt3JCLs_lqXVIlYCUOAE3770-1764189771-1.2.1.1-dTH3sePAT0USkZbzKNjwE1dzzgJ5V6p7iuW6TMuQ_6sYmZsxVpJREHoDuolv9gfwvOKlURyCynaKbUOLS0aHsZj1pe72wdtYZUAOqkQ1sIFrBREfEoJh.s763UkmcFZdXlNdWOLaTmeo4TSFgyKkCVmxPUfWtNYlrxXsYG18B.HmBYgT.9EkTVduLdVeD7QqCClAlvuYU7JXp7TYBih8XtAEsMv78zBirZLxrEkyvvI
+""")
 
 # Video generation queue and semaphore
 video_generation_queue = deque()
 active_generations = 0
-MAX_CONCURRENT_GENERATIONS = 2
+MAX_CONCURRENT_GENERATIONS = 2  # Allow 2 videos at once
 generation_semaphore = asyncio.Semaphore(MAX_CONCURRENT_GENERATIONS)
 user_active_tasks: Dict[int, asyncio.Task] = {}
 
@@ -89,7 +102,7 @@ logging.basicConfig(
 log = logging.getLogger("ytbot")
 
 DOWNLOAD_DIR.mkdir(exist_ok=True)
-Path(COOKIES_FILE).touch(exist_ok=True)
+Path(COOKIES_FILE).touch(exist_ok=True)  # Create cookies file placeholder if it doesn't exist
 
 # In-memory storage (volatile)
 PENDING: Dict[str, dict] = {}
@@ -124,14 +137,14 @@ try:
     admins_col = db[MONGO_ADMINS]
     redeem_col = db[MONGO_REDEEM]
     whitelist_col = db[MONGO_WHITELIST]
-    video_redeem_col = db[MONGO_VIDEO_REDEEM]
     MONGO_AVAILABLE = True
     log.info("✅ MongoDB connected")
     
+    # Create indexes
     users_col.create_index("referral_code", unique=True, sparse=True)
     redeem_col.create_index("code", unique=True)
-    video_redeem_col.create_index("code", unique=True)
     
+    # Add owner as admin if collection empty
     if admins_col is not None and admins_col.count_documents({}) == 0:
         admins_col.insert_one({
             "_id": OWNER_ID, "name": "Owner",
@@ -142,7 +155,7 @@ try:
 except Exception as e:
     log.error(f"❌ MongoDB failed: {e}")
     MONGO_AVAILABLE = False
-    mongo = db = users_col = admins_col = redeem_col = whitelist_col = video_redeem_col = None
+    mongo = db = users_col = admins_col = redeem_col = whitelist_col = None
 
 # =========================
 # Credit System Functions
@@ -151,7 +164,7 @@ def get_today_str() -> str:
     return datetime.now().strftime("%Y-%m-%d")
 
 async def get_user_credits(user_id: int) -> tuple[int, int, bool]:
-    """Returns (current_credits, used_today, is_whitelisted) for AI"""
+    """Returns (current_credits, used_today, is_whitelisted)"""
     if not MONGO_AVAILABLE:
         return BASE_CREDITS, 0, False
     
@@ -160,6 +173,7 @@ async def get_user_credits(user_id: int) -> tuple[int, int, bool]:
     
     today = get_today_str()
     
+    # Check whitelist first
     whitelist_entry = whitelist_col.find_one({"_id": user_id}) if whitelist_col is not None else None
     if whitelist_entry:
         limit = whitelist_entry.get("daily_limit", BASE_CREDITS)
@@ -167,12 +181,14 @@ async def get_user_credits(user_id: int) -> tuple[int, int, bool]:
         used = whitelist_entry.get("daily_usage", 0) if last_date == today else 0
         return limit, used, True
     
+    # Regular user
     user = users_col.find_one({"_id": user_id}, {"credits": 1, "daily_usage": 1, "last_usage_date": 1})
     if not user:
         return BASE_CREDITS, 0, False
     
     last_date = user.get("last_usage_date", today)
     if last_date != today:
+        # Reset daily usage
         users_col.update_one(
             {"_id": user_id},
             {"$set": {"daily_usage": 0, "last_usage_date": today}}
@@ -180,92 +196,6 @@ async def get_user_credits(user_id: int) -> tuple[int, int, bool]:
         return user.get("credits", BASE_CREDITS), 0, False
     
     return user.get("credits", BASE_CREDITS), user.get("daily_usage", 0), False
-
-async def consume_credit(user_id: int) -> bool:
-    """Consume 1 AI credit, return True if successful"""
-    if not MONGO_AVAILABLE:
-        return True
-    
-    if is_admin(user_id):
-        return True
-    
-    credits, used, is_whitelisted = await get_user_credits(user_id)
-    
-    if used >= credits:
-        return False
-    
-    today = get_today_str()
-    update_fields = {"$inc": {"daily_usage": 1}}
-    
-    if is_whitelisted:
-        whitelist_col.update_one(
-            {"_id": user_id},
-            {**update_fields, "$set": {"last_usage_date": today}},
-            upsert=True
-        )
-    else:
-        users_col.update_one(
-            {"_id": user_id},
-            {**update_fields, "$set": {"last_usage_date": today}},
-            upsert=True
-        )
-    
-    return True
-
-async def add_credits(user_id: int, amount: int, credit_type: str = "ai") -> bool:
-    """Add credits to user (ai or video)"""
-    if not MONGO_AVAILABLE:
-        return False
-    
-    try:
-        if credit_type == "ai":
-            field = "credits"
-        else:
-            field = "video_credits"
-            
-        users_col.update_one(
-            {"_id": user_id},
-            {"$inc": {field: amount}},
-            upsert=True
-        )
-        return True
-    except Exception as e:
-        log.error(f"Failed to add {credit_type} credits to {user_id}: {e}")
-        return False
-
-# =========================
-# Video Credit System Functions
-# =========================
-async def get_user_video_credits(user_id: int) -> tuple[int, int, bool]:
-    """Returns (limit, used, is_whitelisted) for video generation"""
-    if not MONGO_AVAILABLE:
-        return VIDEO_BASE_CREDITS, 0, False
-    
-    if is_admin(user_id):
-        return VIDEO_ADMIN_CREDITS, 0, True
-    
-    today = get_today_str()
-    
-    whitelist_entry = whitelist_col.find_one({"_id": user_id}) if whitelist_col is not None else None
-    if whitelist_entry:
-        limit = whitelist_entry.get("video_daily_limit", VIDEO_BASE_CREDITS)
-        last_date = whitelist_entry.get("video_last_usage_date", today)
-        used = whitelist_entry.get("video_daily_usage", 0) if last_date == today else 0
-        return limit, used, True
-    
-    user = users_col.find_one({"_id": user_id}, {"video_credits": 1, "video_daily_usage": 1, "video_last_usage_date": 1})
-    if not user:
-        return VIDEO_BASE_CREDITS, 0, False
-    
-    last_date = user.get("video_last_usage_date", today)
-    if last_date != today:
-        users_col.update_one(
-            {"_id": user_id},
-            {"$set": {"video_daily_usage": 0, "video_last_usage_date": today}}
-        )
-        return user.get("video_credits", VIDEO_BASE_CREDITS), 0, False
-    
-    return user.get("video_credits", VIDEO_BASE_CREDITS), user.get("video_daily_usage", 0), False
 
 async def consume_video_credit(user_id: int) -> bool:
     """Consume 1 video credit, return True if successful"""
