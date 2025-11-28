@@ -2050,12 +2050,12 @@ async def send_broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
         f"👥 Total Recipients: {len(recipients)}"
     )
     
-    response = await update.message.reply_text(summary, parse_mode=ParseMode.HTML)
-    await log_to_group(update, context, action="/send
-        response = await update.message.reply_text(summary, parse_mode=ParseMode.HTML)
+    await update.message.reply_text(summary, parse_mode=ParseMode.HTML)
+    
+    # Fixed logging calls - removed duplicate line and closed string literals
     await log_to_group(update, context, action="/send_broadcast", 
-        details=f"Sent to {success} users, {failed} failed")
-    await forward_interaction_to_log(update, context, response)
+                      details=f"Sent to {success} users, {failed} failed")
+    await forward_interaction_to_log(update, context, None)
 
 async def cancel_broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id): 
