@@ -806,8 +806,16 @@ async def search_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         keyboard = []
         for i, entry in enumerate(search_results["entries"][:5]):  # Show top 5 results
             title = entry.get("title", "Unknown")
+            
+            # FIXED: Handle duration properly as float/int
             duration = entry.get("duration", 0)
-            duration_str = f"{duration//60}:{duration%60:02d}" if duration else "Unknown"
+            if duration:
+                duration_int = int(duration)  # Convert to int to avoid float formatting errors
+                minutes = duration_int // 60
+                seconds = duration_int % 60
+                duration_str = f"{minutes}:{seconds:02d}"
+            else:
+                duration_str = "Unknown"
             
             # Truncate long titles
             display_title = title[:40] + "..." if len(title) > 40 else title
@@ -2472,6 +2480,80 @@ async def my_chat_member_handler(update: Update, context: ContextTypes.DEFAULT_T
                 log.info(f"✅ Removed {chat.title} from broadcast_chats")
             except Exception as e:
                 log.error(f"Failed to remove chat from broadcast_chats: {e}")
+
+# Add this new command handler
+async def test_video_api_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Test video generation API credentials - Admin only"""
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("❌ Admin only!")
+        return
+    
+    status_msg = await update.message.reply_text("🔍 Testing video generation API credentials...")
+    
+    try:
+        # Check if credentials are set
+        if not BEARER_TOKEN or BEARER_TOKEN == "your_bearer_token_here":
+            raise ValueError("BEARER_TOKEN not configured or is placeholder")
+        
+        if not COOKIE_FILE_CONTENT:
+            raise ValueError("COOKIE_FILE_CONTENT not configured")
+        
+        if "# Netscape HTTP Cookie File" not in COOKIE_FILE_CONTENT:
+            raise ValueError("Cookie format is not Netscape")
+        
+        # Test parsing cookies
+        cookies = parse_netscape_cookies(COOKIE_FILE_CONTENT)
+        if not cookies:
+            raise ValueError("No valid cookies found in COOKIE_FILE_CONTENT")
+        
+        # Test API call
+        api = GeminiGenAPI(cookies, BEARER_TOKEN)
+        
+        await status_msg.edit_text(
+            "🚀 Submitting test generation request...\n"
+            "This usually takes 30-90 seconds..."
+        )
+        
+        # Use a simple prompt
+        test_prompt = "a simple test video of a cat walking"
+        job_id = await api.generate_video(test_prompt)
+        
+        await status_msg.edit_text(
+            f"✅ API Test Successful!\n\n"
+            f"🆔 Job ID: <code>{job_id}</code>\n\n"
+            f"Your credentials are working. The video will complete in background.",
+            parse_mode=ParseMode.HTML
+        )
+        
+        await log_to_group(update, context, action="/testvideoapi", details="Video API credentials test passed")
+        
+        # Poll for completion in background (optional)
+        try:
+            video_url = await api.poll_for_video(job_id, timeout=180)
+            await update.message.reply_text(f"✅ Test video completed: {video_url[:100]}...")
+        except TimeoutError:
+            await update.message.reply_text("⏳ Test video generation still in progress...")
+        except Exception as e:
+            await update.message.reply_text(f"⚠️ Video generation issue: {str(e)[:200]}")
+            
+    except Exception as e:
+        error_details = (
+            f"❌ <b>Video API Test Failed</b>\n\n"
+            f"📋 Error: <code>{str(e)}</code>\n\n"
+            f"<b>Configuration Check:</b>\n"
+            f"• BEARER_TOKEN: {'✅ Set' if BEARER_TOKEN and BEARER_TOKEN != 'your_bearer_token_here' else '❌ Missing/Placeholder'}\n"
+            f"• COOKIE_FILE_CONTENT: {'✅ Set' if COOKIE_FILE_CONTENT else '❌ Missing'}\n"
+            f"• Cookie Format: {'✅ Netscape' if COOKIE_FILE_CONTENT and '# Netscape HTTP Cookie File' in COOKIE_FILE_CONTENT else '❌ Wrong format'}\n\n"
+            f"<b>To fix:</b>\n"
+            f"1. Get fresh bearer token from geminigen.ai\n"
+            f"2. Export fresh YouTube cookies (Netscape format)\n"
+            f"3. Set them as environment variables\n"
+            f"4. Restart bot",
+            parse_mode=ParseMode.HTML
+        )
+        await status_msg.edit_text(error_details)
+        await log_to_group(update, context, action="/testvideoapi", details=f"Test failed: {str(e)}", is_error=True)
+        
 # =========================
 # Main Function
 # =========================
@@ -2558,6 +2640,8 @@ def main():
     
     # Chat member handler
     app.add_handler(ChatMemberHandler(my_chat_member_handler, ChatMemberHandler.MY_CHAT_MEMBER))
+    # Add this to your main() function's command handlers:
+    app.add_handler(CommandHandler("testvideoapi", test_video_api_cmd))
     
     # Start the bot
     log.info("🚀 Bot is starting...")
