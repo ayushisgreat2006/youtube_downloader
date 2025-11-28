@@ -7,6 +7,7 @@ import secrets
 import aiohttp
 import random
 import aiofiles
+import aiohttp
 import json
 import re
 import asyncio
@@ -27,6 +28,9 @@ from groq import Groq
 # =========================
 # CONFIGURATION
 # =========================
+# =========================
+# CONFIGURATION
+# =========================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 OWNER_ID = int(os.getenv("OWNER_ID", "7941244038"))
 UPDATES_CHANNEL = os.getenv("UPDATES_CHANNEL", "@tonystark_jr")
@@ -36,7 +40,7 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 
 # Cookies configuration for YouTube
-COOKIES_FILE = os.getenv("COOKIES_FILE", "cookies.txt")
+COOKIES_FILE = os.getenv("COOKIES_FILE", "cookies.txt")  # Netscape format cookies file
 
 # MongoDB
 MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
@@ -45,8 +49,6 @@ MONGO_USERS = os.getenv("MONGO_USERS", "users")
 MONGO_ADMINS = os.getenv("MONGO_ADMINS", "admins")
 MONGO_REDEEM = os.getenv("MONGO_REDEEM", "redeem_codes")
 MONGO_WHITELIST = os.getenv("MONGO_WHITELIST", "whitelist")
-MONGO_WHITELIST_VDO = os.getenv("MONGO_WHITELIST_VDO", "whitelist_vdo")
-MONGO_REDEEM_VDO = os.getenv("MONGO_REDEEM_VDO", "redeem_codes_vdo")
 
 # Credit System Constants
 BASE_CREDITS = 20
@@ -54,23 +56,20 @@ REFERRER_BONUS = 20
 CLAIMER_BONUS = 15
 PREMIUM_BOT_USERNAME = "@ayushxchat_robot"
 
-# Video Credit System Constants
-VIDEO_BASE_CREDITS = 2  # Normal users get 2 video generations per day
-VIDEO_ADMIN_CREDITS = 10000  # Admins/owners get unlimited (10k)
-
 # File size limits
 DOWNLOAD_DIR = Path("downloads")
 MAX_FREE_SIZE = 50 * 1024 * 1024
 PREMIUM_SIZE = 450 * 1024 * 1024
 YOUTUBE_REGEX = re.compile(r"(https?://)?(www\.)?(youtube\.com|youtu\.be)/[\w\-?&=/%]+", re.I)
 
-# Combined Media Generation Limits (for images - separate from video credits)
-BASE_MEDIA_GEN_LIMIT = 10
-PROXY_LIST = []
+# Combined Media Generation Limits (images + videos share the same pool)
+BASE_MEDIA_GEN_LIMIT = 10      # Default 10 media items per day per user
+PROXY_LIST = []                # Not used - direct connection only (API has 100/min limit)
 PROXY_ROTATE_ON_FAILURE = False
-VIDEO_MAX_ATTEMPTS = 1
-IMAGE_MAX_ATTEMPTS = 1
+VIDEO_MAX_ATTEMPTS = 1         # Direct IP only
+IMAGE_MAX_ATTEMPTS = 1         # Direct IP only
 
+#config of vdo gen
 # GeminiGen AI Video Configuration
 BEARER_TOKEN = os.getenv("BEARER_TOKEN", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJleHAiOjE3NjQzOTEyNDYsInN1YiI6ImY5MTlhYjEyLWNiMDgtMTFmMC05YWEyLWVlNDdlYmE0N2M1ZCJ9.Fc-S3UZISOlG4EuD8nip2q3tbESy0kb2IIvNFachA-8")
 COOKIE_FILE_CONTENT = os.getenv("COOKIE_FILE_CONTENT", """# Netscape HTTP Cookie File
@@ -89,7 +88,7 @@ geminigen.ai	FALSE	/	FALSE	0	video-duration	8
 # Video generation queue and semaphore
 video_generation_queue = deque()
 active_generations = 0
-MAX_CONCURRENT_GENERATIONS = 2
+MAX_CONCURRENT_GENERATIONS = 2  # Allow 2 videos at once
 generation_semaphore = asyncio.Semaphore(MAX_CONCURRENT_GENERATIONS)
 user_active_tasks: Dict[int, asyncio.Task] = {}
 
@@ -104,7 +103,7 @@ logging.basicConfig(
 log = logging.getLogger("ytbot")
 
 DOWNLOAD_DIR.mkdir(exist_ok=True)
-Path(COOKIES_FILE).touch(exist_ok=True)
+Path(COOKIES_FILE).touch(exist_ok=True)  # Create cookies file placeholder if it doesn't exist
 
 # In-memory storage (volatile)
 PENDING: Dict[str, dict] = {}
@@ -139,15 +138,12 @@ try:
     admins_col = db[MONGO_ADMINS]
     redeem_col = db[MONGO_REDEEM]
     whitelist_col = db[MONGO_WHITELIST]
-    whitelist_vdo_col = db[MONGO_WHITELIST_VDO]
-    redeem_vdo_col = db[MONGO_REDEEM_VDO]
     MONGO_AVAILABLE = True
     log.info("✅ MongoDB connected")
     
     # Create indexes
     users_col.create_index("referral_code", unique=True, sparse=True)
     redeem_col.create_index("code", unique=True)
-    redeem_vdo_col.create_index("code", unique=True)
     
     # Add owner as admin if collection empty
     if admins_col is not None and admins_col.count_documents({}) == 0:
@@ -160,7 +156,7 @@ try:
 except Exception as e:
     log.error(f"❌ MongoDB failed: {e}")
     MONGO_AVAILABLE = False
-    mongo = db = users_col = admins_col = redeem_col = whitelist_col = whitelist_vdo_col = redeem_vdo_col = None
+    mongo = db = users_col = admins_col = redeem_col = whitelist_col = None
 
 # =========================
 # Credit System Functions
@@ -169,11 +165,11 @@ def get_today_str() -> str:
     return datetime.now().strftime("%Y-%m-%d")
 
 async def get_user_credits(user_id: int) -> tuple[int, int, bool]:
-    """Returns (ai_credits, used_today, is_whitelisted) for AI/gen commands"""
+    """Returns (current_credits, used_today, is_whitelisted)"""
     if not MONGO_AVAILABLE:
         return BASE_CREDITS, 0, False
     
-    if is_admin(user_id) or is_owner(user_id):
+    if is_admin(user_id):
         return 99999, 0, True
     
     today = get_today_str()
@@ -203,11 +199,11 @@ async def get_user_credits(user_id: int) -> tuple[int, int, bool]:
     return user.get("credits", BASE_CREDITS), user.get("daily_usage", 0), False
 
 async def consume_credit(user_id: int) -> bool:
-    """Consume 1 AI credit, return True if successful"""
+    """Consume 1 credit, return True if successful"""
     if not MONGO_AVAILABLE:
         return True
     
-    if is_admin(user_id) or is_owner(user_id):
+    if is_admin(user_id):
         return True
     
     credits, used, is_whitelisted = await get_user_credits(user_id)
@@ -234,7 +230,7 @@ async def consume_credit(user_id: int) -> bool:
     return True
 
 async def add_credits(user_id: int, amount: int, is_referral: bool = False) -> bool:
-    """Add AI credits to user (permanent)"""
+    """Add credits to user"""
     if not MONGO_AVAILABLE:
         return False
     
@@ -247,90 +243,6 @@ async def add_credits(user_id: int, amount: int, is_referral: bool = False) -> b
         return True
     except Exception as e:
         log.error(f"Failed to add credits to {user_id}: {e}")
-        return False
-
-# =========================
-# Video Credit System Functions (NEW)
-# =========================
-async def get_user_video_credits(user_id: int) -> tuple[int, int, bool]:
-    """Returns (video_credits, video_used_today, is_whitelisted_vdo) for /vdogen"""
-    if not MONGO_AVAILABLE:
-        return VIDEO_BASE_CREDITS, 0, False
-    
-    if is_admin(user_id) or is_owner(user_id):
-        return VIDEO_ADMIN_CREDITS, 0, True
-    
-    today = get_today_str()
-    
-    # Check video whitelist first
-    whitelist_entry = whitelist_vdo_col.find_one({"_id": user_id}) if whitelist_vdo_col is not None else None
-    if whitelist_entry:
-        limit = whitelist_entry.get("daily_limit", VIDEO_BASE_CREDITS)
-        last_date = whitelist_entry.get("last_usage_date", today)
-        used = whitelist_entry.get("daily_usage", 0) if last_date == today else 0
-        return limit, used, True
-    
-    # Regular user
-    user = users_col.find_one({"_id": user_id}, {"vdogen_credits": 1, "vdogen_daily_usage": 1, "vdogen_last_date": 1})
-    if not user:
-        return VIDEO_BASE_CREDITS, 0, False
-    
-    last_date = user.get("vdogen_last_date", today)
-    if last_date != today:
-        # Reset daily usage
-        users_col.update_one(
-            {"_id": user_id},
-            {"$set": {"vdogen_daily_usage": 0, "vdogen_last_date": today}}
-        )
-        return user.get("vdogen_credits", VIDEO_BASE_CREDITS), 0, False
-    
-    return user.get("vdogen_credits", VIDEO_BASE_CREDITS), user.get("vdogen_daily_usage", 0), False
-
-async def consume_video_credit(user_id: int) -> bool:
-    """Consume 1 video credit, return True if successful"""
-    if not MONGO_AVAILABLE:
-        return True
-    
-    if is_admin(user_id) or is_owner(user_id):
-        return True
-    
-    credits, used, is_whitelisted = await get_user_video_credits(user_id)
-    
-    if used >= credits:
-        return False
-    
-    today = get_today_str()
-    update_fields = {"$inc": {"vdogen_daily_usage": 1}}
-    
-    if is_whitelisted:
-        whitelist_vdo_col.update_one(
-            {"_id": user_id},
-            {**update_fields, "$set": {"last_usage_date": today}},
-            upsert=True
-        )
-    else:
-        users_col.update_one(
-            {"_id": user_id},
-            {**update_fields, "$set": {"vdogen_last_date": today}},
-            upsert=True
-        )
-    
-    return True
-
-async def add_video_credits(user_id: int, amount: int) -> bool:
-    """Add permanent video credits to user"""
-    if not MONGO_AVAILABLE:
-        return False
-    
-    try:
-        users_col.update_one(
-            {"_id": user_id},
-            {"$inc": {"vdogen_credits": amount}},
-            upsert=True
-        )
-        return True
-    except Exception as e:
-        log.error(f"Failed to add video credits to {user_id}: {e}")
         return False
 
 # =========================
@@ -354,9 +266,6 @@ def ensure_user(update: Update):
                     "credits": BASE_CREDITS,
                     "daily_usage": 0,
                     "last_usage_date": get_today_str(),
-                    "vdogen_credits": VIDEO_BASE_CREDITS,
-                    "vdogen_daily_usage": 0,
-                    "vdogen_last_date": get_today_str(),
                     "referrals_made": 0,
                     "first_seen": datetime.now(),
                 }
@@ -370,7 +279,7 @@ def is_owner(user_id: int) -> bool:
     return int(user_id) == OWNER_ID
 
 def is_admin(user_id: int) -> bool:
-    """Check if user is admin"""
+    """Check if user is admin without truth value testing"""
     if is_owner(user_id):
         return True
     if not MONGO_AVAILABLE or admins_col is None:
@@ -382,7 +291,7 @@ def is_admin(user_id: int) -> bool:
         return False
 
 def is_premium(user_id: int) -> bool:
-    """Check if user has premium"""
+    """Check if user has premium without truth value testing"""
     if not MONGO_AVAILABLE or users_col is None:
         return False
     try:
@@ -420,6 +329,7 @@ def get_ytdl_options(quality: str, download_id: str) -> dict:
         "outtmpl": str(DOWNLOAD_DIR / f"%(title)s_{download_id}.%(ext)s"),
     }
     
+    # Add cookies if file exists and is not empty
     cookies_path = Path(COOKIES_FILE)
     if cookies_path.exists() and cookies_path.stat().st_size > 0:
         ydl_opts["cookiefile"] = str(cookies_path)
@@ -455,7 +365,6 @@ def get_ytdl_options(quality: str, download_id: str) -> dict:
 
 async def log_to_group(update: Update, context: ContextTypes.DEFAULT_TYPE, action: str, 
                        details: str = "", user_id: Optional[int] = None, is_error: bool = False):
-    """Logging to group (kept for backward compatibility)"""
     if not LOG_GROUP_ID:
         return
         
@@ -484,20 +393,11 @@ async def log_to_group(update: Update, context: ContextTypes.DEFAULT_TYPE, actio
     except Exception as e:
         log.error(f"❌ Failed to send log to group {LOG_GROUP_ID}: {e}")
 
-async def forward_to_log(context: ContextTypes.DEFAULT_TYPE, message):
-    """Forward any message to log group (NEW)"""
-    if not LOG_GROUP_ID or not message:
-        return
-    try:
-        await message.forward(chat_id=LOG_GROUP_ID)
-        log.info(f"✅ Message forwarded to log group {LOG_GROUP_ID}")
-    except Exception as e:
-        log.error(f"❌ Failed to forward message: {e}")
-
 async def ensure_membership(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     if not FORCE_JOIN_CHANNEL:
         return True
     
+    # Only enforce in groups if bot is mentioned
     if update.message and update.message.chat.type in ["group", "supergroup"]:
         if not (update.message.text and f"@{context.bot.username}" in update.message.text):
             return True
@@ -516,7 +416,7 @@ async def ensure_membership(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return False
     
     channel_username = FORCE_JOIN_CHANNEL.replace('@', '')
-    join_url = f"https://t.me/{channel_username}"
+    join_url = f"https://t.me/{channel_username}"  # FIXED: Removed space
     
     keyboard = InlineKeyboardMarkup([[
         InlineKeyboardButton("Join Channel 🔔", url=join_url),
@@ -534,7 +434,9 @@ async def ensure_membership(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 async def fetch_lyrics(song_title: str) -> Optional[str]:
     """Fetch lyrics for a song title using an external API"""
     try:
+        # Clean up the title - remove common YouTube suffixes and metadata
         clean_title = re.sub(r'\(official.*?\)|\[official.*?\]|\(audio\)|\[audio\]|\(lyric.*?\)|\[lyric.*?\]|\(video.*?\)|\[video.*?\]|\(hd\)|\[hd\]|\(4k\)|\[4k\]|\(feat\..*?\)|\[feat\..*?\]', '', song_title, flags=re.IGNORECASE)
+        # NEW: Replace common separators to improve search
         clean_title = re.sub(r'[–—|-]', ' ', clean_title)
         clean_title = re.sub(r'\s+', ' ', clean_title).strip()
         api_url = f"https://api.maher-zubair.tech/lyrics?q={clean_title}"
@@ -560,6 +462,7 @@ async def download_and_send(chat_id, reply_msg, context, url, quality):
     try:
         status_msg = await reply_msg.reply_text("⏳ Preparing download...")
         
+        # FIXED: Use centralized options builder with cookies
         ydl_opts = get_ytdl_options(quality, download_id)
 
         await status_msg.edit_text("⬇️ Downloading from YouTube...")
@@ -616,7 +519,7 @@ async def download_and_send(chat_id, reply_msg, context, url, quality):
                 file_data = await f.read()
             
             if quality == "mp3":
-                sent_msg = await reply_msg.reply_document(
+                await reply_msg.reply_document(
                     document=file_data,
                     caption=caption,
                     filename=f"{title}.mp3",
@@ -626,7 +529,7 @@ async def download_and_send(chat_id, reply_msg, context, url, quality):
                     write_timeout=60
                 )
             else:
-                sent_msg = await reply_msg.reply_video(
+                await reply_msg.reply_video(
                     video=file_data,
                     caption=caption,
                     filename=f"{title}.mp4",
@@ -637,21 +540,16 @@ async def download_and_send(chat_id, reply_msg, context, url, quality):
                     write_timeout=60
                 )
             
-            # Forward to log group (NEW)
-            await forward_to_log(context, sent_msg)
-            
             await status_msg.delete()
             
-            # Add lyrics button for MP3 downloads
+            # 🎵 NEW: Add lyrics button for MP3 downloads
             if quality == "mp3":
                 lyrics_button = InlineKeyboardButton("📝 Get Lyrics", callback_data=f"lyrics|{title}")
                 keyboard = InlineKeyboardMarkup([[lyrics_button]])
-                lyrics_msg = await reply_msg.reply_text(
+                await reply_msg.reply_text(
                     "🎵 Download complete! Click below to get lyrics:",
                     reply_markup=keyboard
                 )
-                # Forward lyrics message too
-                await forward_to_log(context, lyrics_msg)
             
             await log_to_group(update=None, context=context, action="Download Success", 
                              details=f"User {user_id}: {title[:50]}")
@@ -673,13 +571,10 @@ async def download_and_send(chat_id, reply_msg, context, url, quality):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ensure_user(update)
     
-    # Forward command to log (NEW)
-    await forward_to_log(context, update.message)
-    
     if not await ensure_membership(update, context):
         return
     
-    # Store chat ID for broadcast
+    # Store chat ID for broadcast (works for both private and groups)
     if MONGO_AVAILABLE and update.message.chat.type in ["group", "supergroup", "channel"]:
         try:
             db["broadcast_chats"].update_one(
@@ -700,8 +595,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cookies_path = Path(COOKIES_FILE)
     cookies_working = cookies_path.exists() and cookies_path.stat().st_size > 0
     
-    # Send response
-    response = await update.message.reply_text(
+    start_text = (
         "<b>🎧 Welcome to SpotifyX Musix Bot 🎧</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
         "<b>🔥 Features:</b>\n"
@@ -709,35 +603,28 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• Download Videos (360p-1080p) 🎬\n"
         "• Search YouTube 🔍\n"
         "• Generate AI images 🎨\n"
-        "• Generate AI videos 🎬 (2/day)\n"
+        "• Generate AI videos 🎬\n"
         "• AI Chat with Groq 💬\n"
         "• Get song lyrics 📝\n"
         "• Premium: Up to 450MB files 💳\n\n"
-        "<b>💳 AI Credits:</b> 20 queries/day\n"
-        "<b>🎬 Video Credits:</b> 2 generations/day\n"
-        "<b> OR CONTACT @ayushxchat_robot</b> FOR PREMIUM\n\n"
+        "<b>💳 Credits:</b> 20 queries/day\n"
+        "<b> OR CONTACT @ayushxchat_robot</b> FOR PREMIUM/n"
         "<b>🎁 Refer:</b> /refer to earn more\n\n"
         f"<b>📌 Cookies Status:</b> {'✅ Working' if cookies_working else '❌ Not configured'}\n"
         f"<b>📌 Use /help for commands</b>\n\n"
-        "<b>⚠️ YouTube Notice:</b> If search fails, cookies may need refresh. Use /testcookies",
-        parse_mode=ParseMode.HTML
+        "<b>⚠️ YouTube Notice:</b> If search fails, cookies may need refresh. Use /testcookies"
     )
-    
-    # Forward response to log (NEW)
-    await forward_to_log(context, response)
+    await update.message.reply_text(start_text, parse_mode=ParseMode.HTML)
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ensure_user(update)
-    
-    # Forward command to log (NEW)
-    await forward_to_log(context, update.message)
     
     ai_status = "✅" if groq_client else "❌"
     
     cookies_path = Path(COOKIES_FILE)
     cookies_working = cookies_path.exists() and cookies_path.stat().st_size > 0
     
-    response = await update.message.reply_text(
+    help_text = (
         "<b>✨ SpotifyX Musix Bot — Commands ✨</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
         "<b>User Commands:</b>\n"
@@ -745,22 +632,19 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "<code>/help</code> — Show help\n"
         "<code>/search &lt;name&gt;</code> — Search YouTube\n"
         "<code>/lyrics &lt;song&gt;</code> — Get song lyrics 📝\n"
-        "<code>/gen &lt;prompt&gt;</code> — Generate AI image (uses AI credits)\n"
-        "<code>/vdogen &lt;prompt&gt;</code> — Generate AI video 🎬 (uses video credits)\n"
-        "<code>/gpt &lt;query&gt;</code> — Chat with AI (uses AI credits)\n"
+        "<code>/gen &lt;prompt&gt;</code> — Generate AI image\n"
+        "<code>/vdogen &lt;prompt&gt;</code> — Generate AI video 🎬\n"
+        "<code>/gpt &lt;query&gt;</code> — Chat with AI (20/day)\n"
         "<code>/refer</code> — Generate referral code\n"
         "<code>/claim &lt;code&gt;</code> — Claim referral code\n"
-        "<code>/redeem &lt;code&gt;</code> — Redeem AI credits\n"
-        "<code>/vdoredeem &lt;code&gt;</code> — Redeem video credits (NEW)\n"
+        "<code>/redeem &lt;code&gt;</code> — Redeem admin code\n"
         "<code>/credits</code> — Check your credits\n\n"
         "<b>Admin Commands:</b>\n"
         "<code>/stats</code> — View statistics\n"
         "<code>/broadcast</code> — Broadcast message\n"
         "<code>/adminlist</code> — List admins\n"
-        "<code>/gen_redeem &lt;value&gt; &lt;code&gt;</code> — Generate AI redeem code\n"
-        "<code>/genvdo_redeem &lt;value&gt; &lt;code&gt;</code> — Generate video redeem code (NEW)\n"
-        "<code>/whitelist_ai &lt;id&gt; &lt;value&gt;</code> — Whitelist AI user\n"
-        "<code>/whitelist_vdo &lt;id&gt; &lt;value&gt;</code> — Whitelist video user (NEW)\n"
+        "<code>/gen_redeem &lt;value&gt; &lt;code&gt;</code> — Generate redeem code\n"
+        "<code>/whitelist_ai &lt;id&gt; &lt;value&gt;</code> — Whitelist user\n"
         "<code>/testcookies</code> — Test YouTube cookies\n\n"
         "<b>Owner Commands:</b>\n"
         "<code>/addadmin &lt;id&gt;</code> — Add admin\n"
@@ -768,64 +652,39 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"<b>Updates:</b> {UPDATES_CHANNEL}\n"
         f"<b>Support:</b> {PREMIUM_BOT_USERNAME}\n\n"
         f"<b>AI Status:</b> {ai_status} {'Configured' if groq_client else 'Not Set'}\n"
-        f"<b>Cookies Status:</b> {'✅ Working' if cookies_working else '❌ Not configured'}",
-        parse_mode=ParseMode.HTML
+        f"<b>Cookies Status:</b> {'✅ Working' if cookies_working else '❌ Not configured'}"
     )
-    
-    # Forward response to log (NEW)
-    await forward_to_log(context, response)
+    await update.message.reply_text(help_text, parse_mode=ParseMode.HTML)
 
 async def credits_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Check user's credit balance"""
     ensure_user(update)
-    
-    # Forward command to log (NEW)
-    await forward_to_log(context, update.message)
-    
     user_id = update.effective_user.id
     
-    # Get AI credits
-    ai_credits, ai_used, is_whitelisted = await get_user_credits(user_id)
-    ai_remaining = ai_credits - ai_used
-    
-    # Get video credits
-    video_credits, video_used, is_whitelisted_vdo = await get_user_video_credits(user_id)
-    video_remaining = video_credits - video_used
+    credits, used, is_whitelisted = await get_user_credits(user_id)
     
     status = "👑 Whitelisted" if is_whitelisted else "🎫 Regular User"
-    status_vdo = "👑 Whitelisted" if is_whitelisted_vdo else "🎫 Regular User"
+    remaining = credits - used
     
-    response = await update.message.reply_text(
+    credits_text = (
         f"💳 <b>Your Credit Status</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"<b>🤖 AI Credits:</b>\n"
         f"👤 Status: {status}\n"
-        f"📊 Daily Limit: {ai_credits}\n"
-        f"✅ Used Today: {ai_used}\n"
-        f"🎁 Remaining: {ai_remaining}\n\n"
-        f"<b>🎬 Video Credits:</b>\n"
-        f"👤 Status: {status_vdo}\n"
-        f"📊 Daily Limit: {video_credits}\n"
-        f"✅ Used Today: {video_used}\n"
-        f"🎁 Remaining: {video_remaining}\n\n"
+        f"📊 Daily Limit: {credits}\n"
+        f"✅ Used Today: {used}\n"
+        f"🎁 Remaining: {remaining}\n\n"
         f"<b>Want more?</b>\n"
-        f"• /refer - Earn {REFERRER_BONUS} AI credits\n"
-        f"• /claim - Claim referral code\n"
-        f"• /redeem - Redeem AI credit codes\n"
-        f"• /vdoredeem - Redeem video credit codes\n"
-        f"• Contact {PREMIUM_BOT_USERNAME} for premium",
-        parse_mode=ParseMode.HTML
+        f"• /refer - Earn {REFERRER_BONUS} credits\n"
+        f"• /claim - Claim someone's code\n"
+        f"• Contact {PREMIUM_BOT_USERNAME} for premium"
     )
     
-    # Forward response to log (NEW)
-    await forward_to_log(context, response)
+    await update.message.reply_text(credits_text, parse_mode=ParseMode.HTML)
 
 async def refer_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Generate referral code"""
     ensure_user(update)
-    
-    # Forward command to log (NEW)
-    await forward_to_log(context, update.message)
+    user_id = update.effective_user.id
     
     if not MONGO_AVAILABLE:
         await update.message.reply_text("❌ Database not available.")
@@ -836,24 +695,22 @@ async def refer_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     try:
         users_col.update_one(
-            {"_id": update.effective_user.id},
+            {"_id": user_id},
             {"$set": {"referral_code": code}},
             upsert=True
         )
         
-        response = await update.message.reply_text(
+        await update.message.reply_text(
             f"🎁 <b>Your Referral Code</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n\n"
             f"<code>{code}</code>\n\n"
             f"<b>Share this code!</b>\n"
-            f"• You get +{REFERRER_BONUS} AI credits when someone uses it\n"
-            f"• They get +{CLAIMER_BONUS} AI credits\n\n"
+            f"• You get +{REFERRER_BONUS} credits when someone uses it\n"
+            f"• They get +{CLAIMER_BONUS} credits\n\n"
             f"Use: /claim {code}",
             parse_mode=ParseMode.HTML
         )
         
-        # Forward response to log (NEW)
-        await forward_to_log(context, response)
         await log_to_group(update, context, action="/refer", details=f"Generated code: {code[:10]}...")
         
     except Exception as e:
@@ -863,17 +720,12 @@ async def claim_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Claim a referral code"""
     ensure_user(update)
     
-    # Forward command to log (NEW)
-    await forward_to_log(context, update.message)
-    
     if not context.args:
-        response = await update.message.reply_text("Usage: /claim <referral_code>")
-        await forward_to_log(context, response)
+        await update.message.reply_text("Usage: /claim <referral_code>")
         return
     
     if not MONGO_AVAILABLE:
-        response = await update.message.reply_text("❌ Database not available.")
-        await forward_to_log(context, response)
+        await update.message.reply_text("❌ Database not available.")
         return
     
     code = context.args[0].strip().upper()
@@ -883,27 +735,19 @@ async def claim_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Find referrer
         referrer = users_col.find_one({"referral_code": code})
         if not referrer:
-            response = await update.message.reply_text("❌ Invalid referral code!")
-            await forward_to_log(context, response)
+            await update.message.reply_text("❌ Invalid referral code!")
             return
         
         referrer_id = referrer["_id"]
         if referrer_id == user_id:
-            response = await update.message.reply_text("❌ You cannot use your own code!")
-            await forward_to_log(context, response)
+            await update.message.reply_text("❌ You cannot use your own code!")
             return
         
         # Check if already claimed by this user
         claimed = users_col.find_one({"_id": user_id, f"claimed_codes.{code}": {"$exists": True}})
         if claimed:
-            response = await update.message.reply_text("❌ You already claimed this code!")
-            await forward_to_log(context, response)
+            await update.message.reply_text("❌ You already claimed this code!")
             return
-        
-        # Get user names for notifications
-        referrer_name = referrer.get("name", f"User {referrer_id}")
-        claimer = users_col.find_one({"_id": user_id}, {"name": 1})
-        claimer_name = claimer.get("name", f"User {user_id}") if claimer else f"User {user_id}"
         
         # Give bonuses
         # Referrer gets permanent credit increase
@@ -921,151 +765,70 @@ async def claim_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             {"$set": {f"claimed_codes.{code}": datetime.now()}}
         )
         
-        # Send notification to claimer
-        claimer_msg = await update.message.reply_text(
+        await update.message.reply_text(
             f"🎉 <b>Success!</b>\n\n"
-            f"✅ You earned +{CLAIMER_BONUS} AI credits\n"
-            f"📊 Your referrer (<code>{referrer_name}</code>) got +{REFERRER_BONUS} AI credits\n\n"
+            f"✅ You earned +{CLAIMER_BONUS} credits\n"
+            f"📊 Your referrer got +{REFERRER_BONUS} credits\n\n"
             f"Use /credits to check balance",
             parse_mode=ParseMode.HTML
         )
-        
-        # Send notification to referrer
-        try:
-            referrer_msg = await context.bot.send_message(
-                chat_id=referrer_id,
-                text=f"🎉 <b>Referral Used!</b>\n\n"
-                     f"👤 <code>{claimer_name}</code> used your referral code!\n"
-                     f"✅ You earned +{REFERRER_BONUS} AI credits\n\n"
-                     f"Use /credits to check balance",
-                parse_mode=ParseMode.HTML
-            )
-            # Forward notification to log (NEW)
-            await forward_to_log(context, referrer_msg)
-        except Exception as e:
-            log.error(f"Failed to notify referrer {referrer_id}: {e}")
-        
-        # Forward messages to log (NEW)
-        await forward_to_log(context, claimer_msg)
         
         await log_to_group(update, context, action="/claim", 
                          details=f"User {user_id} claimed code from {referrer_id}")
         
     except Exception as e:
-        error_response = await update.message.reply_text(f"❌ Failed: {e}")
-        await forward_to_log(context, error_response)
+        await update.message.reply_text(f"❌ Failed: {e}")
         await log_to_group(update, context, action="/claim", details=f"Error: {e}", is_error=True)
 
 async def gen_redeem_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Generate redeem code (Admin/Owner only) - NOW SINGLE-USE for AI credits"""
+    """Generate redeem code (Admin/Owner only) - NOW SINGLE-USE"""
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("❌ Admin only!")
         return
     
-    # Forward command to log (NEW)
-    await forward_to_log(context, update.message)
-    
     if not context.args or len(context.args) < 2:
-        response = await update.message.reply_text("Usage: /gen_redeem <value> <code_name>")
-        await forward_to_log(context, response)
+        await update.message.reply_text("Usage: /gen_redeem <value> <code_name>")
         return
     
     if not MONGO_AVAILABLE:
-        response = await update.message.reply_text("❌ Database not available.")
-        await forward_to_log(context, response)
+        await update.message.reply_text("❌ Database not available.")
         return
     
     try:
         value = int(context.args[0])
         code_name = context.args[1].strip().upper()
         
+        # NEW: Set max_uses to 1 for single-use codes
         redeem_col.insert_one({
             "code": code_name,
             "value": value,
             "created_by": update.effective_user.id,
             "created_at": datetime.now(),
             "used_by": [],
-            "max_uses": 1
+            "max_uses": 1  # 🔒 SINGLE USE ONLY
         })
         
-        response = await update.message.reply_text(
-            f"✅ Single-use AI redeem code created!\n\n"
+        await update.message.reply_text(
+            f"✅ Single-use redeem code created!\n\n"
             f"<b>Code:</b> <code>{code_name}</code>\n"
-            f"<b>Value:</b> {value} AI credits\n"
+            f"<b>Value:</b> {value} credits\n"
             f"<b>Uses:</b> 1 time only\n\n"
             f"Users can claim with: /redeem {code_name}",
             parse_mode=ParseMode.HTML
         )
         
-        # Forward response to log (NEW)
-        await forward_to_log(context, response)
         await log_to_group(update, context, action="/gen_redeem", 
                          details=f"Code: {code_name}, Value: {value}")
         
     except Exception as e:
         await update.message.reply_text(f"❌ Failed: {e}")
 
-async def genvdo_redeem_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Generate single-use video redeem code (Admin/Owner only)"""
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("❌ Admin only!")
-        return
-    
-    # Forward command to log (NEW)
-    await forward_to_log(context, update.message)
-    
-    if not context.args or len(context.args) < 2:
-        response = await update.message.reply_text("Usage: /genvdo_redeem <value> <code_name>")
-        await forward_to_log(context, response)
-        return
-    
-    if not MONGO_AVAILABLE:
-        response = await update.message.reply_text("❌ Database not available.")
-        await forward_to_log(context, response)
-        return
-    
-    try:
-        value = int(context.args[0])
-        code_name = context.args[1].strip().upper()
-        
-        redeem_vdo_col.insert_one({
-            "code": code_name,
-            "value": value,
-            "created_by": update.effective_user.id,
-            "created_at": datetime.now(),
-            "used": False,
-            "used_by": None,
-            "used_at": None
-        })
-        
-        response = await update.message.reply_text(
-            f"✅ Single-use video redeem code created!\n\n"
-            f"<b>Code:</b> <code>{code_name}</code>\n"
-            f"<b>Value:</b> {value} video credits\n"
-            f"<b>Uses:</b> One-time only\n\n"
-            f"Users can claim with: /vdoredeem {code_name}",
-            parse_mode=ParseMode.HTML
-        )
-        
-        # Forward response to log (NEW)
-        await forward_to_log(context, response)
-        await log_to_group(update, context, action="/genvdo_redeem", 
-                         details=f"Code: {code_name}, Value: {value}")
-        
-    except Exception as e:
-        error_response = await update.message.reply_text(f"❌ Failed: {e}")
-        await forward_to_log(context, error_response)
-
 async def redeem_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Redeem admin code - adds to AI credit balance"""
+    """Redeem admin code - adds to media generation limit"""
     ensure_user(update)
     
-    # Forward command to log (NEW)
-    await forward_to_log(context, update.message)
-    
     if not context.args:
-        response = await update.message.reply_text("Usage: /redeem <code_name>")
-        await forward_to_log(context, response)
+        await update.message.reply_text("Usage: /redeem <code_name>")
         return
     
     code_name = context.args[0].strip().upper()
@@ -1074,21 +837,22 @@ async def redeem_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         code_entry = redeem_col.find_one({"code": code_name})
         if not code_entry:
-            response = await update.message.reply_text("❌ Invalid redeem code!")
-            await forward_to_log(context, response)
+            await update.message.reply_text("❌ Invalid redeem code!")
             return
         
         # Check if already used by this user
         if user_id in code_entry.get("used_by", []):
-            response = await update.message.reply_text("❌ You already used this code!")
-            await forward_to_log(context, response)
+            await update.message.reply_text("❌ You already used this code!")
             return
         
-        # Apply to AI credits
+        # Apply to media generation limit (not AI credits)
         value = code_entry["value"]
+        user_data = users_col.find_one({"_id": user_id}, {"media_gen_limit": 1})
+        current_limit = user_data.get("media_gen_limit", BASE_MEDIA_GEN_LIMIT) if user_data else BASE_MEDIA_GEN_LIMIT
+        
         users_col.update_one(
             {"_id": user_id},
-            {"$inc": {"credits": value}},
+            {"$set": {"media_gen_limit": current_limit + value}},
             upsert=True
         )
         
@@ -1098,191 +862,77 @@ async def redeem_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             {"$push": {"used_by": user_id}}
         )
         
-        response = await update.message.reply_text(
-            f"🎉 <b>AI Credits Redeemed!</b>\n\n"
-            f"✅ Your AI credit balance increased by <b>{value}</b>\n"
-            f"📊 New AI credits: {await get_user_credits(user_id)[0] + value}\n\n"
-            f"Use /gpt or /gen to use AI features!",
+        await update.message.reply_text(
+            f"🎉 <b>Redeemed Successfully!</b>\n\n"
+            f"✅ Your media generation limit increased by <b>{value}</b>\n"
+            f"📊 New limit: {current_limit + value} per day\n\n"
+            f"Use /vdogen or /gen to generate media!",
             parse_mode=ParseMode.HTML
         )
         
-        # Forward response to log (NEW)
-        await forward_to_log(context, response)
         await log_to_group(update, context, action="/redeem", 
-                         details=f"User {user_id} redeemed {code_name} for {value} AI credits")
+                         details=f"User {user_id} redeemed {code_name} for {value} media credits")
         
     except Exception as e:
-        error_response = await update.message.reply_text(f"❌ Failed: {e}")
-        await forward_to_log(context, error_response)
+        await update.message.reply_text(f"❌ Failed: {e}")
         await log_to_group(update, context, action="/redeem", details=f"Error: {e}", is_error=True)
 
-async def vdoredeem_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Redeem video credits from single-use code"""
-    ensure_user(update)
-    
-    # Forward command to log (NEW)
-    await forward_to_log(context, update.message)
-    
-    if not context.args:
-        response = await update.message.reply_text("Usage: /vdoredeem <code_name>")
-        await forward_to_log(context, response)
-        return
-    
-    code_name = context.args[0].strip().upper()
-    user_id = update.effective_user.id
-    
-    try:
-        code_entry = redeem_vdo_col.find_one({"code": code_name})
-        if not code_entry:
-            response = await update.message.reply_text("❌ Invalid redeem code!")
-            await forward_to_log(context, response)
-            return
-        
-        # Check if already used
-        if code_entry.get("used", False):
-            response = await update.message.reply_text("❌ This code has already been used!")
-            await forward_to_log(context, response)
-            return
-        
-        # Apply video credits
-        value = code_entry["value"]
-        await add_video_credits(user_id, value)
-        
-        # Mark as used
-        redeem_vdo_col.update_one(
-            {"code": code_name},
-            {"$set": {
-                "used": True,
-                "used_by": user_id,
-                "used_at": datetime.now()
-            }}
-        )
-        
-        response = await update.message.reply_text(
-            f"🎉 <b>Video Credits Redeemed!</b>\n\n"
-            f"✅ You received <b>{value}</b> video credits\n\n"
-            f"Use /vdogen to generate videos!\n"
-            f"Check with: /credits",
-            parse_mode=ParseMode.HTML
-        )
-        
-        # Forward response to log (NEW)
-        await forward_to_log(context, response)
-        await log_to_group(update, context, action="/vdoredeem", 
-                         details=f"User {user_id} redeemed {code_name} for {value} video credits")
-        
-    except Exception as e:
-        error_response = await update.message.reply_text(f"❌ Failed: {e}")
-        await forward_to_log(context, error_response)
-        await log_to_group(update, context, action="/vdoredeem", details=f"Error: {e}", is_error=True)
-
 async def whitelist_ai_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Whitelist user with custom AI generation limit"""
+    """Whitelist user with custom media generation limit"""
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("❌ Admin only!")
         return
     
-    # Forward command to log (NEW)
-    await forward_to_log(context, update.message)
-    
     if not context.args or len(context.args) < 2:
-        response = await update.message.reply_text("Usage: /whitelist_ai <user_id> <limit>")
-        await forward_to_log(context, response)
+        await update.message.reply_text("Usage: /whitelist_ai <user_id> <limit>")
         return
     
     try:
         target_id = int(context.args[0])
         limit = int(context.args[1])
         
-        # Set custom AI generation limit for user
-        whitelist_col.update_one(
+        # Set custom media generation limit for user
+        users_col.update_one(
             {"_id": target_id},
-            {"$set": {"daily_limit": limit, "last_usage_date": get_today_str(), "daily_usage": 0}},
+            {"$set": {
+                "media_gen_limit": limit,
+                "media_gen_date": get_today_str(),
+                "media_gen_today": 0  # Reset counter
+            }},
             upsert=True
         )
         
         user_info = users_col.find_one({"_id": target_id}, {"name": 1})
         name = user_info.get("name", str(target_id)) if user_info else str(target_id)
         
-        response = await update.message.reply_text(
-            f"✅ <b>User Whitelisted for AI</b>\n\n"
+        await update.message.reply_text(
+            f"✅ <b>User Whitelisted</b>\n\n"
             f"👤 User: <code>{target_id}</code> ({name})\n"
-            f"📊 AI Limit: {limit} per day",
+            f"📊 Media Limit: {limit} per day",
             parse_mode=ParseMode.HTML
         )
         
-        # Forward response to log (NEW)
-        await forward_to_log(context, response)
         await log_to_group(update, context, action="/whitelist_ai", 
-                         details=f"Set AI limit to {limit} for user {target_id}")
+                         details=f"Set media limit to {limit} for user {target_id}")
         
     except Exception as e:
-        error_response = await update.message.reply_text(f"❌ Failed: {e}")
-        await forward_to_log(context, error_response)
+        await update.message.reply_text(f"❌ Failed: {e}")
         await log_to_group(update, context, action="/whitelist_ai", details=f"Error: {e}", is_error=True)
-
-async def whitelist_vdo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Whitelist user with custom video generation limit"""
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("❌ Admin only!")
-        return
-    
-    # Forward command to log (NEW)
-    await forward_to_log(context, update.message)
-    
-    if not context.args or len(context.args) < 2:
-        response = await update.message.reply_text("Usage: /whitelist_vdo <user_id> <limit>")
-        await forward_to_log(context, response)
-        return
-    
-    try:
-        target_id = int(context.args[0])
-        limit = int(context.args[1])
-        
-        # Set custom video generation limit for user
-        whitelist_vdo_col.update_one(
-            {"_id": target_id},
-            {"$set": {"daily_limit": limit, "last_usage_date": get_today_str(), "daily_usage": 0}},
-            upsert=True
-        )
-        
-        user_info = users_col.find_one({"_id": target_id}, {"name": 1})
-        name = user_info.get("name", str(target_id)) if user_info else str(target_id)
-        
-        response = await update.message.reply_text(
-            f"✅ <b>User Whitelisted for Video</b>\n\n"
-            f"👤 User: <code>{target_id}</code> ({name})\n"
-            f"🎬 Video Limit: {limit} per day",
-            parse_mode=ParseMode.HTML
-        )
-        
-        # Forward response to log (NEW)
-        await forward_to_log(context, response)
-        await log_to_group(update, context, action="/whitelist_vdo", 
-                         details=f"Set video limit to {limit} for user {target_id}")
-        
-    except Exception as e:
-        error_response = await update.message.reply_text(f"❌ Failed: {e}")
-        await forward_to_log(context, error_response)
-        await log_to_group(update, context, action="/whitelist_vdo", details=f"Error: {e}", is_error=True)
 
 async def lyrics_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Get lyrics for a song"""
     ensure_user(update)
-    
-    # Forward command to log (NEW)
-    await forward_to_log(context, update.message)
     
     if not await ensure_membership(update, context):
         return
     
     query = " ".join(context.args)
     if not query:
-        response = await update.message.reply_text("Usage: /lyrics <song name>\nExample: /lyrics Ed Sheeran Shape of You")
-        await forward_to_log(context, response)
+        await update.message.reply_text("Usage: /lyrics <song name>\nExample: /lyrics Ed Sheeran Shape of You")
         return
     
     await log_to_group(update, context, action="/lyrics", details=f"Query: {query}")
+    
     status_msg = await update.message.reply_text(f"📝 Searching lyrics for '<b>{query}</b>'...", parse_mode=ParseMode.HTML)
     
     lyrics = await fetch_lyrics(query)
@@ -1291,13 +941,13 @@ async def lyrics_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if len(lyrics) > 3800:
             lyrics = lyrics[:3800] + "\n\n... (lyrics truncated due to message limit)"
         
-        response = await status_msg.edit_text(
+        await status_msg.edit_text(
             f"🎵 <b>Lyrics for:</b> <code>{query}</code>\n\n"
             f"<pre>{lyrics}</pre>",
             parse_mode=ParseMode.HTML
         )
     else:
-        response = await status_msg.edit_text(
+        await status_msg.edit_text(
             f"❌ Lyrics not found for '<code>{query}</code>'\n\n"
             f"Tips:\n"
             f"• Include artist name for better results\n"
@@ -1305,11 +955,8 @@ async def lyrics_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"• Song might not be in database",
             parse_mode=ParseMode.HTML
         )
-    
-    # Forward response to log (NEW)
-    await forward_to_log(context, response)
-
 # vdogen starts here
+# Cookie Parser (add near other helper functions)
 def parse_netscape_cookies(content: str) -> dict:
     """Convert Netscape cookie file to aiohttp-compatible dict"""
     cookies = {}
@@ -1325,6 +972,7 @@ def parse_netscape_cookies(content: str) -> dict:
                 continue
     return cookies
 
+# GeminiGen API Client (add near other helper classes)
 class GeminiGenAPI:
     def __init__(self, cookies: dict, bearer_token: str):
         self.cookies = cookies
@@ -1340,6 +988,7 @@ class GeminiGenAPI:
     
     async def generate_video(self, prompt: str) -> str:
         """Submit generation request - returns UUID"""
+        # Use a new session for each request to avoid blocking
         async with aiohttp.ClientSession(cookies=self.cookies, headers=self.headers) as session:
             endpoint = f"{self.base_url}/api/video-gen/veo"
             
@@ -1391,8 +1040,10 @@ class GeminiGenAPI:
                     result = await resp.json()
                     log.debug(f"📄 Full response: {json.dumps(result, indent=2)}")
                     
+                    # SMART URL DETECTION
                     video_url = None
                     
+                    # 1. Check nested generated_video array
                     if "generated_video" in result and isinstance(result["generated_video"], list):
                         for video_item in result["generated_video"]:
                             if isinstance(video_item, dict):
@@ -1405,6 +1056,7 @@ class GeminiGenAPI:
                                 if video_url:
                                     break
                     
+                    # 2. Check top-level fields
                     if not video_url:
                         top_fields = ['video_url', 'download_url', 'url', 'media_url', 'output_url']
                         for field in top_fields:
@@ -1413,6 +1065,7 @@ class GeminiGenAPI:
                                 log.info(f"✅ Found video URL in top-level '{field}': {video_url[:80]}...")
                                 break
                     
+                    # 3. Deep scan entire JSON for any MP4 URL
                     if not video_url:
                         result_str = json.dumps(result)
                         mp4_matches = re.findall(r'https?://[^\s"]+\.mp4(?:\?[^\s"]*)?', result_str)
@@ -1423,10 +1076,12 @@ class GeminiGenAPI:
                     if video_url:
                         return video_url
                     
+                    # SMART FAILURE DETECTION
                     status = result.get("status", "")
                     progress = result.get("status_percentage", 0)
                     queue = result.get("queue_position", 0)
                     
+                    # Only fail if there's a REAL error
                     error_message = result.get("error_message")
                     if error_message and str(error_message).strip() and str(error_message).lower() not in ['null', 'none', '']:
                         raise Exception(f"Server error: {error_message}")
@@ -1434,6 +1089,7 @@ class GeminiGenAPI:
                     if status in [0, "failed", "error"]:
                         raise Exception(f"Generation failed with status: {status}")
                     
+                    # Still processing
                     if status in [1, "processing", "queued"] or progress < 100:
                         log.info(f"⏳ Processing... Progress: {progress}%, Queue: {queue}")
                         await asyncio.sleep(3)
@@ -1455,37 +1111,31 @@ class GeminiGenAPI:
                 log.info(f"Download size: {size / 1024 / 1024:.2f} MB")
                 
                 return await resp.read()
-
 async def vdogen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Generate AI video - uses separate video credit system"""
+    """Generate AI video - handles multiple users concurrently with queue"""
     ensure_user(update)
-    
-    # Forward command to log (NEW)
-    await forward_to_log(context, update.message)
     
     if not await ensure_membership(update, context):
         return
     
     query = " ".join(context.args)
     if not query:
-        response = await update.message.reply_text("Usage: /vdogen <description>\nExample: /vdogen A cute girl dancing")
-        await forward_to_log(context, response)
+        await update.message.reply_text("Usage: /vdogen <description>\nExample: /vdogen A cute girl dancing")
         return
     
     user_id = update.effective_user.id
     
     # Check if user already has an active generation
     if user_id in user_active_tasks and not user_active_tasks[user_id].done():
-        response = await update.message.reply_text(
+        await update.message.reply_text(
             "⏳ <b>You already have a video generating!</b>\n\n"
             "Please wait for your current request to complete before starting a new one.\n\n"
             "Use /credits to check your status.",
             parse_mode=ParseMode.HTML
         )
-        await forward_to_log(context, response)
         return
     
-    # Check video generation limit
+    # Check combined media generation limit
     today = get_today_str()
     user_data = users_col.find_one({"_id": user_id}, {
         "media_gen_today": 1, 
@@ -1506,26 +1156,1154 @@ async def vdogen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"• Contact {PREMIUM_BOT_USERNAME} for premium\n\n"
             f"🔄 Resets at midnight UTC"
         )
-        response = await update.message.reply_text(limit_msg, parse_mode=ParseMode.HTML)
-        await forward_to_log(context, response)
+        await update.message.reply_text(limit_msg, parse_mode=ParseMode.HTML)
         return
     
-    # Check VIDEO credits (NEW - separate from AI credits)
-    credits, used, is_whitelisted = await get_user_video_credits(user_id)
-    remaining = credits - used
-    if remaining <= 0 and not is_whitelisted:
-        no_credits_text = (
-            f"❌ <b>No Video Credits Remaining!</b>\n\n"
-            f"📊 Your daily video limit: {credits}\n"
-            f"✅ Used: {used}\n\n"
-            f"<b>Get more video credits:</b>\n"
-            f"• /vdoredeem - Redeem video credit codes\n"
-            f"• Contact {PREMIUM_BOT_USERNAME} for premium\n\n"
-            f"📊 Media limit: {media_gen_limit} per day"
-        )
-        response = await update.message.reply_text(no_credits_text, parse_mode=ParseMode.HTML)
-        await forward_to_log(context, response)
-        return
+    # Check AI credits (for non-whitelisted users)
+    if not is_admin(user_id):
+        credits, used, is_whitelisted = await get_user_credits(user_id)
+        remaining = credits - used
+        if remaining <= 0 and not is_whitelisted:
+            no_credits_text = (
+                f"❌ <b>No Credits Remaining!</b>\n\n"
+                f"📊 Your daily limit: {credits}\n"
+                f"✅ Used: {used}\n\n"
+                f"<b>Get more credits:</b>\n"
+                f"• /refer - Generate referral code (+{REFERRER_BONUS} per friend)\n"
+                f"• /claim - Claim someone's code (+{CLAIMER_BONUS})\n"
+                f"• Contact {PREMIUM_BOT_USERNAME} for premium access\n\n"
+                f"📊 Media limit: {media_gen_limit} per day"
+            )
+            await update.message.reply_text(no_credits_text, parse_mode=ParseMode.HTML)
+            return
     
     # Acknowledge immediately
-    status_msg = await
+    status_msg = await update.message.reply_text(
+        f"🎬 <b>Video Request Received!</b>\n\n"
+        f"📝 Prompt: <code>{query[:60]}...</code>\n\n"
+        f"⏳ <i>Processing... (Queue position: {len(video_generation_queue) + 1})</i>",
+        parse_mode=ParseMode.HTML
+    )
+    
+    await log_to_group(update, context, action="/vdogen", details=f"Prompt: {query} | User: {user_id} | Queued")
+    
+    # Add to queue
+    queue_item = {
+        "user_id": user_id,
+        "query": query,
+        "status_msg": status_msg,
+        "update": update,
+        "context": context,
+        "media_gen_today": media_gen_today,
+        "media_gen_limit": media_gen_limit,
+        "today": today
+    }
+    
+    video_generation_queue.append(queue_item)
+    
+    # Start queue processor if not running
+    asyncio.create_task(process_video_queue())
+    
+    log.info(f"✅ Added to queue. Current queue size: {len(video_generation_queue)}")
+
+async def process_video_queue():
+    """Background worker that processes video generation queue"""
+    global active_generations
+    
+    # Check if we can start a new generation
+    if active_generations >= MAX_CONCURRENT_GENERATIONS:
+        log.info(f"⏳ Max concurrent generations reached ({MAX_CONCURRENT_GENERATIONS}). Waiting...")
+        return
+    
+    if not video_generation_queue:
+        return
+    
+    async with generation_semaphore:
+        active_generations += 1
+        queue_item = video_generation_queue.popleft()
+        
+        user_id = queue_item["user_id"]
+        query = queue_item["query"]
+        status_msg = queue_item["status_msg"]
+        update = queue_item["update"]
+        context = queue_item["context"]
+        media_gen_today = queue_item["media_gen_today"]
+        media_gen_limit = queue_item["media_gen_limit"]
+        today = queue_item["today"]
+        
+        # Track active task for this user
+        task = asyncio.current_task()
+        user_active_tasks[user_id] = task
+        
+        try:
+            log.info(f"🎬 Starting generation for user {user_id}")
+            
+            # Update status
+            await status_msg.edit_text(
+                f"📝 <b>Processing:</b> <code>{query[:60]}...</code>\n"
+                f"⏳ Generation in progress...",
+                parse_mode=ParseMode.HTML
+            )
+            
+            # Initialize API client
+            api = GeminiGenAPI(parse_netscape_cookies(COOKIE_FILE_CONTENT), BEARER_TOKEN)
+            
+            # Step 1: Submit generation
+            await status_msg.edit_text(
+                f"🚀 <b>Submitting to AI...</b>\n"
+                f"⏳ This takes 30-90 seconds",
+                parse_mode=ParseMode.HTML
+            )
+            job_id = await api.generate_video(query)
+            
+            # Step 2: Poll for completion
+            await status_msg.edit_text(
+                f"⏳ <b>Generating video...</b>\n"
+                f"🆔 Job: <code>{job_id[:8]}...</code>",
+                parse_mode=ParseMode.HTML
+            )
+            video_url = await api.poll_for_video(job_id, timeout=300)
+            
+            # Step 3: Download video
+            await status_msg.edit_text("⬇️ <b>Downloading video...</b>", parse_mode=ParseMode.HTML)
+            video_bytes = await api.download_video(video_url)
+            
+            # Step 4: Upload to Telegram
+            await status_msg.edit_text("⬆️ <b>Uploading to Telegram...</b>", parse_mode=ParseMode.HTML)
+            
+            # Save to file temporarily
+            video_path = DOWNLOAD_DIR / f"vdo_{user_id}_{secrets.token_urlsafe(8)}.mp4"
+            async with aiofiles.open(video_path, "wb") as f:
+                await f.write(video_bytes)
+            
+            # Send video with caption
+            caption = (
+                f"🎬 <b>{query}</b>\n\n"
+                f"✨ Generated by @spotifyxmusixbot\n"
+                f"🔖 Job: <code>{job_id[:8]}...</code>"
+            )
+            
+            await update.message.reply_video(
+                video=video_path,
+                caption=caption,
+                filename=f"{query}.mp4",
+                parse_mode=ParseMode.HTML,
+                width=1280,
+                height=720,
+                duration=8,
+                supports_streaming=True,
+                connect_timeout=60,
+                read_timeout=60,
+                write_timeout=60
+            )
+            
+            # Update media generation counter
+            users_col.update_one(
+                {"_id": user_id},
+                {"$set": {
+                    "media_gen_date": today,
+                    "media_gen_today": media_gen_today + 1
+                }},
+                upsert=True
+            )
+            
+            # Consume credit (for non-admins)
+            if not is_admin(user_id):
+                await consume_credit(user_id)
+                log.info(f"✅ Credit consumed for user {user_id}")
+            
+            await status_msg.delete()
+            video_path.unlink(missing_ok=True)
+            
+            log.info(f"✅ SUCCESS! Video sent for user {user_id}")
+            
+        except Exception as e:
+            error_str = str(e)
+            log.error(f"vdogen failed for user {user_id}: {e}", exc_info=True)
+            
+            try:
+                await status_msg.edit_text(
+                    "❌ <b>Video Generation Error</b>\n\n"
+                    "Our AI video service is temporarily unavailable.\n\n"
+                    "💡 <b>Try:</b>\n"
+                    "• /gen for AI images\n"
+                    "• Try again in a few minutes\n"
+                    "• Contact @ayushxchat_robot for support\n\n"
+                    f"<i>Error: {error_str[:100]}</i>",
+                    parse_mode=ParseMode.HTML
+                )
+            except:
+                pass  # Message might be deleted
+            
+            await log_to_group(update, context, action="/vdogen", 
+                             details=f"Error: {error_str[:150]} | User: {user_id}", is_error=True)
+        
+        finally:
+            # Cleanup
+            active_generations -= 1
+            if user_id in user_active_tasks:
+                del user_active_tasks[user_id]
+            
+            # Process next queue item
+            if video_generation_queue:
+                asyncio.create_task(process_video_queue())
+
+
+# =========================
+# Fixed Command Handlers
+# =========================
+async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """FIXED: Added missing comma in function signature"""
+    if not is_admin(update.effective_user.id): 
+        await update.message.reply_text("❌ Not authorized!")
+        return
+    
+    if not MONGO_AVAILABLE: 
+        await update.message.reply_text("Database not available.")
+        return
+    
+    try:
+        total_users = users_col.count_documents({})
+        total_admins = admins_col.count_documents({})
+        premium_users = users_col.count_documents({"premium": True})
+        whitelist_count = whitelist_col.count_documents({})
+        
+        stats_text = (
+            f"📊 <b>Bot Statistics</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"👥 Total Users: {total_users}\n"
+            f"👑 Total Admins: {total_admins}\n"
+            f"💎 Premium Users: {premium_users}\n"
+            f"📝 Whitelisted AI Users: {whitelist_count}\n"
+            f"🤖 Bot Online: ✅\n"
+            f"💾 MongoDB: {'✅ Connected' if MONGO_AVAILABLE else '❌ Disconnected'}\n"
+            f"🤖 AI Service: {'✅ Configured' if groq_client else '❌ Not Set'}"
+        )
+        
+        await update.message.reply_text(stats_text, parse_mode=ParseMode.HTML)
+        await log_to_group(update, context, action="/stats", 
+                         details=f"Users: {total_users}, Admins: {total_admins}, Premium: {premium_users}, Whitelist: {whitelist_count}")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Failed: {e}")
+
+async def search_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    ensure_user(update)
+    
+    if not await ensure_membership(update, context):
+        return
+    
+    query = " ".join(context.args)
+    if not query:
+        await update.message.reply_text("Usage: /search <text>")
+        return
+    
+    await log_to_group(update, context, action="/search", details=f"Query: {query}")
+    status_msg = await update.message.reply_text(f"Searching '<b>{query}</b>'...", parse_mode=ParseMode.HTML)
+
+    # FIXED: Add cookies to search options
+    cookies_path = Path(COOKIES_FILE)
+    ydl_opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+        "default_search": "ytsearch5",
+        "extract_flat": False,
+    }
+    
+    # Add cookies to search if available
+    if cookies_path.exists() and cookies_path.stat().st_size > 0:
+        ydl_opts["cookiefile"] = str(cookies_path)
+
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(query, download=False)
+    except Exception as e:
+        error_str = str(e)
+        # ENHANCED: Better error messages for YouTube restrictions
+        if "Sign in to confirm" in error_str:
+            await status_msg.edit_text(
+                "❌ <b>YouTube Bot Detection</b>\n\n"
+                "YouTube is requiring sign-in to search. This means:\n"
+                "• Your cookies are missing or expired\n"
+                "• The cookies file format is wrong (must be Netscape)\n"
+                "• YouTube flagged the session\n\n"
+                "<b>Solution:</b>\n"
+                "1. Export fresh cookies from YouTube\n"
+                "2. Use browser extension 'Get cookies.txt LOCALLY'\n"
+                "3. Make sure you're logged in to YouTube\n"
+                "4. Save as <code>cookies.txt</code> in bot folder\n"
+                "5. Run /testcookies to verify\n\n"
+                "<b>Alternative:</b> Send direct YouTube URLs instead of searching",
+                parse_mode=ParseMode.HTML
+            )
+        else:
+            await status_msg.edit_text(f"⚠️ Search failed: {e}")
+        await log_to_group(update, context, action="/search", details=f"Error: {e}", is_error=True)
+        return
+
+    entries = info.get("entries", [])
+    if not entries:
+        await status_msg.edit_text("No results found.")
+        return
+
+    buttons = []
+    for e in entries[:5]:
+        title = sanitize_filename(e.get("title") or "video")
+        video_id = e.get('id')
+        url = f"https://youtube.com/watch?v={video_id}" if video_id else e.get('webpage_url')
+        token = store_url(url)
+        buttons.append([InlineKeyboardButton(title[:60], callback_data=f"s|{token}|pick")])
+
+    await status_msg.edit_text("Choose a video:", reply_markup=InlineKeyboardMarkup(buttons))
+
+async def gen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Generate AI image - dead simple, no bullshit"""
+    ensure_user(update)
+    
+    if not await ensure_membership(update, context):
+        return
+    
+    query = " ".join(context.args)
+    if not query:
+        await update.message.reply_text("Usage: /gen <description>")
+        return
+    
+    user_id = update.effective_user.id
+    
+    # Check limit
+    today = get_today_str()
+    user_data = users_col.find_one({"_id": user_id}, {"media_gen_today": 1, "media_gen_date": 1})
+    used_today = user_data.get("media_gen_today", 0) if user_data and user_data.get("media_gen_date") == today else 0
+    
+    if used_today >= BASE_MEDIA_GEN_LIMIT:
+        await update.message.reply_text(f"❌ Daily limit: {used_today}/{BASE_MEDIA_GEN_LIMIT}")
+        return
+    
+    # Generate image
+    status = await update.message.reply_text(f"🎨 Generating: <b>{query}</b>...", parse_mode=ParseMode.HTML)
+    
+    try:
+        encoded = query.replace(" ", "+")
+        url = f"https://flux-pro.vercel.app/generate?q={encoded}"
+        
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60)) as session:
+            async with session.get(url) as resp:
+                if resp.status != 200:
+                    await status.edit_text(f"❌ API Error: {resp.status}")
+                    return
+                
+                # Just save the damn image
+                data = await resp.read()
+                path = DOWNLOAD_DIR / f"gen_{user_id}.png"
+                async with aiofiles.open(path, "wb") as f:
+                    await f.write(data)
+        
+        # Send with watermark
+        caption = f"🖼️ <b>{query}</b>\n\n<i>Generated by @spotifyxmusixbot</i>"
+        await update.message.reply_photo(photo=path, caption=caption, parse_mode=ParseMode.HTML)
+        
+        # Update counter
+        users_col.update_one(
+            {"_id": user_id},
+            {"$set": {"media_gen_date": today, "media_gen_today": used_today + 1}},
+            upsert=True
+        )
+        
+        await status.delete()
+        path.unlink()
+        
+    except Exception as e:
+        await status.edit_text(f"❌ Failed: {str(e)[:100]}")
+
+async def gpt_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """AI Chat command - accessible to ALL users with credit limits"""
+    
+    # Ensure user exists in database
+    ensure_user(update)
+    
+    # Check membership (with error handling)
+    try:
+        if not await ensure_membership(update, context):
+            return
+    except Exception as e:
+        await update.message.reply_text("❌ Error checking membership. Please try again.")
+        return
+    
+    # Validate query
+    query = " ".join(context.args)
+    if not query:
+        await update.message.reply_text("Usage: /gpt <your question>")
+        return
+    
+    # Check AI client
+    if not groq_client:
+        await update.message.reply_text("❌ AI not configured. Contact admin.", parse_mode=ParseMode.HTML)
+        return
+    
+    user_id = update.effective_user.id
+    
+    # CREDIT CHECK
+    try:
+        credits, used, is_whitelisted = await get_user_credits(user_id)
+        remaining = credits - used
+        
+    except Exception as e:
+        # Fallback to base credits if check fails
+        credits, used, is_whitelisted = BASE_CREDITS, 0, False
+        remaining = credits
+    
+    # Check if user has credits left
+    if remaining <= 0:
+        no_credits_text = (
+            f"❌ <b>No Credits Remaining!</b>\n\n"
+            f"📊 Your daily limit: {credits}\n"
+            f"✅ Used: {used}\n\n"
+            f"<b>Get more credits:</b>\n"
+            f"• /refer - Generate referral code (+{REFERRER_BONUS} per friend)\n"
+            f"• /claim - Claim someone's code (+{CLAIMER_BONUS})\n"
+            f"• Contact {PREMIUM_BOT_USERNAME} for premium access\n\n"
+            f"Use /credits to check your balance"
+        )
+        await update.message.reply_text(no_credits_text, parse_mode=ParseMode.HTML)
+        await log_to_group(update, context, action="/gpt", details=f"User {user_id} out of credits (used {used}/{credits})")
+        return
+    
+    # Processing message
+    status_msg = await update.message.reply_text(f"🤖 Processing... (Credits left: {remaining-1})")
+    
+    # Initialize conversation
+    if user_id not in USER_CONVERSATIONS:
+        USER_CONVERSATIONS[user_id] = [
+            {"role": "system", "content": "You are a helpful assistant. Be concise and clear."}
+        ]
+    
+    USER_CONVERSATIONS[user_id].append({"role": "user", "content": query})
+    
+    try:
+        # Call Groq API
+        response = groq_client.chat.completions.create(
+            model=GROQ_MODEL,
+            messages=USER_CONVERSATIONS[user_id],
+            max_tokens=1000,
+            temperature=0.7
+        )
+        
+        answer = response.choices[0].message.content
+        USER_CONVERSATIONS[user_id].append({"role": "assistant", "content": answer})
+        
+        # Limit conversation history
+        if len(USER_CONVERSATIONS[user_id]) > 10:
+            USER_CONVERSATIONS[user_id] = [USER_CONVERSATIONS[user_id][0]] + USER_CONVERSATIONS[user_id][-9:]
+        
+        # Truncate if too long
+        if len(answer) > 4000:
+            answer = answer[:4000] + "\n\n... (truncated)"
+        
+        # ✅ MODIFIED: Added ai attribution
+        await status_msg.edit_text(
+            f"💬 <b>Query:</b> <code>{query}</code>\n\n"
+            f"<b>Answer:</b>\n{answer}\n\n"
+            f"<i>ai by @spotifyxmusixbot</i>",
+            parse_mode=ParseMode.HTML
+        )
+        
+        # Consume credit
+        credit_success = await consume_credit(user_id)
+        log.info(f"✅ GPT_CMD SUCCESS | User: {user_id} | Credit consumed: {credit_success}")
+        
+        # Log to group
+        await log_to_group(update, context, action="/gpt", 
+                         details=f"User {user_id}: {query[:50]}... | Remaining: {remaining-1}")
+        
+    except Exception as e:
+        log.error(f"💥 GPT_CMD AI ERROR for {user_id}: {e}", exc_info=True)
+        await status_msg.edit_text(f"❌ AI Error: {str(e)[:200]}")
+        await log_to_group(update, context, action="/gpt", details=f"Error: {e}", is_error=True)
+        USER_CONVERSATIONS[user_id] = [{"role": "system", "content": "You are a helpful assistant."}]
+
+# =========================
+# NEW: Enhanced Test Cookies Command
+# =========================
+async def test_cookies_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Test YouTube cookies functionality - Admin only"""
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("❌ Admin only!")
+        return
+    
+    # Check if cookies file exists
+    cookies_path = Path(COOKIES_FILE)
+    if not cookies_path.exists():
+        await update.message.reply_text(
+            f"❌ Cookies file not found!\n\n"
+            f"Expected location: <code>{cookies_path.absolute()}</code>\n\n"
+            f"<b>How to get cookies:</b>\n"
+            f"1. Install browser extension 'Get cookies.txt LOCALLY'\n"
+            f"2. Log in to YouTube\n"
+            f"3. Click extension → Export → Netscape format\n"
+            f"4. Save as <code>{COOKIES_FILE}</code> in bot directory\n"
+            f"5. Restart bot",
+            parse_mode=ParseMode.HTML
+        )
+        return
+    
+    if cookies_path.stat().st_size == 0:
+        await update.message.reply_text(
+            f"⚠️ Cookies file is empty!\n\n"
+            f"Location: <code>{cookies_path.absolute()}</code>\n\n"
+            f"Please export cookies from YouTube and save to this file.",
+            parse_mode=ParseMode.HTML
+        )
+        return
+    
+    status_msg = await update.message.reply_text("🔍 Testing YouTube cookies...")
+    
+    try:
+        # Test 1: Check if cookies file is valid format
+        with open(cookies_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+            if '# Netscape HTTP Cookie File' not in content:
+                raise ValueError("Not a Netscape format cookies file")
+            if '.youtube.com' not in content and '.google.com' not in content:
+                raise ValueError("No YouTube/Google cookies found")
+        
+        # Test 2: Try to extract info from a video (this tests authentication)
+        test_url = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"  # Rickroll (short video)
+        
+        ydl_opts = {
+            "quiet": True,
+            "no_warnings": True,
+            "skip_download": True,
+            "cookiefile": str(cookies_path),
+        }
+        
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(test_url, download=False)
+            
+            # Check for authentication indicators
+            is_logged_in = False
+            has_pauth = False
+            if info:
+                # Check for presence of sensitive cookies
+                cookies_valid = True
+                # Check if we can access video details that require auth
+                if info.get('duration') is not None or info.get('uploader') is not None:
+                    is_logged_in = True
+                
+                # Also check cookie content for SAPISID/APISID (required for API calls)
+                if 'SAPISID' in content or '__Secure-3PAPISID' in content:
+                    has_pauth = True
+        
+        result_text = (
+            f"✅ <b>Cookies Test Results</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"📁 File: <code>{cookies_path.absolute()}</code>\n"
+            f"📏 Size: {cookies_path.stat().st_size} bytes\n"
+            f"🍪 Format: ✅ Netscape\n"
+            f"🔑 YouTube Cookies: {'✅ Found' if '.youtube.com' in content else '❌ Missing'}\n"
+            f"🔐 Auth Cookies: {'✅ Found' if has_pauth else '⚠️ Partial'}\n"
+            f"🎬 Video Access: {'✅ Success' if is_logged_in else '⚠️ Limited'}\n\n"
+            f"<b>Status:</b> {'✅ Ready for use' if is_logged_in else '⚠️ May need refresh'}"
+        )
+        
+        await status_msg.edit_text(result_text, parse_mode=ParseMode.HTML)
+        
+        await log_to_group(update, context, action="/testcookies", 
+                         details=f"Cookies test passed. Auth: {is_logged_in}, PAuth: {has_pauth}")
+        
+    except ValueError as ve:
+        error_text = (
+            f"❌ <b>Cookies Format Error</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"📁 File: <code>{cookies_path.absolute()}</code>\n"
+            f"❌ Error: {str(ve)}\n\n"
+            f"<b>Solution:</b>\n"
+            f"Export cookies in Netscape format:\n"
+            f"1. Install 'Get cookies.txt LOCALLY' extension\n"
+            f"2. Go to YouTube and ensure you're logged in\n"
+            f"3. Click extension → Export → Netscape format\n"
+            f"4. Save as <code>{COOKIES_FILE}</code>"
+        )
+        await status_msg.edit_text(error_text, parse_mode=ParseMode.HTML)
+        await log_to_group(update, context, action="/testcookies", details=f"Format error: {ve}", is_error=True)
+        
+    except Exception as e:
+        error_text = (
+            f"❌ <b>Cookies Test Failed</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"📁 File: <code>{cookies_path.absolute()}</code>\n"
+            f"❌ Error: {str(e)[:200]}\n\n"
+            f"<b>Possible issues:</b>\n"
+            f"• Cookies expired (export again)\n"
+            f"• Wrong format (must be Netscape)\n"
+            f"• File permissions\n"
+            f"• YouTube account flagged\n\n"
+            f"<b>Tip:</b> Log out and back into YouTube, then re-export cookies"
+        )
+        
+        await status_msg.edit_text(error_text, parse_mode=ParseMode.HTML)
+        await log_to_group(update, context, action="/testcookies", details=f"Test failed: {str(e)[:100]}", is_error=True)
+
+# =========================
+# Broadcast Functions (FIXED)
+# =========================
+async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id): 
+        await update.message.reply_text("❌ Not authorized!")
+        return
+    
+    admin_id = update.effective_user.id
+    BROADCAST_STORE[admin_id] = []
+    BROADCAST_STATE[admin_id] = True
+    
+    await update.message.reply_text(
+        "📢 Broadcast mode ON. Send messages to add to queue.\n"
+        "Then use:\n"
+        "/done_broadcast - Preview messages\n"
+        "/send_broadcast - Send to all users and groups\n"
+        "/cancel_broadcast - Cancel"
+    )
+    
+    await log_to_group(update, context, action="/broadcast", details="Broadcast mode started")
+
+async def handle_broadcast_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle ALL non-command messages for broadcast"""
+    if not update.effective_user or not is_admin(update.effective_user.id):
+        return
+    
+    admin_id = update.effective_user.id
+    if not BROADCAST_STATE.get(admin_id):
+        return
+    
+    # Store message based on type
+    msg = {}
+    if update.message.text:
+        msg = {"type": "text", "text": update.message.text}
+    elif update.message.photo:
+        msg = {
+            "type": "photo",
+            "photo": update.message.photo[-1].file_id,
+            "caption": update.message.caption or ""
+        }
+    elif update.message.video:
+        msg = {
+            "type": "video",
+            "video": update.message.video.file_id,
+            "caption": update.message.caption or ""
+        }
+    elif update.message.document:
+        msg = {
+            "type": "document",
+            "document": update.message.document.file_id,
+            "caption": update.message.caption or ""
+        }
+    elif update.message.animation:
+        msg = {
+            "type": "animation",
+            "animation": update.message.animation.file_id,
+            "caption": update.message.caption or ""
+        }
+    elif update.message.audio:
+        msg = {
+            "type": "audio",
+            "audio": update.message.audio.file_id,
+            "caption": update.message.caption or ""
+        }
+    else:
+        await update.message.reply_text("⚠️ Unsupported message type for broadcast.")
+        return
+    
+    BROADCAST_STORE.setdefault(admin_id, []).append(msg)
+    count = len(BROADCAST_STORE[admin_id])
+    
+    await update.message.reply_text(f"✅ Message added. Queue: {count}")
+
+async def done_broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id): 
+        return
+    
+    admin_id = update.effective_user.id
+    if not BROADCAST_STATE.get(admin_id): 
+        await update.message.reply_text("❌ Not in broadcast mode.")
+        return
+    
+    messages = BROADCAST_STORE.get(admin_id, [])
+    if not messages: 
+        await update.message.reply_text("❌ No messages to preview.")
+        return
+    
+    await update.message.reply_text("📢 <b>Broadcast Preview:</b>", parse_mode=ParseMode.HTML)
+    
+    for i, msg in enumerate(messages, 1):
+        try:
+            if msg["type"] == "text":
+                await update.message.reply_text(msg["text"], parse_mode=ParseMode.HTML)
+            elif msg["type"] == "photo":
+                await update.message.reply_photo(photo=msg["photo"], caption=msg["caption"], parse_mode=ParseMode.HTML)
+            elif msg["type"] == "video":
+                await update.message.reply_video(video=msg["video"], caption=msg["caption"], parse_mode=ParseMode.HTML)
+            elif msg["type"] == "document":
+                await update.message.reply_document(document=msg["document"], caption=msg["caption"], parse_mode=ParseMode.HTML)
+            elif msg["type"] == "animation":
+                await update.message.reply_animation(animation=msg["animation"], caption=msg["caption"], parse_mode=ParseMode.HTML)
+            elif msg["type"] == "audio":
+                await update.message.reply_audio(audio=msg["audio"], caption=msg["caption"], parse_mode=ParseMode.HTML)
+        except Exception as e:
+            await update.message.reply_text(f"❌ Failed to preview message {i}: {e}")
+    
+    await update.message.reply_text(
+        "✅ Preview complete.\n"
+        "Send /send_broadcast to broadcast or /cancel_broadcast to cancel."
+    )
+
+async def send_broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id): 
+        return
+    
+    admin_id = update.effective_user.id
+    if not BROADCAST_STATE.get(admin_id): 
+        await update.message.reply_text("❌ Not in broadcast mode.")
+        return
+    
+    messages = BROADCAST_STORE.get(admin_id, [])
+    if not messages: 
+        await update.message.reply_text("❌ No messages to broadcast.")
+        return
+    
+    # Get all recipients (users + groups)
+    recipients = set()
+    
+    if MONGO_AVAILABLE:
+        # Add all users
+        for u in users_col.find({}, {"_id": 1}): 
+            recipients.add(u["_id"])
+        
+        # Add groups where bot is added
+        for g in db["broadcast_chats"].find({}, {"_id": 1}):
+            recipients.add(g["_id"])
+    
+    if not recipients:
+        await update.message.reply_text("❌ No recipients found.")
+        return
+    
+    await update.message.reply_text(f"📢 Broadcasting to {len(recipients)} chats...")
+    
+    success, failed = 0, 0
+    progress_msg = await update.message.reply_text("Progress: 0%")
+    
+    for i, chat_id in enumerate(recipients):
+        if i % 50 == 0:
+            progress = (i / len(recipients)) * 100
+            await progress_msg.edit_text(f"Progress: {progress:.1f}% ({i}/{len(recipients)})")
+            await asyncio.sleep(0.1)
+        
+        try:
+            for msg in messages:
+                if msg["type"] == "text":
+                    await context.bot.send_message(chat_id=chat_id, text=msg["text"], parse_mode=ParseMode.HTML)
+                elif msg["type"] == "photo":
+                    await context.bot.send_photo(chat_id=chat_id, photo=msg["photo"], caption=msg["caption"], parse_mode=ParseMode.HTML)
+                elif msg["type"] == "video":
+                    await context.bot.send_video(chat_id=chat_id, video=msg["video"], caption=msg["caption"], parse_mode=ParseMode.HTML)
+                elif msg["type"] == "document":
+                    await context.bot.send_document(chat_id=chat_id, document=msg["document"], caption=msg["caption"], parse_mode=ParseMode.HTML)
+                elif msg["type"] == "animation":
+                    await context.bot.send_animation(chat_id=chat_id, animation=msg["animation"], caption=msg["caption"], parse_mode=ParseMode.HTML)
+                elif msg["type"] == "audio":
+                    await context.bot.send_audio(chat_id=chat_id, audio=msg["audio"], caption=msg["caption"], parse_mode=ParseMode.HTML)
+            success += 1
+        except Exception as e:
+            log.error(f"Broadcast failed to {chat_id}: {e}")
+            failed += 1
+        await asyncio.sleep(0.05)
+    
+    await progress_msg.delete()
+    
+    BROADCAST_STORE.pop(admin_id, None)
+    BROADCAST_STATE[admin_id] = False
+    
+    summary = (
+        f"✅ <b>Broadcast Complete!</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"📤 Successful: {success}\n"
+        f"❌ Failed: {failed}\n"
+        f"👥 Total Recipients: {len(recipients)}"
+    )
+    
+    await update.message.reply_text(summary, parse_mode=ParseMode.HTML)
+    await log_to_group(update, context, action="/send_broadcast", 
+                     details=f"Sent to {success} users, {failed} failed")
+
+async def cancel_broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id): 
+        return
+    
+    admin_id = update.effective_user.id
+    BROADCAST_STORE.pop(admin_id, None)
+    BROADCAST_STATE[admin_id] = False
+    
+    await update.message.reply_text("❌ Broadcast cancelled.")
+    await log_to_group(update, context, action="/cancel_broadcast", details="Broadcast cancelled")
+
+# =========================
+# NEW: Track Bot Addition to Groups
+# =========================
+async def track_bot_addition(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Track when bot is added to a new group for broadcast"""
+    if not MONGO_AVAILABLE:
+        return
+        
+    chat = update.effective_chat
+    if chat.type in ["group", "supergroup"]:
+        # Only add if bot is actually a member (not left/kicked)
+        my_member = update.my_chat_member
+        if my_member.new_chat_member.status in ["member", "administrator"]:
+            db["broadcast_chats"].update_one(
+                {"_id": chat.id},
+                {"$set": {
+                    "title": chat.title,
+                    "type": chat.type,
+                    "added_at": datetime.now()
+                }},
+                upsert=True
+            )
+            log.info(f"Bot added to group: {chat.title} ({chat.id})")
+
+# =========================
+# Admin Commands
+# =========================
+async def addadmin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update.effective_user.id): 
+        await update.message.reply_text("❌ Owner only!")
+        return
+    if not context.args: 
+        await update.message.reply_text("Usage: /addadmin <user_id>")
+        return
+    try:
+        new_id = int(context.args[0])
+        user = users_col.find_one({"_id": new_id})
+        if not user: 
+            await update.message.reply_text("❌ User not found. They must /start first.")
+            return
+        if admins_col.find_one({"_id": new_id}): 
+            await update.message.reply_text("❌ Already admin.")
+            return
+        admins_col.insert_one({
+            "_id": new_id, 
+            "name": user.get("name", str(new_id)), 
+            "added_by": update.effective_user.id, 
+            "added_at": datetime.now()
+        })
+        await log_to_group(update, context, action="/addadmin", details=f"Added admin {new_id}")
+        await update.message.reply_text(f"✅ Added <b>{user.get('name', new_id)}</b> as admin.", parse_mode=ParseMode.HTML)
+    except Exception as e: 
+        await update.message.reply_text(f"❌ Failed: {e}")
+
+async def rmadmin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update.effective_user.id): 
+        await update.message.reply_text("❌ Owner only!")
+        return
+    if not context.args: 
+        await update.message.reply_text("Usage: /rmadmin <user_id>")
+        return
+    try:
+        rm_id = int(context.args[0])
+        if rm_id == OWNER_ID: 
+            await update.message.reply_text("❌ Cannot remove owner!")
+            return
+        if not admins_col.find_one({"_id": rm_id}): 
+            await update.message.reply_text("❌ Not an admin.")
+            return
+        admins_col.delete_one({"_id": rm_id})
+        await log_to_group(update, context, action="/rmadmin", details=f"Removed admin {rm_id}")
+        await update.message.reply_text(f"✅ Removed admin.", parse_mode=ParseMode.HTML)
+    except Exception as e: 
+        await update.message.reply_text(f"❌ Failed: {e}")
+
+async def adminlist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id): 
+        await update.message.reply_text("❌ Not authorized!")
+        return
+    if not MONGO_AVAILABLE: 
+        await update.message.reply_text("Database not available.")
+        return
+    try:
+        admins = list(admins_col.find().sort("added_at", -1))
+        if not admins: 
+            await update.message.reply_text("No admins.")
+            return
+        admin_list = "👥 <b>Admin List</b>\n━━━━━━━━━━━━\n\n"
+        for admin in admins:
+            admin_id = admin["_id"]
+            name = admin.get("name", "Unknown")
+            role = "👑 Owner" if admin_id == OWNER_ID else "🔧 Admin"
+            admin_list += f"• <code>{admin_id}</code> - {name} ({role})\n"
+        admin_list += f"\n<b>Total: {len(admins)}</b>"
+        await update.message.reply_text(admin_list, parse_mode=ParseMode.HTML)
+        await log_to_group(update, context, action="/adminlist", details=f"Listed {len(admins)} admins")
+    except Exception as e: 
+        await update.message.reply_text(f"❌ Failed: {e}")
+
+# =========================
+# NEW: My Chat Member Handler (Track Bot Addition)
+# =========================
+async def my_chat_member_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Track when bot is added to or removed from groups"""
+    if not MONGO_AVAILABLE:
+        return
+        
+    chat = update.effective_chat
+    my_member = update.my_chat_member
+    
+    # Only track groups
+    if chat.type not in ["group", "supergroup"]:
+        return
+    
+    # Bot was added to group
+    if my_member.new_chat_member.status in ["member", "administrator"]:
+        db["broadcast_chats"].update_one(
+            {"_id": chat.id},
+            {"$set": {
+                "title": chat.title,
+                "type": chat.type,
+                "added_at": datetime.now()
+            }},
+            upsert=True
+        )
+        log.info(f"✅ Bot added to group: {chat.title} ({chat.id})")
+        
+    # Bot was removed from group
+    elif my_member.new_chat_member.status in ["left", "kicked"]:
+        db["broadcast_chats"].delete_one({"_id": chat.id})
+        log.info(f"❌ Bot removed from group: {chat.title} ({chat.id})")
+
+# =========================
+# Callback Handlers
+# =========================
+async def on_quality(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    try:
+        _, token, qlt = q.data.split("|")
+    except:
+        return
+    data = PENDING.get(token)
+    if not data or data["exp"] < asyncio.get_event_loop().time():
+        await q.edit_message_text("Session expired.")
+        return
+    await q.edit_message_text(f"⬇️ Downloading {qlt}p quality...")
+    await download_and_send(q.message.chat.id, q.message, context, data["url"], qlt)
+
+async def on_search_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    try:
+        _, token, _ = q.data.split("|")
+    except:
+        return
+    data = PENDING.get(token)
+    if not data or data["exp"] < asyncio.get_event_loop().time():
+        await q.edit_message_text("Expired.")
+        return
+    await q.edit_message_text("Choose quality:", reply_markup=quality_keyboard(data["url"]))
+
+async def on_lyrics_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle lyrics button clicks"""
+    q = update.callback_query
+    await q.answer()
+    
+    try:
+        _, song_title = q.data.split("|", 1)
+    except:
+        await q.edit_message_text("❌ Invalid request")
+        return
+    
+    # Edit message to show loading
+    status_msg = await q.edit_message_text("📝 Searching for lyrics...")
+    
+    # Fetch lyrics
+    lyrics = await fetch_lyrics(song_title)
+    
+    if lyrics:
+        if len(lyrics) > 3800:  # Leave room for header
+            lyrics = lyrics[:3800] + "\n\n... (lyrics truncated due to message limit)"
+        
+        await status_msg.edit_text(
+            f"🎵 <b>Lyrics for:</b> <code>{song_title}</code>\n\n"
+            f"<pre>{lyrics}</pre>",
+            parse_mode=ParseMode.HTML
+        )
+    else:
+        await status_msg.edit_text(
+            f"❌ Lyrics not found for '<code>{song_title}</code>'\n\n"
+            f"• Song might be too new\n"
+            f"• Title might be misspelled\n"
+            f"• Try manual search: /lyrics artist song",
+            parse_mode=ParseMode.HTML
+        )
+
+async def on_verify_membership(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    try:
+        member = await context.bot.get_chat_member(
+            chat_id=FORCE_JOIN_CHANNEL,
+            user_id=q.from_user.id
+        )
+        if member.status not in ["left", "kicked"]:
+            await q.edit_message_text("✅ Verified! You can now use the bot.")
+            await start(update, context)
+            await log_to_group(update, context, action="Channel Verified", details=f"User {q.from_user.id} verified membership")
+        else:
+            await q.answer("❌ Please join the channel first!", show_alert=True)
+    except Exception as e:
+        log.error(f"Membership verification failed: {e}")
+        await q.answer("❌ Error verifying. Try again.", show_alert=True)
+
+# =========================
+# Message Handlers
+# =========================
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    ensure_user(update)
+    
+    # Store group chat for broadcast
+    if update.message.chat.type in ["group", "supergroup", "channel"]:
+        if MONGO_AVAILABLE:
+            db["broadcast_chats"].update_one(
+                {"_id": update.message.chat.id},
+                {"$set": {
+                    "title": update.message.chat.title,
+                    "type": update.message.chat.type,
+                    "updated_at": datetime.now()
+                }},
+                upsert=True
+            )
+    
+    if not await ensure_membership(update, context):
+        return
+    
+    # Check broadcast mode first
+    if update.effective_user and is_admin(update.effective_user.id):
+        admin_id = update.effective_user.id
+        if BROADCAST_STATE.get(admin_id):
+            await handle_broadcast_message(update, context)
+            return
+    
+    txt = update.message.text.strip()
+    match = YOUTUBE_REGEX.search(txt)
+    if match:
+        url = match.group(0)
+        user_id = update.effective_user.id
+        await log_to_group(update, context, action="YouTube URL", details=f"User {user_id} sent: {url[:50]}...")
+        await update.message.reply_text("Choose quality:", reply_markup=quality_keyboard(url))
+
+async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle all message types for potential broadcast"""
+    if update.effective_user and is_admin(update.effective_user.id):
+        admin_id = update.effective_user.id
+        if BROADCAST_STATE.get(admin_id):
+            await handle_broadcast_message(update, context)
+
+# =========================
+# Keyboard Generator
+# =========================
+def quality_keyboard(url: str) -> InlineKeyboardMarkup:
+    token = store_url(url)
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🎵 MP3 Audio", callback_data=f"q|{token}|mp3")],
+        [InlineKeyboardButton("🎬 360p", callback_data=f"q|{token}|360")],
+        [InlineKeyboardButton("🎬 480p", callback_data=f"q|{token}|480")],
+        [InlineKeyboardButton("🎬 720p", callback_data=f"q|{token}|720")],
+        [InlineKeyboardButton("🎬 1080p", callback_data=f"q|{token}|1080")],
+    ])
+
+# =========================
+# Main Function
+# =========================
+def main():
+    import signal
+    import sys
+    
+    def shutdown_handler(signum, frame):
+        log.info("Shutting down...")
+        sys.exit(0)
+    
+    signal.signal(signal.SIGTERM, shutdown_handler)
+    
+    # Startup logging with cookies info
+    cookies_path = Path(COOKIES_FILE)
+    cookies_working = cookies_path.exists() and cookies_path.stat().st_size > 0
+    
+    log.info("="*60)
+    log.info("🔍 BOT STARTUP")
+    log.info(f"Current Directory: {Path.cwd()}")
+    log.info(f"Force Join: {FORCE_JOIN_CHANNEL}")
+    log.info(f"Log Group: {LOG_GROUP_ID}")
+    log.info(f"AI API Key: {'✅ Set' if groq_client else '❌ Not Set'}")
+    log.info(f"Cookies File: {'✅ Found' if cookies_working else '❌ Not configured'} ({cookies_path.absolute()})")
+    log.info("="*60)
+    
+    app = ApplicationBuilder().token(BOT_TOKEN).connect_timeout(60).read_timeout(60).write_timeout(60).build()
+    
+    async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+        log.error("Exception while handling an update:", exc_info=context.error)
+        try:
+            if LOG_GROUP_ID and hasattr(update, 'effective_user') and update.effective_user:
+                error_text = (
+                    f"❌ <b>Bot Error</b>\n\n"
+                    f"User: {update.effective_user.id}\n"
+                    f"Error: {str(context.error)[:200]}\n\n"
+                    f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                )
+                await context.bot.send_message(
+                    chat_id=LOG_GROUP_ID,
+                    text=error_text,
+                    parse_mode=ParseMode.HTML
+                )
+        except:
+            pass
+    
+    app.add_error_handler(error_handler)
+
+    # Command handlers
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(CommandHandler("credits", credits_cmd))
+    app.add_handler(CommandHandler("refer", refer_cmd))
+    app.add_handler(CommandHandler("claim", claim_cmd))
+    app.add_handler(CommandHandler("gen_redeem", gen_redeem_cmd))
+    app.add_handler(CommandHandler("redeem", redeem_cmd))
+    app.add_handler(CommandHandler("whitelist_ai", whitelist_ai_cmd))
+    app.add_handler(CommandHandler("search", search_cmd))
+    app.add_handler(CommandHandler("gpt", gpt_cmd))
+    app.add_handler(CommandHandler("gen", gen_cmd))
+    app.add_handler(CommandHandler("vdogen", vdogen_cmd))  # NEW COMMAND
+    app.add_handler(CommandHandler("stats", stats_cmd))
+    app.add_handler(CommandHandler("broadcast", broadcast_cmd))
+    app.add_handler(CommandHandler("done_broadcast", done_broadcast_cmd))
+    app.add_handler(CommandHandler("send_broadcast", send_broadcast_cmd))
+    app.add_handler(CommandHandler("cancel_broadcast", cancel_broadcast_cmd))
+    app.add_handler(CommandHandler("addadmin", addadmin_cmd))
+    app.add_handler(CommandHandler("rmadmin", rmadmin_cmd))
+    app.add_handler(CommandHandler("adminlist", adminlist_cmd))
+    app.add_handler(CommandHandler("testcookies", test_cookies_cmd))
+    app.add_handler(CommandHandler("lyrics", lyrics_cmd))
+    
+    # Message handlers
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_all_messages))
+    
+    # Callback handlers
+    app.add_handler(CallbackQueryHandler(on_quality, pattern=r"^q\|"))
+    app.add_handler(CallbackQueryHandler(on_search_pick, pattern=r"^s\|"))
+    app.add_handler(CallbackQueryHandler(on_lyrics_request, pattern=r"^lyrics\|"))
+    app.add_handler(CallbackQueryHandler(on_verify_membership, pattern=r"^verify_membership$"))
+    
+    # Chat member handler
+    app.add_handler(ChatMemberHandler(my_chat_member_handler, ChatMemberHandler.MY_CHAT_MEMBER))
+    
+    # Start the bot
+    log.info("🚀 Bot is starting...")
+    app.run_polling()
+
+if __name__ == "__main__":
+    main()
