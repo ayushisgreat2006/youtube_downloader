@@ -2412,6 +2412,8 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
         if BROADCAST_STATE.get(admin_id):
             await handle_broadcast_message(update, context)
 
+
+
 # =========================
 # Keyboard Generator
 # =========================
@@ -2425,6 +2427,51 @@ def quality_keyboard(url: str) -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🎬 1080p", callback_data=f"q|{token}|1080")],
     ])
 
+# =========================
+# Chat Member Handler - Track Bot Group Membership
+# =========================
+async def my_chat_member_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle bot being added/removed from groups"""
+    result = update.my_chat_member
+    chat = result.chat
+    old_status = result.old_chat_member.status
+    new_status = result.new_chat_member.status
+    
+    # Log the change
+    log.info(f"Chat member update: {chat.title} ({chat.id}) | {old_status} -> {new_status}")
+    
+    # Bot added to group
+    if old_status in ["left", "kicked"] and new_status in ["member", "administrator"]:
+        log.info(f"✅ Bot was added to {chat.title} ({chat.id})")
+        
+        # Add to broadcast database
+        if MONGO_AVAILABLE and chat.type in ["group", "supergroup", "channel"]:
+            try:
+                db["broadcast_chats"].update_one(
+                    {"_id": chat.id},
+                    {"$set": {
+                        "title": chat.title,
+                        "type": chat.type,
+                        "added_at": datetime.now(),
+                        "updated_at": datetime.now()
+                    }},
+                    upsert=True
+                )
+                log.info(f"✅ Added {chat.title} to broadcast_chats")
+            except Exception as e:
+                log.error(f"Failed to add chat to broadcast_chats: {e}")
+    
+    # Bot removed from group
+    elif old_status in ["member", "administrator"] and new_status in ["left", "kicked"]:
+        log.info(f"❌ Bot was removed from {chat.title} ({chat.id})")
+        
+        # Remove from broadcast database
+        if MONGO_AVAILABLE:
+            try:
+                db["broadcast_chats"].delete_one({"_id": chat.id})
+                log.info(f"✅ Removed {chat.title} from broadcast_chats")
+            except Exception as e:
+                log.error(f"Failed to remove chat from broadcast_chats: {e}")
 # =========================
 # Main Function
 # =========================
