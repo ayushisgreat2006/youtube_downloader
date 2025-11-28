@@ -754,6 +754,118 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     response = await update.message.reply_text(help_text, parse_mode=ParseMode.HTML)
     await forward_interaction_to_log(update, context, response)
 
+
+
+# Add this function after the other command handlers, before the main() function
+
+async def search_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Search YouTube for videos"""
+    ensure_user(update)
+    
+    if not await ensure_membership(update, context):
+        return
+    
+    query = " ".join(context.args)
+    if not query:
+        response = await update.message.reply_text(
+            "Usage: /search <video name>\n"
+            "Example: /search Ed Sheeran Shape of You"
+        )
+        await forward_interaction_to_log(update, context, response)
+        return
+    
+    status_msg = await update.message.reply_text(
+        f"🔍 Searching YouTube for '<b>{query}</b>'...",
+        parse_mode=ParseMode.HTML
+    )
+    
+    try:
+        # Use yt-dlp to search YouTube
+        ydl_opts = {
+            "quiet": True,
+            "no_warnings": True,
+            "extract_flat": True,
+            "cookiefile": str(COOKIES_FILE) if Path(COOKIES_FILE).exists() else None,
+        }
+        
+        loop = asyncio.get_event_loop()
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            search_results = await loop.run_in_executor(
+                None, 
+                lambda: ydl.extract_info(f"ytsearch10:{query}", download=False)
+            )
+        
+        if not search_results or "entries" not in search_results or not search_results["entries"]:
+            await status_msg.edit_text(
+                f"❌ No results found for '<code>{query}</code>'",
+                parse_mode=ParseMode.HTML
+            )
+            return
+        
+        # Create keyboard with search results
+        keyboard = []
+        for i, entry in enumerate(search_results["entries"][:5]):  # Show top 5 results
+            title = entry.get("title", "Unknown")
+            duration = entry.get("duration", 0)
+            duration_str = f"{duration//60}:{duration%60:02d}" if duration else "Unknown"
+            
+            # Truncate long titles
+            display_title = title[:40] + "..." if len(title) > 40 else title
+            
+            token = store_url(f"https://www.youtube.com/watch?v={entry['id']}")
+            keyboard.append([
+                InlineKeyboardButton(
+                    f"{i+1}. {display_title} [{duration_str}]",
+                    callback_data=f"s|{token}|select"
+                )
+            ])
+        
+        keyboard.append([InlineKeyboardButton("❌ Cancel", callback_data="s|cancel")])
+        
+        results_text = (
+            f"📺 <b>Search Results for:</b> <code>{query}</code>\n\n"
+            f"Select a video to download:"
+        )
+        
+        await status_msg.edit_text(
+            results_text,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode=ParseMode.HTML
+        )
+        
+        await log_to_group(update, context, action="/search", details=f"Query: {query}")
+        
+    except Exception as e:
+        error_msg = f"❌ Search failed: {str(e)[:200]}"
+        await status_msg.edit_text(error_msg)
+        await log_to_group(update, context, action="/search", details=f"Error: {str(e)[:150]}", is_error=True)
+
+# Also update the callback handler for search picks
+async def on_search_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    
+    if q.data == "s|cancel":
+        await q.edit_message_text("❌ Search cancelled.")
+        return
+    
+    try:
+        _, token, _ = q.data.split("|")
+    except:
+        await q.edit_message_text("❌ Invalid selection.")
+        return
+    
+    data = PENDING.get(token)
+    if not data or data["exp"] < asyncio.get_event_loop().time():
+        await q.edit_message_text("❌ Session expired. Please search again.")
+        return
+    
+    # Show quality selection for the selected video
+    await q.edit_message_text("⏳ Preparing download...")
+    await q.edit_message_text("Choose quality:", reply_markup=quality_keyboard(data["url"]))
+
+
+
 async def credits_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Check user's credit balance"""
     ensure_user(update)
