@@ -7,10 +7,14 @@ import secrets
 import aiohttp
 import random
 import aiofiles
+import aiohttp
 import json
+import re
+import asyncio
 from collections import deque
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any
 from pathlib import Path
+from typing import Dict, List, Optional
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.constants import ParseMode
 from telegram.ext import (
@@ -21,10 +25,9 @@ import yt_dlp
 from pymongo import MongoClient
 from groq import Groq
 
-# NEW: Token refresh imports
-import jwt
-from playwright.async_api import async_playwright
-
+# =========================
+# CONFIGURATION
+# =========================
 # =========================
 # CONFIGURATION
 # =========================
@@ -36,7 +39,8 @@ LOG_GROUP_ID = int(os.getenv("LOG_GROUP_ID", "-5066591546"))
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 
-COOKIES_FILE = os.getenv("COOKIES_FILE", "cookies.txt")
+# Cookies configuration for YouTube
+COOKIES_FILE = os.getenv("COOKIES_FILE", "cookies.txt")  # Netscape format cookies file
 
 # MongoDB
 MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
@@ -58,13 +62,14 @@ MAX_FREE_SIZE = 50 * 1024 * 1024
 PREMIUM_SIZE = 450 * 1024 * 1024
 YOUTUBE_REGEX = re.compile(r"(https?://)?(www\.)?(youtube\.com|youtu\.be)/[\w\-?&=/%]+", re.I)
 
-# Combined Media Generation Limits
-BASE_MEDIA_GEN_LIMIT = 10
-PROXY_LIST = []
+# Combined Media Generation Limits (images + videos share the same pool)
+BASE_MEDIA_GEN_LIMIT = 10      # Default 10 media items per day per user
+PROXY_LIST = []                # Not used - direct connection only (API has 100/min limit)
 PROXY_ROTATE_ON_FAILURE = False
-VIDEO_MAX_ATTEMPTS = 1
-IMAGE_MAX_ATTEMPTS = 1
+VIDEO_MAX_ATTEMPTS = 1         # Direct IP only
+IMAGE_MAX_ATTEMPTS = 1         # Direct IP only
 
+#config of vdo gen
 # GeminiGen AI Video Configuration
 BEARER_TOKEN = os.getenv("BEARER_TOKEN", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJleHAiOjE3NjQzOTEyNDYsInN1YiI6ImY5MTlhYjEyLWNiMDgtMTFmMC05YWEyLWVlNDdlYmE0N2M1ZCJ9.Fc-S3UZISOlG4EuD8nip2q3tbESy0kb2IIvNFachA-8")
 COOKIE_FILE_CONTENT = os.getenv("COOKIE_FILE_CONTENT", """# Netscape HTTP Cookie File
@@ -83,16 +88,9 @@ geminigen.ai	FALSE	/	FALSE	0	video-duration	8
 # Video generation queue and semaphore
 video_generation_queue = deque()
 active_generations = 0
-MAX_CONCURRENT_GENERATIONS = 2
+MAX_CONCURRENT_GENERATIONS = 2  # Allow 2 videos at once
 generation_semaphore = asyncio.Semaphore(MAX_CONCURRENT_GENERATIONS)
 user_active_tasks: Dict[int, asyncio.Task] = {}
-
-# NEW: Token refresh globals
-is_system_paused = False
-pause_reason = ""
-token_refresh_lock = asyncio.Lock()
-_last_token_check = 0
-TOKEN_CHECK_INTERVAL = 900
 
 # =========================
 # Logging & Storage
@@ -105,9 +103,9 @@ logging.basicConfig(
 log = logging.getLogger("ytbot")
 
 DOWNLOAD_DIR.mkdir(exist_ok=True)
-Path(COOKIES_FILE).touch(exist_ok=True)
+Path(COOKIES_FILE).touch(exist_ok=True)  # Create cookies file placeholder if it doesn't exist
 
-# In-memory storage
+# In-memory storage (volatile)
 PENDING: Dict[str, dict] = {}
 USER_CONVERSATIONS: Dict[int, List[dict]] = {}
 BROADCAST_STORE: Dict[int, List[dict]] = {}
@@ -143,10 +141,12 @@ try:
     MONGO_AVAILABLE = True
     log.info("✅ MongoDB connected")
     
+    # Create indexes
     users_col.create_index("referral_code", unique=True, sparse=True)
     redeem_col.create_index("code", unique=True)
     
-    if admins_col.count_documents({}) == 0:
+    # Add owner as admin if collection empty
+    if admins_col is not None and admins_col.count_documents({}) == 0:
         admins_col.insert_one({
             "_id": OWNER_ID, "name": "Owner",
             "added_by": OWNER_ID, "added_at": datetime.now()
@@ -165,6 +165,7 @@ def get_today_str() -> str:
     return datetime.now().strftime("%Y-%m-%d")
 
 async def get_user_credits(user_id: int) -> tuple[int, int, bool]:
+    """Returns (current_credits, used_today, is_whitelisted)"""
     if not MONGO_AVAILABLE:
         return BASE_CREDITS, 0, False
     
@@ -172,6 +173,8 @@ async def get_user_credits(user_id: int) -> tuple[int, int, bool]:
         return 99999, 0, True
     
     today = get_today_str()
+    
+    # Check whitelist first
     whitelist_entry = whitelist_col.find_one({"_id": user_id}) if whitelist_col is not None else None
     if whitelist_entry:
         limit = whitelist_entry.get("daily_limit", BASE_CREDITS)
@@ -179,12 +182,14 @@ async def get_user_credits(user_id: int) -> tuple[int, int, bool]:
         used = whitelist_entry.get("daily_usage", 0) if last_date == today else 0
         return limit, used, True
     
+    # Regular user
     user = users_col.find_one({"_id": user_id}, {"credits": 1, "daily_usage": 1, "last_usage_date": 1})
     if not user:
         return BASE_CREDITS, 0, False
     
     last_date = user.get("last_usage_date", today)
     if last_date != today:
+        # Reset daily usage
         users_col.update_one(
             {"_id": user_id},
             {"$set": {"daily_usage": 0, "last_usage_date": today}}
@@ -194,6 +199,7 @@ async def get_user_credits(user_id: int) -> tuple[int, int, bool]:
     return user.get("credits", BASE_CREDITS), user.get("daily_usage", 0), False
 
 async def consume_credit(user_id: int) -> bool:
+    """Consume 1 credit, return True if successful"""
     if not MONGO_AVAILABLE:
         return True
     
@@ -224,6 +230,7 @@ async def consume_credit(user_id: int) -> bool:
     return True
 
 async def add_credits(user_id: int, amount: int, is_referral: bool = False) -> bool:
+    """Add credits to user"""
     if not MONGO_AVAILABLE:
         return False
     
@@ -242,6 +249,7 @@ async def add_credits(user_id: int, amount: int, is_referral: bool = False) -> b
 # Helper Functions
 # =========================
 def ensure_user(update: Update):
+    """Track user in database"""
     if not MONGO_AVAILABLE or update.effective_user is None:
         return
     
@@ -271,6 +279,7 @@ def is_owner(user_id: int) -> bool:
     return int(user_id) == OWNER_ID
 
 def is_admin(user_id: int) -> bool:
+    """Check if user is admin without truth value testing"""
     if is_owner(user_id):
         return True
     if not MONGO_AVAILABLE or admins_col is None:
@@ -282,6 +291,7 @@ def is_admin(user_id: int) -> bool:
         return False
 
 def is_premium(user_id: int) -> bool:
+    """Check if user has premium without truth value testing"""
     if not MONGO_AVAILABLE or users_col is None:
         return False
     try:
@@ -312,12 +322,14 @@ def cleanup_old_files():
         pass
 
 def get_ytdl_options(quality: str, download_id: str) -> dict:
+    """Generate yt-dlp options with cookies support"""
     ydl_opts = {
         "quiet": True,
         "no_warnings": True,
         "outtmpl": str(DOWNLOAD_DIR / f"%(title)s_{download_id}.%(ext)s"),
     }
     
+    # Add cookies if file exists and is not empty
     cookies_path = Path(COOKIES_FILE)
     if cookies_path.exists() and cookies_path.stat().st_size > 0:
         ydl_opts["cookiefile"] = str(cookies_path)
@@ -385,6 +397,7 @@ async def ensure_membership(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     if not FORCE_JOIN_CHANNEL:
         return True
     
+    # Only enforce in groups if bot is mentioned
     if update.message and update.message.chat.type in ["group", "supergroup"]:
         if not (update.message.text and f"@{context.bot.username}" in update.message.text):
             return True
@@ -403,7 +416,7 @@ async def ensure_membership(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return False
     
     channel_username = FORCE_JOIN_CHANNEL.replace('@', '')
-    join_url = f"https://t.me/{channel_username}"
+    join_url = f"https://t.me/{channel_username}"  # FIXED: Removed space
     
     keyboard = InlineKeyboardMarkup([[
         InlineKeyboardButton("Join Channel 🔔", url=join_url),
@@ -419,8 +432,11 @@ async def ensure_membership(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     return False
 
 async def fetch_lyrics(song_title: str) -> Optional[str]:
+    """Fetch lyrics for a song title using an external API"""
     try:
-        clean_title = re.sub(r'\(official.*?\)|\[official.*?\]|\(audio\)|\[audio\]|\(lyric.*?\)|\[lyric.*?\]|\(video.*?\)|\[video.*?\]|\(hd\)|\[hd\]|\(4k\)|\[4k\]|\(feat\..*?\)|\[feat\...*?\]', '', song_title, flags=re.IGNORECASE)
+        # Clean up the title - remove common YouTube suffixes and metadata
+        clean_title = re.sub(r'\(official.*?\)|\[official.*?\]|\(audio\)|\[audio\]|\(lyric.*?\)|\[lyric.*?\]|\(video.*?\)|\[video.*?\]|\(hd\)|\[hd\]|\(4k\)|\[4k\]|\(feat\..*?\)|\[feat\..*?\]', '', song_title, flags=re.IGNORECASE)
+        # NEW: Replace common separators to improve search
         clean_title = re.sub(r'[–—|-]', ' ', clean_title)
         clean_title = re.sub(r'\s+', ' ', clean_title).strip()
         api_url = f"https://api.maher-zubair.tech/lyrics?q={clean_title}"
@@ -436,12 +452,17 @@ async def fetch_lyrics(song_title: str) -> Optional[str]:
 
     return None
 
+# =========================
+# Download Function with Logging
+# =========================
 async def download_and_send(chat_id, reply_msg, context, url, quality):
     user_id = reply_msg.chat.id
     download_id = f"{user_id}_{secrets.token_urlsafe(8)}"
     
     try:
         status_msg = await reply_msg.reply_text("⏳ Preparing download...")
+        
+        # FIXED: Use centralized options builder with cookies
         ydl_opts = get_ytdl_options(quality, download_id)
 
         await status_msg.edit_text("⬇️ Downloading from YouTube...")
@@ -464,6 +485,7 @@ async def download_and_send(chat_id, reply_msg, context, url, quality):
         file_size = final_path.stat().st_size
         is_user_premium = is_premium(user_id)
 
+        # Check size limits
         if file_size > MAX_FREE_SIZE and not is_user_premium:
             final_path.unlink()
             premium_msg = (
@@ -491,6 +513,7 @@ async def download_and_send(chat_id, reply_msg, context, url, quality):
         caption = f"📥 <b>{title}</b> ({file_size/1024/1024:.1f}MB)\n\nDownloaded by @spotifyxmusixbot"
         await status_msg.edit_text("⬆️ Uploading to Telegram...")
         
+        # Send file with proper error handling
         try:
             async with aiofiles.open(final_path, 'rb') as f:
                 file_data = await f.read()
@@ -519,6 +542,7 @@ async def download_and_send(chat_id, reply_msg, context, url, quality):
             
             await status_msg.delete()
             
+            # 🎵 NEW: Add lyrics button for MP3 downloads
             if quality == "mp3":
                 lyrics_button = InlineKeyboardButton("📝 Get Lyrics", callback_data=f"lyrics|{title}")
                 keyboard = InlineKeyboardMarkup([[lyrics_button]])
@@ -550,6 +574,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await ensure_membership(update, context):
         return
     
+    # Store chat ID for broadcast (works for both private and groups)
     if MONGO_AVAILABLE and update.message.chat.type in ["group", "supergroup", "channel"]:
         try:
             db["broadcast_chats"].update_one(
@@ -566,6 +591,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await log_to_group(update, context, action="/start", details="User started bot")
     
+    # Check cookies status
     cookies_path = Path(COOKIES_FILE)
     cookies_working = cookies_path.exists() and cookies_path.stat().st_size > 0
     
@@ -619,9 +645,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "<code>/adminlist</code> — List admins\n"
         "<code>/gen_redeem &lt;value&gt; &lt;code&gt;</code> — Generate redeem code\n"
         "<code>/whitelist_ai &lt;id&gt; &lt;value&gt;</code> — Whitelist user\n"
-        "<code>/testcookies</code> — Test YouTube cookies\n"
-        "<code>/pause_vdo</code> — Pause video generation\n"
-        "<code>/resume_vdo</code> — Resume video generation\n\n"
+        "<code>/testcookies</code> — Test YouTube cookies\n\n"
         "<b>Owner Commands:</b>\n"
         "<code>/addadmin &lt;id&gt;</code> — Add admin\n"
         "<code>/rmadmin &lt;id&gt;</code> — Remove admin\n\n"
@@ -633,6 +657,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(help_text, parse_mode=ParseMode.HTML)
 
 async def credits_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Check user's credit balance"""
     ensure_user(update)
     user_id = update.effective_user.id
     
@@ -650,12 +675,14 @@ async def credits_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🎁 Remaining: {remaining}\n\n"
         f"<b>Want more?</b>\n"
         f"• /refer - Earn {REFERRER_BONUS} credits\n"
+        f"• /claim - Claim someone's code\n"
         f"• Contact {PREMIUM_BOT_USERNAME} for premium"
     )
     
     await update.message.reply_text(credits_text, parse_mode=ParseMode.HTML)
 
 async def refer_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Generate referral code"""
     ensure_user(update)
     user_id = update.effective_user.id
     
@@ -663,6 +690,7 @@ async def refer_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Database not available.")
         return
     
+    # Generate unique referral code
     code = secrets.token_urlsafe(12).upper()
     
     try:
@@ -689,6 +717,7 @@ async def refer_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Failed: {e}")
 
 async def claim_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Claim a referral code"""
     ensure_user(update)
     
     if not context.args:
@@ -703,6 +732,7 @@ async def claim_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     
     try:
+        # Find referrer
         referrer = users_col.find_one({"referral_code": code})
         if not referrer:
             await update.message.reply_text("❌ Invalid referral code!")
@@ -713,18 +743,23 @@ async def claim_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ You cannot use your own code!")
             return
         
+        # Check if already claimed by this user
         claimed = users_col.find_one({"_id": user_id, f"claimed_codes.{code}": {"$exists": True}})
         if claimed:
             await update.message.reply_text("❌ You already claimed this code!")
             return
         
+        # Give bonuses
+        # Referrer gets permanent credit increase
         users_col.update_one(
             {"_id": referrer_id},
             {"$inc": {"credits": REFERRER_BONUS, "referrals_made": 1}}
         )
         
+        # Claimer gets one-time bonus
         await add_credits(user_id, CLAIMER_BONUS)
         
+        # Mark as claimed
         users_col.update_one(
             {"_id": user_id},
             {"$set": {f"claimed_codes.{code}": datetime.now()}}
@@ -746,6 +781,7 @@ async def claim_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await log_to_group(update, context, action="/claim", details=f"Error: {e}", is_error=True)
 
 async def gen_redeem_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Generate redeem code (Admin/Owner only) - NOW SINGLE-USE"""
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("❌ Admin only!")
         return
@@ -762,13 +798,14 @@ async def gen_redeem_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         value = int(context.args[0])
         code_name = context.args[1].strip().upper()
         
+        # NEW: Set max_uses to 1 for single-use codes
         redeem_col.insert_one({
             "code": code_name,
             "value": value,
             "created_by": update.effective_user.id,
             "created_at": datetime.now(),
             "used_by": [],
-            "max_uses": 1
+            "max_uses": 1  # 🔒 SINGLE USE ONLY
         })
         
         await update.message.reply_text(
@@ -787,6 +824,7 @@ async def gen_redeem_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Failed: {e}")
 
 async def redeem_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Redeem admin code - adds to media generation limit"""
     ensure_user(update)
     
     if not context.args:
@@ -802,10 +840,12 @@ async def redeem_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ Invalid redeem code!")
             return
         
+        # Check if already used by this user
         if user_id in code_entry.get("used_by", []):
             await update.message.reply_text("❌ You already used this code!")
             return
         
+        # Apply to media generation limit (not AI credits)
         value = code_entry["value"]
         user_data = users_col.find_one({"_id": user_id}, {"media_gen_limit": 1})
         current_limit = user_data.get("media_gen_limit", BASE_MEDIA_GEN_LIMIT) if user_data else BASE_MEDIA_GEN_LIMIT
@@ -816,6 +856,7 @@ async def redeem_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             upsert=True
         )
         
+        # Mark as used
         redeem_col.update_one(
             {"code": code_name},
             {"$push": {"used_by": user_id}}
@@ -837,6 +878,7 @@ async def redeem_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await log_to_group(update, context, action="/redeem", details=f"Error: {e}", is_error=True)
 
 async def whitelist_ai_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Whitelist user with custom media generation limit"""
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("❌ Admin only!")
         return
@@ -849,12 +891,13 @@ async def whitelist_ai_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         target_id = int(context.args[0])
         limit = int(context.args[1])
         
+        # Set custom media generation limit for user
         users_col.update_one(
             {"_id": target_id},
             {"$set": {
                 "media_gen_limit": limit,
                 "media_gen_date": get_today_str(),
-                "media_gen_today": 0
+                "media_gen_today": 0  # Reset counter
             }},
             upsert=True
         )
@@ -877,6 +920,7 @@ async def whitelist_ai_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await log_to_group(update, context, action="/whitelist_ai", details=f"Error: {e}", is_error=True)
 
 async def lyrics_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Get lyrics for a song"""
     ensure_user(update)
     
     if not await ensure_membership(update, context):
@@ -888,6 +932,7 @@ async def lyrics_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     await log_to_group(update, context, action="/lyrics", details=f"Query: {query}")
+    
     status_msg = await update.message.reply_text(f"📝 Searching lyrics for '<b>{query}</b>'...", parse_mode=ParseMode.HTML)
     
     lyrics = await fetch_lyrics(query)
@@ -910,137 +955,10 @@ async def lyrics_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"• Song might not be in database",
             parse_mode=ParseMode.HTML
         )
-
-# =========================
-# TOKEN AUTO-REFRESH SYSTEM
-# =========================
-async def check_and_refresh_token():
-    """Background task: Check token expiry & auto-refresh"""
-    global BEARER_TOKEN, COOKIE_FILE_CONTENT, is_system_paused, pause_reason, _last_token_check
-    
-    current_time = asyncio.get_event_loop().time()
-    if current_time - _last_token_check < TOKEN_CHECK_INTERVAL:
-        return True
-    
-    _last_token_check = current_time
-    
-    try:
-        payload = jwt.decode(BEARER_TOKEN, options={"verify_signature": False})
-        exp = datetime.fromtimestamp(payload["exp"])
-        
-        if datetime.now() + timedelta(hours=6) >= exp:
-            log.warning("⚠️ Token expiring soon, auto-refreshing...")
-            is_system_paused = True
-            pause_reason = "Token auto-refresh in progress..."
-            
-            if await refresh_token_from_browser():
-                log.info("✅ Token refreshed successfully!")
-                is_system_paused = False
-                pause_reason = ""
-                return True
-            else:
-                log.error("❌ Token refresh failed!")
-                pause_reason = "Token refresh failed - manual update needed"
-                return False
-        
-        return True
-        
-    except Exception as e:
-        log.error(f"Token check failed: {e}")
-        return False
-
-async def refresh_token_from_browser():
-    """Extract fresh token using Playwright"""
-    async with token_refresh_lock:
-        try:
-            async with async_playwright() as p:
-                browser = await p.chromium.launch(headless=True)
-                context = await browser.new_context(
-                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-                )
-                page = await context.new_page()
-                
-                await page.goto("https://geminigen.ai", wait_until="networkidle")
-                await page.fill('input[placeholder*="prompt"]', "test")
-                await page.click('button:has-text("Generate")')
-                
-                async with page.expect_response("**/api/video-gen/veo", timeout=10000) as resp_info:
-                    response = await resp_info.value
-                    headers = await response.request.all_headers()
-                    new_token = headers.get("authorization", "").replace("Bearer ", "")
-                    
-                    cookies = await context.cookies()
-                    cookie_lines = ["# Netscape HTTP Cookie File"]
-                    for c in cookies:
-                        domain = c["domain"]
-                        flag = "TRUE" if domain.startswith(".") else "FALSE"
-                        secure = "TRUE" if c["secure"] else "FALSE"
-                        expires = int(c["expires"]) if c["expires"] else 0
-                        line = f"{domain}\t{flag}\t{c['path']}\t{secure}\t{expires}\t{c['name']}\t{c['value']}"
-                        cookie_lines.append(line)
-                    
-                    await browser.close()
-                    
-                    if new_token:
-                        global BEARER_TOKEN, COOKIE_FILE_CONTENT
-                        BEARER_TOKEN = new_token
-                        COOKIE_FILE_CONTENT = "\n".join(cookie_lines)
-                        log.info("✅ Token extracted and updated in memory!")
-                        return True
-                
-                await browser.close()
-        except Exception as e:
-            log.error(f"Browser token extraction failed: {e}")
-    
-    return False
-
-async def notify_admin_of_token_issue(context: ContextTypes.DEFAULT_TYPE, error_msg: str):
-    """Send token expiry notification to admin"""
-    try:
-        if LOG_GROUP_ID:
-            await context.bot.send_message(
-                chat_id=LOG_GROUP_ID,
-                text=f"🚨 <b>Token Auto-Refresh Failed</b>\n\n"
-                     f"Error: {error_msg}\n\n"
-                     f"Manual token update required!\n"
-                     f"Users are seeing 'Video Generation Error'.",
-                parse_mode=ParseMode.HTML
-            )
-    except:
-        pass
-
-async def pause_vdo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Pause video generation system (Admin only)"""
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("❌ Admin only!")
-        return
-    
-    global is_system_paused, pause_reason
-    is_system_paused = True
-    pause_reason = " ".join(context.args) or "Manual admin pause"
-    
-    await update.message.reply_text(f"⏸ System paused: {pause_reason}")
-    await log_to_group(update, context, action="/pause_vdo", details=f"Paused: {pause_reason}")
-
-async def resume_vdo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Resume video generation system (Admin only)"""
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("❌ Admin only!")
-        return
-    
-    global is_system_paused
-    is_system_paused = False
-    
-    await update.message.reply_text("▶️ System resumed!")
-    await log_to_group(update, context, action="/resume_vdo", details="System resumed")
-    
-    if video_generation_queue:
-        asyncio.create_task(process_video_queue())
-
-# =========================
-# Cookie Parser
-# =========================
+# vdogen starts here
+# Cookie Parser (add near other helper functions)
 def parse_netscape_cookies(content: str) -> dict:
+    """Convert Netscape cookie file to aiohttp-compatible dict"""
     cookies = {}
     for line in content.splitlines():
         line = line.strip()
@@ -1054,9 +972,7 @@ def parse_netscape_cookies(content: str) -> dict:
                 continue
     return cookies
 
-# =========================
-# GeminiGen API Client
-# =========================
+# GeminiGen API Client (add near other helper classes)
 class GeminiGenAPI:
     def __init__(self, cookies: dict, bearer_token: str):
         self.cookies = cookies
@@ -1071,57 +987,38 @@ class GeminiGenAPI:
         }
     
     async def generate_video(self, prompt: str) -> str:
-        """Submit generation with token refresh retry"""
-        retry_count = 0
-        
-        while retry_count < 2:
-            try:
-                async with aiohttp.ClientSession(cookies=self.cookies, headers=self.headers) as session:
-                    endpoint = f"{self.base_url}/api/video-gen/veo"
-                    
-                    form = aiohttp.FormData()
-                    form.add_field('prompt', prompt)
-                    form.add_field('model', 'veo-3-fast')
-                    form.add_field('duration', '8')
-                    form.add_field('resolution', '720p')
-                    form.add_field('aspect_ratio', '16:9')
-                    form.add_field('enhance_prompt', 'true')
-                    
-                    log.info(f"🚀 POST {endpoint}")
-                    
-                    async with session.post(endpoint, data=form) as resp:
-                        if resp.status not in (200, 202):
-                            text = await resp.text()
-                            if resp.status == 403 or "TOKEN_EXPIRED" in text:
-                                log.warning(f"Token expired (attempt {retry_count + 1}), refreshing...")
-                                if await refresh_token_from_browser():
-                                    retry_count += 1
-                                    await asyncio.sleep(3)
-                                    continue
-                            raise Exception(f"Generation failed: HTTP {resp.status}\nResponse: {text[:500]}")
-                        
-                        result = await resp.json()
-                        log.info(f"✅ Generation response: {json.dumps(result, indent=2)}")
-                        
-                        job_id = result.get("uuid") or result.get("id")
-                        if not job_id:
-                            raise Exception(f"No job_id found: {result}")
-                        
-                        log.info(f"🆔 Job UUID: {job_id}")
-                        return job_id
+        """Submit generation request - returns UUID"""
+        # Use a new session for each request to avoid blocking
+        async with aiohttp.ClientSession(cookies=self.cookies, headers=self.headers) as session:
+            endpoint = f"{self.base_url}/api/video-gen/veo"
+            
+            form = aiohttp.FormData()
+            form.add_field('prompt', prompt)
+            form.add_field('model', 'veo-3-fast')
+            form.add_field('duration', '8')
+            form.add_field('resolution', '720p')
+            form.add_field('aspect_ratio', '16:9')
+            form.add_field('enhance_prompt', 'true')
+            
+            log.info(f"🚀 POST {endpoint}")
+            
+            async with session.post(endpoint, data=form) as resp:
+                if resp.status not in (200, 202):
+                    text = await resp.text()
+                    raise Exception(f"Generation failed: HTTP {resp.status}\nResponse: {text[:500]}")
                 
-            except Exception as e:
-                if "TOKEN_EXPIRED" in str(e) and retry_count < 1:
-                    log.warning("Token expired detected, refreshing...")
-                    if await refresh_token_from_browser():
-                        retry_count += 1
-                        await asyncio.sleep(3)
-                        continue
-                raise
-        
-        raise Exception("Max retries exceeded - token refresh failed")
+                result = await resp.json()
+                log.info(f"✅ Generation response: {json.dumps(result, indent=2)}")
+                
+                job_id = result.get("uuid") or result.get("id")
+                if not job_id:
+                    raise Exception(f"No job_id found: {result}")
+                
+                log.info(f"🆔 Job UUID: {job_id}")
+                return job_id
     
     async def poll_for_video(self, job_id: str, timeout: int = 300) -> str:
+        """Poll history endpoint with smart URL detection"""
         async with aiohttp.ClientSession(cookies=self.cookies, headers=self.headers) as session:
             start = datetime.now()
             endpoint = f"{self.base_url}/api/history/{job_id}"
@@ -1143,8 +1040,10 @@ class GeminiGenAPI:
                     result = await resp.json()
                     log.debug(f"📄 Full response: {json.dumps(result, indent=2)}")
                     
+                    # SMART URL DETECTION
                     video_url = None
                     
+                    # 1. Check nested generated_video array
                     if "generated_video" in result and isinstance(result["generated_video"], list):
                         for video_item in result["generated_video"]:
                             if isinstance(video_item, dict):
@@ -1157,6 +1056,7 @@ class GeminiGenAPI:
                                 if video_url:
                                     break
                     
+                    # 2. Check top-level fields
                     if not video_url:
                         top_fields = ['video_url', 'download_url', 'url', 'media_url', 'output_url']
                         for field in top_fields:
@@ -1165,6 +1065,7 @@ class GeminiGenAPI:
                                 log.info(f"✅ Found video URL in top-level '{field}': {video_url[:80]}...")
                                 break
                     
+                    # 3. Deep scan entire JSON for any MP4 URL
                     if not video_url:
                         result_str = json.dumps(result)
                         mp4_matches = re.findall(r'https?://[^\s"]+\.mp4(?:\?[^\s"]*)?', result_str)
@@ -1175,10 +1076,12 @@ class GeminiGenAPI:
                     if video_url:
                         return video_url
                     
+                    # SMART FAILURE DETECTION
                     status = result.get("status", "")
                     progress = result.get("status_percentage", 0)
                     queue = result.get("queue_position", 0)
                     
+                    # Only fail if there's a REAL error
                     error_message = result.get("error_message")
                     if error_message and str(error_message).strip() and str(error_message).lower() not in ['null', 'none', '']:
                         raise Exception(f"Server error: {error_message}")
@@ -1186,6 +1089,7 @@ class GeminiGenAPI:
                     if status in [0, "failed", "error"]:
                         raise Exception(f"Generation failed with status: {status}")
                     
+                    # Still processing
                     if status in [1, "processing", "queued"] or progress < 100:
                         log.info(f"⏳ Processing... Progress: {progress}%, Queue: {queue}")
                         await asyncio.sleep(3)
@@ -1196,6 +1100,7 @@ class GeminiGenAPI:
                 await asyncio.sleep(3)
     
     async def download_video(self, url: str) -> bytes:
+        """Download video from Cloudflare R2"""
         async with aiohttp.ClientSession() as session:
             log.info(f"📥 Downloading from {url[:80]}...")
             async with session.get(url) as resp:
@@ -1206,24 +1111,9 @@ class GeminiGenAPI:
                 log.info(f"Download size: {size / 1024 / 1024:.2f} MB")
                 
                 return await resp.read()
-
-# =========================
-# Video Generation Commands
-# =========================
 async def vdogen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Generate AI video with token expiry handling"""
+    """Generate AI video - handles multiple users concurrently with queue"""
     ensure_user(update)
-    
-    global is_system_paused
-    if is_system_paused:
-        await update.message.reply_text(
-            "⏳ <b>System Maintenance in Progress...</b>\n\n"
-            f"We're updating our AI connection.\n"
-            f"Reason: {pause_reason}\n\n"
-            "Please try again in 2-3 minutes.",
-            parse_mode=ParseMode.HTML
-        )
-        return
     
     if not await ensure_membership(update, context):
         return
@@ -1235,18 +1125,7 @@ async def vdogen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     user_id = update.effective_user.id
     
-    token_ok = await check_and_refresh_token()
-    if not token_ok:
-        await update.message.reply_text(
-            "⚠️ <b>Token Issue Detected</b>\n\n"
-            "We're having trouble with the AI service token.\n"
-            "Admin has been notified and will fix it shortly.\n\n"
-            "Please try again in a few minutes.",
-            parse_mode=ParseMode.HTML
-        )
-        await notify_admin_of_token_issue(context, "Token check failed")
-        return
-    
+    # Check if user already has an active generation
     if user_id in user_active_tasks and not user_active_tasks[user_id].done():
         await update.message.reply_text(
             "⏳ <b>You already have a video generating!</b>\n\n"
@@ -1256,6 +1135,7 @@ async def vdogen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     
+    # Check combined media generation limit
     today = get_today_str()
     user_data = users_col.find_one({"_id": user_id}, {
         "media_gen_today": 1, 
@@ -1279,6 +1159,7 @@ async def vdogen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(limit_msg, parse_mode=ParseMode.HTML)
         return
     
+    # Check AI credits (for non-whitelisted users)
     if not is_admin(user_id):
         credits, used, is_whitelisted = await get_user_credits(user_id)
         remaining = credits - used
@@ -1296,6 +1177,7 @@ async def vdogen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(no_credits_text, parse_mode=ParseMode.HTML)
             return
     
+    # Acknowledge immediately
     status_msg = await update.message.reply_text(
         f"🎬 <b>Video Request Received!</b>\n\n"
         f"📝 Prompt: <code>{query[:60]}...</code>\n\n"
@@ -1305,6 +1187,7 @@ async def vdogen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await log_to_group(update, context, action="/vdogen", details=f"Prompt: {query} | User: {user_id} | Queued")
     
+    # Add to queue
     queue_item = {
         "user_id": user_id,
         "query": query,
@@ -1317,28 +1200,17 @@ async def vdogen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     }
     
     video_generation_queue.append(queue_item)
+    
+    # Start queue processor if not running
     asyncio.create_task(process_video_queue())
     
     log.info(f"✅ Added to queue. Current queue size: {len(video_generation_queue)}")
 
 async def process_video_queue():
-    """Background worker with pause support"""
-    global active_generations, is_system_paused
+    """Background worker that processes video generation queue"""
+    global active_generations
     
-    if is_system_paused:
-        log.info(f"⏳ System paused: {pause_reason}")
-        await asyncio.sleep(10)
-        if video_generation_queue:
-            asyncio.create_task(process_video_queue())
-        return
-    
-    token_ok = await check_and_refresh_token()
-    if not token_ok:
-        log.error("Token check failed, pausing system")
-        is_system_paused = True
-        await notify_admin_of_token_issue(None, "Token invalid/expired")
-        return
-    
+    # Check if we can start a new generation
     if active_generations >= MAX_CONCURRENT_GENERATIONS:
         log.info(f"⏳ Max concurrent generations reached ({MAX_CONCURRENT_GENERATIONS}). Waiting...")
         return
@@ -1359,20 +1231,24 @@ async def process_video_queue():
         media_gen_limit = queue_item["media_gen_limit"]
         today = queue_item["today"]
         
+        # Track active task for this user
         task = asyncio.current_task()
         user_active_tasks[user_id] = task
         
         try:
             log.info(f"🎬 Starting generation for user {user_id}")
             
+            # Update status
             await status_msg.edit_text(
                 f"📝 <b>Processing:</b> <code>{query[:60]}...</code>\n"
                 f"⏳ Generation in progress...",
                 parse_mode=ParseMode.HTML
             )
             
+            # Initialize API client
             api = GeminiGenAPI(parse_netscape_cookies(COOKIE_FILE_CONTENT), BEARER_TOKEN)
             
+            # Step 1: Submit generation
             await status_msg.edit_text(
                 f"🚀 <b>Submitting to AI...</b>\n"
                 f"⏳ This takes 30-90 seconds",
@@ -1380,6 +1256,7 @@ async def process_video_queue():
             )
             job_id = await api.generate_video(query)
             
+            # Step 2: Poll for completion
             await status_msg.edit_text(
                 f"⏳ <b>Generating video...</b>\n"
                 f"🆔 Job: <code>{job_id[:8]}...</code>",
@@ -1387,15 +1264,19 @@ async def process_video_queue():
             )
             video_url = await api.poll_for_video(job_id, timeout=300)
             
+            # Step 3: Download video
             await status_msg.edit_text("⬇️ <b>Downloading video...</b>", parse_mode=ParseMode.HTML)
             video_bytes = await api.download_video(video_url)
             
+            # Step 4: Upload to Telegram
             await status_msg.edit_text("⬆️ <b>Uploading to Telegram...</b>", parse_mode=ParseMode.HTML)
             
+            # Save to file temporarily
             video_path = DOWNLOAD_DIR / f"vdo_{user_id}_{secrets.token_urlsafe(8)}.mp4"
             async with aiofiles.open(video_path, "wb") as f:
                 await f.write(video_bytes)
             
+            # Send video with caption
             caption = (
                 f"🎬 <b>{query}</b>\n\n"
                 f"✨ Generated by @spotifyxmusixbot\n"
@@ -1416,6 +1297,7 @@ async def process_video_queue():
                 write_timeout=60
             )
             
+            # Update media generation counter
             users_col.update_one(
                 {"_id": user_id},
                 {"$set": {
@@ -1425,6 +1307,7 @@ async def process_video_queue():
                 upsert=True
             )
             
+            # Consume credit (for non-admins)
             if not is_admin(user_id):
                 await consume_credit(user_id)
                 log.info(f"✅ Credit consumed for user {user_id}")
@@ -1450,23 +1333,27 @@ async def process_video_queue():
                     parse_mode=ParseMode.HTML
                 )
             except:
-                pass
+                pass  # Message might be deleted
             
             await log_to_group(update, context, action="/vdogen", 
                              details=f"Error: {error_str[:150]} | User: {user_id}", is_error=True)
         
         finally:
+            # Cleanup
             active_generations -= 1
             if user_id in user_active_tasks:
                 del user_active_tasks[user_id]
             
+            # Process next queue item
             if video_generation_queue:
                 asyncio.create_task(process_video_queue())
+
 
 # =========================
 # Fixed Command Handlers
 # =========================
 async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """FIXED: Added missing comma in function signature"""
     if not is_admin(update.effective_user.id): 
         await update.message.reply_text("❌ Not authorized!")
         return
@@ -1513,6 +1400,7 @@ async def search_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await log_to_group(update, context, action="/search", details=f"Query: {query}")
     status_msg = await update.message.reply_text(f"Searching '<b>{query}</b>'...", parse_mode=ParseMode.HTML)
 
+    # FIXED: Add cookies to search options
     cookies_path = Path(COOKIES_FILE)
     ydl_opts = {
         "quiet": True,
@@ -1522,6 +1410,7 @@ async def search_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "extract_flat": False,
     }
     
+    # Add cookies to search if available
     if cookies_path.exists() and cookies_path.stat().st_size > 0:
         ydl_opts["cookiefile"] = str(cookies_path)
 
@@ -1530,6 +1419,7 @@ async def search_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             info = ydl.extract_info(query, download=False)
     except Exception as e:
         error_str = str(e)
+        # ENHANCED: Better error messages for YouTube restrictions
         if "Sign in to confirm" in error_str:
             await status_msg.edit_text(
                 "❌ <b>YouTube Bot Detection</b>\n\n"
@@ -1580,6 +1470,7 @@ async def gen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     user_id = update.effective_user.id
     
+    # Check limit
     today = get_today_str()
     user_data = users_col.find_one({"_id": user_id}, {"media_gen_today": 1, "media_gen_date": 1})
     used_today = user_data.get("media_gen_today", 0) if user_data and user_data.get("media_gen_date") == today else 0
@@ -1588,6 +1479,7 @@ async def gen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Daily limit: {used_today}/{BASE_MEDIA_GEN_LIMIT}")
         return
     
+    # Generate image
     status = await update.message.reply_text(f"🎨 Generating: <b>{query}</b>...", parse_mode=ParseMode.HTML)
     
     try:
@@ -1600,14 +1492,17 @@ async def gen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await status.edit_text(f"❌ API Error: {resp.status}")
                     return
                 
+                # Just save the damn image
                 data = await resp.read()
                 path = DOWNLOAD_DIR / f"gen_{user_id}.png"
                 async with aiofiles.open(path, "wb") as f:
                     await f.write(data)
         
+        # Send with watermark
         caption = f"🖼️ <b>{query}</b>\n\n<i>Generated by @spotifyxmusixbot</i>"
         await update.message.reply_photo(photo=path, caption=caption, parse_mode=ParseMode.HTML)
         
+        # Update counter
         users_col.update_one(
             {"_id": user_id},
             {"$set": {"media_gen_date": today, "media_gen_today": used_today + 1}},
@@ -1622,8 +1517,11 @@ async def gen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def gpt_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """AI Chat command - accessible to ALL users with credit limits"""
+    
+    # Ensure user exists in database
     ensure_user(update)
     
+    # Check membership (with error handling)
     try:
         if not await ensure_membership(update, context):
             return
@@ -1631,25 +1529,30 @@ async def gpt_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Error checking membership. Please try again.")
         return
     
+    # Validate query
     query = " ".join(context.args)
     if not query:
         await update.message.reply_text("Usage: /gpt <your question>")
         return
     
+    # Check AI client
     if not groq_client:
         await update.message.reply_text("❌ AI not configured. Contact admin.", parse_mode=ParseMode.HTML)
         return
     
     user_id = update.effective_user.id
     
+    # CREDIT CHECK
     try:
         credits, used, is_whitelisted = await get_user_credits(user_id)
         remaining = credits - used
         
     except Exception as e:
+        # Fallback to base credits if check fails
         credits, used, is_whitelisted = BASE_CREDITS, 0, False
         remaining = credits
     
+    # Check if user has credits left
     if remaining <= 0:
         no_credits_text = (
             f"❌ <b>No Credits Remaining!</b>\n\n"
@@ -1665,8 +1568,10 @@ async def gpt_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await log_to_group(update, context, action="/gpt", details=f"User {user_id} out of credits (used {used}/{credits})")
         return
     
+    # Processing message
     status_msg = await update.message.reply_text(f"🤖 Processing... (Credits left: {remaining-1})")
     
+    # Initialize conversation
     if user_id not in USER_CONVERSATIONS:
         USER_CONVERSATIONS[user_id] = [
             {"role": "system", "content": "You are a helpful assistant. Be concise and clear."}
@@ -1675,6 +1580,7 @@ async def gpt_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     USER_CONVERSATIONS[user_id].append({"role": "user", "content": query})
     
     try:
+        # Call Groq API
         response = groq_client.chat.completions.create(
             model=GROQ_MODEL,
             messages=USER_CONVERSATIONS[user_id],
@@ -1685,12 +1591,15 @@ async def gpt_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         answer = response.choices[0].message.content
         USER_CONVERSATIONS[user_id].append({"role": "assistant", "content": answer})
         
+        # Limit conversation history
         if len(USER_CONVERSATIONS[user_id]) > 10:
             USER_CONVERSATIONS[user_id] = [USER_CONVERSATIONS[user_id][0]] + USER_CONVERSATIONS[user_id][-9:]
         
+        # Truncate if too long
         if len(answer) > 4000:
             answer = answer[:4000] + "\n\n... (truncated)"
         
+        # ✅ MODIFIED: Added ai attribution
         await status_msg.edit_text(
             f"💬 <b>Query:</b> <code>{query}</code>\n\n"
             f"<b>Answer:</b>\n{answer}\n\n"
@@ -1698,9 +1607,11 @@ async def gpt_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode=ParseMode.HTML
         )
         
+        # Consume credit
         credit_success = await consume_credit(user_id)
         log.info(f"✅ GPT_CMD SUCCESS | User: {user_id} | Credit consumed: {credit_success}")
         
+        # Log to group
         await log_to_group(update, context, action="/gpt", 
                          details=f"User {user_id}: {query[:50]}... | Remaining: {remaining-1}")
         
@@ -1710,11 +1621,16 @@ async def gpt_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await log_to_group(update, context, action="/gpt", details=f"Error: {e}", is_error=True)
         USER_CONVERSATIONS[user_id] = [{"role": "system", "content": "You are a helpful assistant."}]
 
+# =========================
+# NEW: Enhanced Test Cookies Command
+# =========================
 async def test_cookies_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Test YouTube cookies functionality - Admin only"""
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("❌ Admin only!")
         return
     
+    # Check if cookies file exists
     cookies_path = Path(COOKIES_FILE)
     if not cookies_path.exists():
         await update.message.reply_text(
@@ -1742,6 +1658,7 @@ async def test_cookies_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     status_msg = await update.message.reply_text("🔍 Testing YouTube cookies...")
     
     try:
+        # Test 1: Check if cookies file is valid format
         with open(cookies_path, 'r', encoding='utf-8') as f:
             content = f.read()
             if '# Netscape HTTP Cookie File' not in content:
@@ -1749,7 +1666,8 @@ async def test_cookies_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if '.youtube.com' not in content and '.google.com' not in content:
                 raise ValueError("No YouTube/Google cookies found")
         
-        test_url = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+        # Test 2: Try to extract info from a video (this tests authentication)
+        test_url = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"  # Rickroll (short video)
         
         ydl_opts = {
             "quiet": True,
@@ -1761,12 +1679,17 @@ async def test_cookies_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(test_url, download=False)
             
+            # Check for authentication indicators
             is_logged_in = False
             has_pauth = False
             if info:
+                # Check for presence of sensitive cookies
+                cookies_valid = True
+                # Check if we can access video details that require auth
                 if info.get('duration') is not None or info.get('uploader') is not None:
                     is_logged_in = True
                 
+                # Also check cookie content for SAPISID/APISID (required for API calls)
                 if 'SAPISID' in content or '__Secure-3PAPISID' in content:
                     has_pauth = True
         
@@ -1821,7 +1744,7 @@ async def test_cookies_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await log_to_group(update, context, action="/testcookies", details=f"Test failed: {str(e)[:100]}", is_error=True)
 
 # =========================
-# Broadcast Functions
+# Broadcast Functions (FIXED)
 # =========================
 async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id): 
@@ -1843,6 +1766,7 @@ async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await log_to_group(update, context, action="/broadcast", details="Broadcast mode started")
 
 async def handle_broadcast_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle ALL non-command messages for broadcast"""
     if not update.effective_user or not is_admin(update.effective_user.id):
         return
     
@@ -1850,6 +1774,7 @@ async def handle_broadcast_message(update: Update, context: ContextTypes.DEFAULT
     if not BROADCAST_STATE.get(admin_id):
         return
     
+    # Store message based on type
     msg = {}
     if update.message.text:
         msg = {"type": "text", "text": update.message.text}
@@ -1944,12 +1869,15 @@ async def send_broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text("❌ No messages to broadcast.")
         return
     
+    # Get all recipients (users + groups)
     recipients = set()
     
     if MONGO_AVAILABLE:
+        # Add all users
         for u in users_col.find({}, {"_id": 1}): 
             recipients.add(u["_id"])
         
+        # Add groups where bot is added
         for g in db["broadcast_chats"].find({}, {"_id": 1}):
             recipients.add(g["_id"])
     
@@ -2017,6 +1945,30 @@ async def cancel_broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
     await log_to_group(update, context, action="/cancel_broadcast", details="Broadcast cancelled")
 
 # =========================
+# NEW: Track Bot Addition to Groups
+# =========================
+async def track_bot_addition(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Track when bot is added to a new group for broadcast"""
+    if not MONGO_AVAILABLE:
+        return
+        
+    chat = update.effective_chat
+    if chat.type in ["group", "supergroup"]:
+        # Only add if bot is actually a member (not left/kicked)
+        my_member = update.my_chat_member
+        if my_member.new_chat_member.status in ["member", "administrator"]:
+            db["broadcast_chats"].update_one(
+                {"_id": chat.id},
+                {"$set": {
+                    "title": chat.title,
+                    "type": chat.type,
+                    "added_at": datetime.now()
+                }},
+                upsert=True
+            )
+            log.info(f"Bot added to group: {chat.title} ({chat.id})")
+
+# =========================
 # Admin Commands
 # =========================
 async def addadmin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2082,7 +2034,6 @@ async def adminlist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         admin_list = "👥 <b>Admin List</b>\n━━━━━━━━━━━━\n\n"
         for admin in admins:
             admin_id = admin["_id"]
-           
             name = admin.get("name", "Unknown")
             role = "👑 Owner" if admin_id == OWNER_ID else "🔧 Admin"
             admin_list += f"• <code>{admin_id}</code> - {name} ({role})\n"
