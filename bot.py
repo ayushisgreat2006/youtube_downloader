@@ -71,7 +71,7 @@ IMAGE_MAX_ATTEMPTS = 1         # Direct IP only
 
 #config of vdo gen
 # GeminiGen AI Video Configuration
-BEARER_TOKEN = os.getenv("BEARER_TOKEN", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJleHAiOjE3NjQzOTEyNDYsInN1YiI6ImY5MTlhYjEyLWNiMDgtMTFmMC05YWEyLWVlNDdlYmE0N2M1ZCJ9.Fc-S3UZISOlG4EuD8nip2q3tbESy0kb2IIvNFachA-8")
+BEARER_TOKEN = os.getenv("BEARER_TOKEN", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJleHAiOjE3NjQ0ODA3NDUsInN1YiI6ImY5MTlhYjEyLWNiMDgtMTFmMC05YWEyLWVlNDdlYmE0N2M1ZCJ9.xYzZAqZW7AkZvWo9q3BjFqVg7TsImoNoTyEbsCS2yl8")
 COOKIE_FILE_CONTENT = os.getenv("COOKIE_FILE_CONTENT", """# Netscape HTTP Cookie File
 geminigen.ai	FALSE	/	FALSE	1779779317	ext_name	ojplmecpdpgccookcobabopnaifgidhf
 geminigen.ai	FALSE	/	FALSE	1779741622	i18n_redirected	en
