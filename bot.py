@@ -2233,13 +2233,24 @@ def quality_keyboard(url: str) -> InlineKeyboardMarkup:
 # =========================
 # TTS Generation Function
 # =========================
+# =========================
+# GROQ TTS FUNCTIONS (Add this whole block)
+# =========================
 async def generate_tts_audio(text: str, voice: str, model: str = GROQ_TTS_MODEL) -> bytes:
     """Generate TTS audio using Groq API"""
     try:
         if not groq_client:
             raise Exception("Groq client not initialized")
         
-        # Use run_in_executor for synchronous API call
+        # Verify voice is valid
+        if voice not in GROQ_TTS_VOICES:
+            raise ValueError(f"Invalid voice: {voice}")
+        
+        if len(text) > 1000:
+            raise ValueError("Text exceeds 1000 character limit")
+        
+        log.info(f"🎙️ Generating TTS: {len(text)} chars, Voice: {voice}")
+        
         loop = asyncio.get_event_loop()
         response = await loop.run_in_executor(
             None,
@@ -2251,18 +2262,37 @@ async def generate_tts_audio(text: str, voice: str, model: str = GROQ_TTS_MODEL)
             )
         )
         
-        audio_bytes = response.content
+        # FIX: Use .read() method for BinaryAPIResponse
+        audio_bytes = response.read()
+        
+        if not audio_bytes:
+            raise Exception("Empty audio response received")
         
         log.info(f"✅ TTS generated: {len(audio_bytes)} bytes")
         return audio_bytes
         
     except Exception as e:
-        log.error(f"TTS generation failed: {e}", exc_info=True)
-        raise
+        error_msg = str(e)
+        
+        # Handle specific Groq errors
+        if "terms acceptance" in error_msg.lower():
+            log.error("TERMS NOT ACCEPTED: User needs to accept PlayAI terms in Groq console")
+            raise Exception(
+                "❌ Terms Acceptance Required\n\n"
+                "The TTS model requires you to accept terms in Groq console:\n"
+                "1. Go to console.groq.com\n"
+                "2. Navigate to Models > PlayAI TTS\n"
+                "3. Click 'Accept Terms'\n"
+                "4. Retry the command"
+            )
+        elif "invalid voice" in error_msg.lower():
+            raise Exception(f"Invalid voice selected. Choose from: {', '.join(GROQ_TTS_VOICES[:5])}...")
+        elif "rate limit" in error_msg.lower():
+            raise Exception("Rate limit exceeded. Please try again later.")
+        else:
+            log.error(f"TTS generation failed: {error_msg}", exc_info=True)
+            raise Exception(f"TTS generation error: {error_msg[:200]}")
 
-# =========================
-# Command Handler: /speech
-# =========================
 async def speech_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Generate AI speech from text - /speech <text>"""
     ensure_user(update)
@@ -2283,6 +2313,7 @@ async def speech_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"<b>Example:</b> <code>/speech Hello, this is a test message!</code>\n\n"
             f"After sending, you'll select a voice from all available models.\n\n"
             f"<b>Sample Voices:</b>\n{voices_sample}\n\n"
+            f"<b>Default:</b> <code>{GROQ_TTS_DEFAULT_VOICE}</code>\n\n"
             f"<b>💡 Tip:</b> Text must be 1-1000 characters"
         )
         await update.message.reply_text(help_text, parse_mode=ParseMode.HTML)
@@ -2342,11 +2373,8 @@ async def speech_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode=ParseMode.HTML
     )
 
-# =========================
-# Callback Handler: TTS Generation
-# =========================
 async def on_tts_generation(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle voice selection and generate TTS"""
+    """Handle voice selection callback for TTS"""
     query = update.callback_query
     await query.answer()
     
@@ -2388,9 +2416,6 @@ async def on_tts_generation(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await process_tts_generation(update, context, text_to_speak, selected_voice, is_callback=True)
 
-# =========================
-# TTS Generation Processor
-# =========================
 async def process_tts_generation(update: Update, context: ContextTypes.DEFAULT_TYPE, 
                                  text: str, voice: str, is_callback: bool = False):
     """Process TTS generation and send as document"""
@@ -2410,18 +2435,17 @@ async def process_tts_generation(update: Update, context: ContextTypes.DEFAULT_T
         
         await status_msg.edit_text("⬆️ Uploading to Telegram as document...")
         
-        # Send as document (as requested)
         caption = (
             f"🎙️ <b>Text-to-Speech Audio</b>\n\n"
             f"📝 Text: <i>\"{text[:300]}{'...' if len(text) > 300 else ''}\"</i>\n"
             f"🗣️ Voice: <code>{voice}</code>\n"
-            f"🎵 Format: {GROQ_TTS_FORMAT.upper()}\n\n"
+            f"📦 Size: {audio_path.stat().st_size / 1024:.2f} KB\n\n"
             f"✨ Generated by @spotifyxmusixbot"
         )
         
         await message.reply_document(
             document=audio_path,
-            filename=f"speech_{voice.replace('-PlayAI', '')}.{GROQ_TTS_FORMAT}",
+            filename=f"speech_{voice.replace('-PlayAI', '')}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.{GROQ_TTS_FORMAT}",
             caption=caption,
             parse_mode=ParseMode.HTML,
             connect_timeout=60,
@@ -2438,11 +2462,10 @@ async def process_tts_generation(update: Update, context: ContextTypes.DEFAULT_T
             remaining = credits - used
             log.info(f"✅ TTS credit consumed for user {user_id}. Remaining: {remaining}")
         
-        # Log success
         await log_to_group(update, context, action="/speech", 
                          details=f"User {user_id}: {len(text)} chars, Voice: {voice}")
         
-        # Clean up
+        # Cleanup
         audio_path.unlink(missing_ok=True)
         if 'tts_text' in context.user_data:
             del context.user_data['tts_text']
@@ -2451,28 +2474,23 @@ async def process_tts_generation(update: Update, context: ContextTypes.DEFAULT_T
         error_str = str(e)
         log.error(f"TTS failed for user {user_id}: {error_str}", exc_info=True)
         
+        # Clean up on error
+        if 'tts_text' in context.user_data:
+            del context.user_data['tts_text']
+        
+        user_error = f"❌ {error_str}" if not error_str.startswith("❌") else error_str
+        
         try:
             await status_msg.edit_text(
-                f"❌ <b>TTS Generation Failed</b>\n\n"
-                f"Error: {error_str[:150]}\n\n"
-                f"💡 Try:\n"
-                f"• Shorter text (< 1000 chars)\n"
-                f"• Different voice\n"
-                f"• Check your credits: /credits",
+                f"{user_error}\n\n"
+                f"💡 Need help? Contact @ayushxchat_robot",
                 parse_mode=ParseMode.HTML
             )
         except:
-            await message.reply_text(
-                f"❌ TTS failed: {error_str[:100]}",
-                parse_mode=ParseMode.HTML
-            )
+            await message.reply_text(user_error, parse_mode=ParseMode.HTML)
         
         await log_to_group(update, context, action="/speech", 
                          details=f"Error: {error_str[:150]} | User: {user_id}", is_error=True)
-        
-        # Clean up on error too
-        if 'tts_text' in context.user_data:
-            del context.user_data['tts_text']
 
 # =========================
 # Main Function
