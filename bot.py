@@ -448,7 +448,7 @@ async def ensure_membership(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 async def fetch_lyrics(song_title: str) -> Optional[str]:
     """Fetch lyrics for a song title using azapi"""
     try:
-        # Clean up the title - remove common YouTube suffixes and metadata
+        # Clean up the title
         clean_title = re.sub(r'\(official.*?\)|\[official.*?\]|\(audio\)|\[audio\]|\(lyric.*?\)|\[lyric.*?\]|\(video.*?\)|\[video.*?\]|\(hd\)|\[hd\]|\(4k\)|\[4k\]|\(feat\..*?\)|\[feat\..*?\]', '', song_title, flags=re.IGNORECASE)
         clean_title = re.sub(r'[–—|-]', ' ', clean_title)
         clean_title = re.sub(r'\s+', ' ', clean_title).strip()
@@ -456,32 +456,57 @@ async def fetch_lyrics(song_title: str) -> Optional[str]:
         if not clean_title:
             return None
         
-        # Run the azapi call in an executor to avoid blocking the event loop
+        log.info(f"📝 Searching lyrics for: '{clean_title}'")
+        
+        # Try to extract artist and title if in "Artist - Title" format
+        artist = None
+        title = clean_title
+        
+        if " - " in clean_title:
+            parts = clean_title.split(" - ", 1)
+            if len(parts) == 2:
+                artist = parts[0].strip()
+                title = parts[1].strip()
+        
         loop = asyncio.get_event_loop()
         
         def fetch_with_azapi():
-            # Create API instance with google search engine
-            api = azapi.AZlyrics('google', accuracy=0.5)
-            
-            # Set the title (azapi will auto-correct spelling and find artist)
-            api.title = clean_title
-            
-            # Get lyrics - NO arguments, NO kwargs
-            lyrics = api.getLyrics()
-            
-            # Return lyrics if we got them
-            if lyrics and lyrics.strip():
-                return lyrics.strip()
-            
-            log.info(f"No lyrics found for '{clean_title}' using azapi")
-            return None
+            try:
+                # Use higher accuracy and slower search for better results
+                api = azapi.AZlyrics('google', accuracy=0.6)
+                
+                if artist:
+                    api.artist = artist
+                    log.info(f"🎤 Artist: '{artist}'")
+                
+                api.title = title
+                log.info(f"🎵 Title: '{title}'")
+                
+                # Get lyrics
+                lyrics_result = api.getLyrics()
+                
+                # Fallback: try without artist if first attempt fails
+                if not lyrics_result and artist:
+                    log.info("❌ First try failed, trying without artist...")
+                    api.artist = None
+                    api.title = clean_title
+                    lyrics_result = api.getLyrics()
+                
+                if lyrics_result and lyrics_result.strip():
+                    log.info(f"✅ Found lyrics ({len(lyrics_result)} chars)")
+                    return lyrics_result.strip()
+                
+                log.info("❌ No lyrics found")
+                return None
+            except Exception as e:
+                log.error(f"❌ Azapi error: {e}")
+                return None
         
         lyrics = await loop.run_in_executor(None, fetch_with_azapi)
-        
         return lyrics
         
     except Exception as e:
-        log.error(f"Failed to fetch lyrics for '{song_title}' using azapi: {e}")
+        log.error(f"❌ Failed to fetch lyrics for '{song_title}': {e}")
         return None
 
 # =========================
