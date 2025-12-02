@@ -467,39 +467,16 @@ async def fetch_lyrics(song_title: str) -> Optional[str]:
             # Pass only the title, let the library find the artist
             api.getLyrics(title=clean_title)
             
-            # Return the lyrics
-            return api.lyrics
+            # Return lyrics if we got them
+            if api.lyrics and api.lyrics.strip():
+                return api.lyrics.strip()
+            
+            log.info(f"No lyrics found for '{clean_title}' using azapi")
+            return None
         
         lyrics = await loop.run_in_executor(None, fetch_with_azapi)
         
-        # Return lyrics if we got them
-        if lyrics and lyrics.strip():
-            return lyrics.strip()
-            
-        log.info(f"No lyrics found for '{clean_title}' using azapi")
-        return None
-        
-    except Exception as e:
-        log.error(f"Failed to fetch lyrics for '{song_title}' using azapi: {e}")
-        return None
-            
-            # Get the first result
-            first_song = api.songs[0]
-            api.artist = first_song['artist']
-            api.title = first_song['song']
-            
-            # Fetch lyrics
-            lyrics = api.getLyrics()
-            return lyrics
-        
-        lyrics = await loop.run_in_executor(None, fetch_with_azapi)
-        
-        # Return lyrics if we got them
-        if lyrics and lyrics.strip():
-            return lyrics.strip()
-            
-        log.info(f"No lyrics found for '{clean_title}' using azapi")
-        return None
+        return lyrics
         
     except Exception as e:
         log.error(f"Failed to fetch lyrics for '{song_title}' using azapi: {e}")
