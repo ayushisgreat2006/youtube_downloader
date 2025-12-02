@@ -446,40 +446,100 @@ async def ensure_membership(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     return False
 
 async def fetch_lyrics(song_title: str) -> Optional[str]:
-    """Fetch lyrics from LRCLIB API"""
+    """Fetch lyrics for a song title using LRCLIB"""
     try:
-        # Clean the title
-        clean_title = re.sub(r'\(official.*?\)|\[.*?\\]|\\(feat.*?\\)', '', song_title, flags=re.IGNORECASE)
-        clean_title = re.sub(r'[–—|-]', ' ', clean_title).strip()
+        # Clean up the title
+        clean_title = re.sub(r'\(official.*?\)|\[official.*?\]|\(audio\)|\[audio\]|\(lyric.*?\)|\[lyric.*?\]|\(video.*?\)|\[video.*?\]|\(hd\)|\[hd\]|\(4k\)|\[4k\]|\(feat\..*?\)|\[feat\..*?\]', '', song_title, flags=re.IGNORECASE)
+        clean_title = re.sub(r'[–—|-]', ' ', clean_title)
+        clean_title = re.sub(r'\s+', ' ', clean_title).strip()
         
-        # Try to split artist/title
-        artist, title = None, clean_title
-        if " - " in clean_title:
-            parts = clean_title.split(" - ", 1)
-            artist, title = parts[0].strip(), parts[1].strip()
+        if not clean_title:
+            return None
         
-        # Search LRCLIB
-        async with aiohttp.ClientSession() as session:
-            params = {"track_name": title}
-            if artist:
-                params["artist_name"] = artist
-            
-            async with session.get("https://lrclib.net/api/search", params=params) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    if data and len(data) > 0:
-                        # Get first result
-                        track = data[0]
-                        # Fetch full lyrics
-                        async with session.get(f"https://lrclib.net/api/get/{track['id']}") as lyrics_resp:
-                            if lyrics_resp.status == 200:
-                                lyrics_data = await lyrics_resp.json()
-                                return lyrics_data.get("syncedLyrics") or lyrics_data.get("plainLyrics")
+        log.info(f"📝 Searching lyrics for: '{clean_title}'")
         
-        return None
+        loop = asyncio.get_event_loop()
+        
+        def fetch_with_lrclib():
+            try:
+                import urllib.parse
+                import requests
+                
+                # Try to extract artist/title
+                artist, title = None, clean_title
+                if " - " in clean_title:
+                    parts = clean_title.split(" - ", 1)
+                    artist, title = parts[0].strip(), parts[1].strip()
+                
+                # Search LRCLIB
+                search_params = {"track_name": title}
+                if artist:
+                    search_params["artist_name"] = artist
+                
+                search_url = "https://lrclib.net/api/search?" + urllib.parse.urlencode(search_params)
+                response = requests.get(search_url, timeout=10)
+                
+                if response.status_code != 200:
+                    return None
+                
+                results = response.json()
+                if not results:
+                    return None
+                
+                # Fetch full lyrics
+                track = results[0]
+                lyrics_response = requests.get(f"https://lrclib.net/api/get/{track['id']}", timeout=10)
+                
+                if lyrics_response.status_code != 200:
+                    return None
+                
+                lyrics_data = lyrics_response.json()
+                lyrics = lyrics_data.get("syncedLyrics") or lyrics_data.get("plainLyrics")
+                
+                if lyrics and lyrics.strip():
+                    log.info(f"✅ Found lyrics ({len(lyrics)} chars)")
+                    return lyrics.strip()
+                
+                return None
+                
+            except Exception as e:
+                log.error(f"❌ LRCLIB error: {e}")
+                return None
+        
+        return await loop.run_in_executor(None, fetch_with_lrclib)
+        
     except Exception as e:
-        log.error(f"LRCLIB failed: {e}")
+        log.error(f"❌ Failed to fetch lyrics: {e}")
         return None
+
+def split_lyrics_into_chunks(lyrics: str, max_chars: int = 3400) -> List[str]:
+    """Split lyrics into chunks that fit in Telegram messages"""
+    # Strip LRC timestamps
+    lyrics_clean = re.sub(r'\[\d{2}:\d{2}\.\d{2}\]\s*', '', lyrics)
+    lyrics_clean = re.sub(r'\n\s*\n', '\n\n', lyrics_clean)  # Remove duplicate blank lines
+    
+    # If short enough, return as single chunk
+    if len(lyrics_clean) <= max_chars:
+        return [lyrics_clean]
+    
+    # Split by lines to avoid breaking words
+    lines = lyrics_clean.split('\n')
+    chunks = []
+    current_chunk = ""
+    
+    for line in lines:
+        if len(current_chunk) + len(line) + 1 > max_chars:
+            if current_chunk:
+                chunks.append(current_chunk.strip())
+            current_chunk = line + "\n"
+        else:
+            current_chunk += line + "\n"
+    
+    # Add the last chunk
+    if current_chunk.strip():
+        chunks.append(current_chunk.strip())
+    
+    return chunks
 
 # =========================
 # Download Function with Logging
@@ -957,24 +1017,42 @@ async def lyrics_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     query = " ".join(context.args)
     if not query:
-        await update.message.reply_text("Usage: /lyrics <song name>\nExample: /lyrics Ed Sheeran Shape of You")
+        await update.message.reply_text("Usage: /lyrics <song name>\nExample: /lyrics Eminem Mockingbird")
         return
     
     await log_to_group(update, context, action="/lyrics", details=f"Query: {query}")
     
     status_msg = await update.message.reply_text(f"📝 Searching lyrics for '<b>{query}</b>'...", parse_mode=ParseMode.HTML)
     
+    # Fetch lyrics (just gets the data)
     lyrics = await fetch_lyrics(query)
     
     if lyrics:
-        if len(lyrics) > 3800:
-            lyrics = lyrics[:3800] + "\n\n... (lyrics truncated due to message limit)"
+        # Split into chunks (presentation logic)
+        lyric_chunks = split_lyrics_into_chunks(lyrics)
         
-        await status_msg.edit_text(
-            f"🎵 <b>Lyrics for:</b> <code>{query}</code>\n\n"
-            f"<pre>{lyrics}</pre>",
-            parse_mode=ParseMode.HTML
-        )
+        if len(lyric_chunks) > 1:
+            # Send multiple parts
+            await status_msg.edit_text(f"🎵 <b>Lyrics for:</b> <code>{query}</code>\n\n<em>Sending in {len(lyric_chunks)} parts...</em>", parse_mode=ParseMode.HTML)
+            
+            for i, chunk in enumerate(lyric_chunks, 1):
+                header = f"🎵 <b>Lyrics for:</b> <code>{query}</code> <em>(Part {i}/{len(lyric_chunks)})</em>\n\n"
+                await update.message.reply_text(
+                    header + f"<pre>{chunk}</pre>",
+                    parse_mode=ParseMode.HTML
+                )
+                await asyncio.sleep(0.3)
+            
+            await status_msg.delete()
+        else:
+            # Send single message
+            await status_msg.edit_text(
+                f"🎵 <b>Lyrics for:</b> <code>{query}</code>\n\n"
+                f"<pre>{lyric_chunks[0]}</pre>",
+                parse_mode=ParseMode.HTML
+            )
+        
+        await log_to_group(update, context, action="/lyrics", details=f"Success: {query} ({len(lyrics)} chars)")
     else:
         await status_msg.edit_text(
             f"❌ Lyrics not found for '<code>{query}</code>'\n\n"
@@ -984,6 +1062,7 @@ async def lyrics_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"• Song might not be in database",
             parse_mode=ParseMode.HTML
         )
+        await log_to_group(update, context, action="/lyrics", details=f"Not found: {query}", is_error=True)
 # vdogen starts here
 # Cookie Parser (add near other helper functions)
 def parse_netscape_cookies(content: str) -> dict:
