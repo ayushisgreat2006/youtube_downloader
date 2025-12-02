@@ -2225,7 +2225,7 @@ async def on_lyrics_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text("❌ Invalid request")
         return
     
-    # Edit message to show loading
+    # Show loading
     status_msg = await q.edit_message_text("📝 Searching for lyrics...")
     
     # Fetch lyrics
@@ -2245,11 +2245,10 @@ async def on_lyrics_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     header + f"<pre>{chunk}</pre>",
                     parse_mode=ParseMode.HTML
                 )
-                await asyncio.sleep(0.3)
+                await asyncio.sleep(0.2)
             
             await status_msg.delete()
         else:
-            # Single message
             await status_msg.edit_text(
                 f"🎵 <b>Lyrics for:</b> <code>{song_title}</code>\n\n"
                 f"<pre>{chunks[0]}</pre>",
@@ -2259,8 +2258,7 @@ async def on_lyrics_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await status_msg.edit_text(
             f"❌ Lyrics not found for '<code>{song_title}</code>'\n\n"
             f"• Song might be too new\n"
-            f"• Title might be misspelled\n"
-            f"• Song might not be in database",
+            f"• Title might be misspelled",
             parse_mode=ParseMode.HTML
         )
 
