@@ -11,6 +11,7 @@ import aiohttp
 import json
 import re
 import asyncio
+import azapi
 from collections import deque
 from typing import Dict, Any
 from pathlib import Path
@@ -445,25 +446,52 @@ async def ensure_membership(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     return False
 
 async def fetch_lyrics(song_title: str) -> Optional[str]:
-    """Fetch lyrics for a song title using an external API"""
+    """Fetch lyrics for a song title using azapi"""
     try:
         # Clean up the title - remove common YouTube suffixes and metadata
         clean_title = re.sub(r'\(official.*?\)|\[official.*?\]|\(audio\)|\[audio\]|\(lyric.*?\)|\[lyric.*?\]|\(video.*?\)|\[video.*?\]|\(hd\)|\[hd\]|\(4k\)|\[4k\]|\(feat\..*?\)|\[feat\..*?\]', '', song_title, flags=re.IGNORECASE)
         # NEW: Replace common separators to improve search
         clean_title = re.sub(r'[–—|-]', ' ', clean_title)
         clean_title = re.sub(r'\s+', ' ', clean_title).strip()
-        api_url = f"https://api.maher-zubair.tech/lyrics?q={clean_title}"
-
-        async with aiohttp.ClientSession() as session:
-            async with session.get(api_url) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    if data.get("status") == 200 and data.get("result"):
-                        return data["result"]
+        
+        if not clean_title:
+            return None
+        
+        # Create API instance
+        api = azapi.AZlyrics()
+        
+        # Run the search in an executor to avoid blocking the event loop
+        loop = asyncio.get_event_loop()
+        
+        def fetch_with_azapi():
+            # Search for the song
+            api.search(clean_title)
+            
+            # Check if we got results
+            if not api.songs:
+                return None
+            
+            # Get the first result
+            first_song = api.songs[0]
+            api.artist = first_song['artist']
+            api.title = first_song['song']
+            
+            # Fetch lyrics
+            lyrics = api.getLyrics()
+            return lyrics
+        
+        lyrics = await loop.run_in_executor(None, fetch_with_azapi)
+        
+        # Return lyrics if we got them
+        if lyrics and lyrics.strip():
+            return lyrics.strip()
+            
+        log.info(f"No lyrics found for '{clean_title}' using azapi")
+        return None
+        
     except Exception as e:
-        log.error(f"Failed to fetch lyrics for '{song_title}': {e}")
-
-    return None
+        log.error(f"Failed to fetch lyrics for '{song_title}' using azapi: {e}")
+        return None
 
 # =========================
 # Download Function with Logging
