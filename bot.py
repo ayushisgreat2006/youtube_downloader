@@ -446,67 +446,39 @@ async def ensure_membership(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     return False
 
 async def fetch_lyrics(song_title: str) -> Optional[str]:
-    """Fetch lyrics for a song title using azapi"""
+    """Fetch lyrics from LRCLIB API"""
     try:
-        # Clean up the title
-        clean_title = re.sub(r'\(official.*?\)|\[official.*?\]|\(audio\)|\[audio\]|\(lyric.*?\)|\[lyric.*?\]|\(video.*?\)|\[video.*?\]|\(hd\)|\[hd\]|\(4k\)|\[4k\]|\(feat\..*?\)|\[feat\..*?\]', '', song_title, flags=re.IGNORECASE)
-        clean_title = re.sub(r'[–—|-]', ' ', clean_title)
-        clean_title = re.sub(r'\s+', ' ', clean_title).strip()
+        # Clean the title
+        clean_title = re.sub(r'\(official.*?\)|\[.*?\\]|\\(feat.*?\\)', '', song_title, flags=re.IGNORECASE)
+        clean_title = re.sub(r'[–—|-]', ' ', clean_title).strip()
         
-        if not clean_title:
-            return None
-        
-        log.info(f"📝 Searching lyrics for: '{clean_title}'")
-        
-        # Try to extract artist and title if in "Artist - Title" format
-        artist = None
-        title = clean_title
-        
+        # Try to split artist/title
+        artist, title = None, clean_title
         if " - " in clean_title:
             parts = clean_title.split(" - ", 1)
-            if len(parts) == 2:
-                artist = parts[0].strip()
-                title = parts[1].strip()
+            artist, title = parts[0].strip(), parts[1].strip()
         
-        loop = asyncio.get_event_loop()
+        # Search LRCLIB
+        async with aiohttp.ClientSession() as session:
+            params = {"track_name": title}
+            if artist:
+                params["artist_name"] = artist
+            
+            async with session.get("https://lrclib.net/api/search", params=params) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    if data and len(data) > 0:
+                        # Get first result
+                        track = data[0]
+                        # Fetch full lyrics
+                        async with session.get(f"https://lrclib.net/api/get/{track['id']}") as lyrics_resp:
+                            if lyrics_resp.status == 200:
+                                lyrics_data = await lyrics_resp.json()
+                                return lyrics_data.get("syncedLyrics") or lyrics_data.get("plainLyrics")
         
-        def fetch_with_azapi():
-            try:
-                # Use higher accuracy and slower search for better results
-                api = azapi.AZlyrics('google', accuracy=0.6)
-                
-                if artist:
-                    api.artist = artist
-                    log.info(f"🎤 Artist: '{artist}'")
-                
-                api.title = title
-                log.info(f"🎵 Title: '{title}'")
-                
-                # Get lyrics
-                lyrics_result = api.getLyrics()
-                
-                # Fallback: try without artist if first attempt fails
-                if not lyrics_result and artist:
-                    log.info("❌ First try failed, trying without artist...")
-                    api.artist = None
-                    api.title = clean_title
-                    lyrics_result = api.getLyrics()
-                
-                if lyrics_result and lyrics_result.strip():
-                    log.info(f"✅ Found lyrics ({len(lyrics_result)} chars)")
-                    return lyrics_result.strip()
-                
-                log.info("❌ No lyrics found")
-                return None
-            except Exception as e:
-                log.error(f"❌ Azapi error: {e}")
-                return None
-        
-        lyrics = await loop.run_in_executor(None, fetch_with_azapi)
-        return lyrics
-        
+        return None
     except Exception as e:
-        log.error(f"❌ Failed to fetch lyrics for '{song_title}': {e}")
+        log.error(f"LRCLIB failed: {e}")
         return None
 
 # =========================
