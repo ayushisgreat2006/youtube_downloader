@@ -450,26 +450,38 @@ async def fetch_lyrics(song_title: str) -> Optional[str]:
     try:
         # Clean up the title - remove common YouTube suffixes and metadata
         clean_title = re.sub(r'\(official.*?\)|\[official.*?\]|\(audio\)|\[audio\]|\(lyric.*?\)|\[lyric.*?\]|\(video.*?\)|\[video.*?\]|\(hd\)|\[hd\]|\(4k\)|\[4k\]|\(feat\..*?\)|\[feat\..*?\]', '', song_title, flags=re.IGNORECASE)
-        # NEW: Replace common separators to improve search
         clean_title = re.sub(r'[–—|-]', ' ', clean_title)
         clean_title = re.sub(r'\s+', ' ', clean_title).strip()
         
         if not clean_title:
             return None
         
-        # Create API instance
-        api = azapi.AZlyrics()
-        
-        # Run the search in an executor to avoid blocking the event loop
+        # Run the azapi call in an executor to avoid blocking
         loop = asyncio.get_event_loop()
         
         def fetch_with_azapi():
-            # Search for the song
-            api.search(clean_title)
+            # Create API instance with google search engine
+            api = azapi.AZlyrics('google')
             
-            # Check if we got results
-            if not api.songs:
-                return None
+            # Get lyrics - this automatically handles search
+            # Pass only the title, let the library find the artist
+            api.getLyrics(title=clean_title)
+            
+            # Return the lyrics
+            return api.lyrics
+        
+        lyrics = await loop.run_in_executor(None, fetch_with_azapi)
+        
+        # Return lyrics if we got them
+        if lyrics and lyrics.strip():
+            return lyrics.strip()
+            
+        log.info(f"No lyrics found for '{clean_title}' using azapi")
+        return None
+        
+    except Exception as e:
+        log.error(f"Failed to fetch lyrics for '{song_title}' using azapi: {e}")
+        return None
             
             # Get the first result
             first_song = api.songs[0]
