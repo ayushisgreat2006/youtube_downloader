@@ -456,20 +456,22 @@ async def fetch_lyrics(song_title: str) -> Optional[str]:
         if not clean_title:
             return None
         
-        # Run the azapi call in an executor to avoid blocking
+        # Run the azapi call in an executor to avoid blocking the event loop
         loop = asyncio.get_event_loop()
         
         def fetch_with_azapi():
             # Create API instance with google search engine
-            api = azapi.AZlyrics('google')
+            api = azapi.AZlyrics('google', accuracy=0.5)
             
-            # Get lyrics - this automatically handles search
-            # Pass only the title, let the library find the artist
-            api.getLyrics(title=clean_title)
+            # Set the title (azapi will auto-correct spelling and find artist)
+            api.title = clean_title
+            
+            # Get lyrics - NO arguments, NO kwargs
+            lyrics = api.getLyrics()
             
             # Return lyrics if we got them
-            if api.lyrics and api.lyrics.strip():
-                return api.lyrics.strip()
+            if lyrics and lyrics.strip():
+                return lyrics.strip()
             
             log.info(f"No lyrics found for '{clean_title}' using azapi")
             return None
