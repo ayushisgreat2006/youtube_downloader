@@ -2232,20 +2232,35 @@ async def on_lyrics_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lyrics = await fetch_lyrics(song_title)
     
     if lyrics:
-        if len(lyrics) > 3800:  # Leave room for header
-            lyrics = lyrics[:3800] + "\n\n... (lyrics truncated due to message limit)"
+        # Split into chunks
+        chunks = split_lyrics_into_chunks(lyrics)
         
-        await status_msg.edit_text(
-            f"🎵 <b>Lyrics for:</b> <code>{song_title}</code>\n\n"
-            f"<pre>{lyrics}</pre>",
-            parse_mode=ParseMode.HTML
-        )
+        if len(chunks) > 1:
+            # Send multiple parts
+            await status_msg.edit_text(f"🎵 <b>Lyrics for:</b> <code>{song_title}</code>\n\n<em>Sending in {len(chunks)} parts...</em>", parse_mode=ParseMode.HTML)
+            
+            for i, chunk in enumerate(chunks, 1):
+                header = f"🎵 <b>Lyrics for:</b> <code>{song_title}</code> <em>(Part {i}/{len(chunks)})</em>\n\n"
+                await q.message.reply_text(
+                    header + f"<pre>{chunk}</pre>",
+                    parse_mode=ParseMode.HTML
+                )
+                await asyncio.sleep(0.3)
+            
+            await status_msg.delete()
+        else:
+            # Single message
+            await status_msg.edit_text(
+                f"🎵 <b>Lyrics for:</b> <code>{song_title}</code>\n\n"
+                f"<pre>{chunks[0]}</pre>",
+                parse_mode=ParseMode.HTML
+            )
     else:
         await status_msg.edit_text(
             f"❌ Lyrics not found for '<code>{song_title}</code>'\n\n"
             f"• Song might be too new\n"
             f"• Title might be misspelled\n"
-            f"• Try manual search: /lyrics artist song",
+            f"• Song might not be in database",
             parse_mode=ParseMode.HTML
         )
 
