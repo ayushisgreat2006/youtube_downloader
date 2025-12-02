@@ -4,4 +4,4 @@ pymongo
 aiohttp
 aiofiles
 groq
-lyricsgenius
+azapi
